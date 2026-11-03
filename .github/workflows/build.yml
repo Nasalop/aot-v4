@@ -219,6 +219,11 @@ jobs:
         with: { distribution: temurin, java-version: '17' }
       - name: Pick mode (game if game/game.exe exists, otherwise Vulkan triangle test)
         run: |
+          echo "--- repo game/ folder as CI sees it:"; ls -la game 2>&1 || echo "(no game/ folder in the repo)"
+          if [ ! -f game/game.exe ] && [ -d game ]; then   # tolerate other names/cases (e.g. AssassinsCreed_Dx10.exe, Game.EXE, game.exe.exe)
+            C=$(find game -maxdepth 1 -type f -iname '*.exe' ! -iname 'textured_cube.exe' ! -iname 'stresst_test.exe' ! -iname 'gfx_multi_cube.exe' | head -n 2)
+            if [ "$(echo "$C" | grep -c .)" = 1 ]; then echo "using $C as game/game.exe"; cp "$C" game/game.exe; fi
+          fi
           M="${{ github.event.inputs.mode }}"
           if [ "$GITHUB_EVENT_NAME" = push ] || [ "$M" = multi ]; then
             echo "AOT_MODE=game" >> $GITHUB_ENV
