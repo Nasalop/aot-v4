@@ -39,7 +39,20 @@ S(ToUnicode) {   /* US-layout ASCII only: (vk, scan, keystate*, buf*, cch, flags
 
 /* ---- advapi32 ---- */
 S(CryptAcquireContextA) { if (P(0)) ST(uint32_t, A(0), 1); return 1; }
-S(CryptGenRandom) { uint8_t *b = P(2); uint32_t n = (uint32_t)A(1), got = 0; while (got < n) { ssize_t r = getrandom(b + got, n - got, 0); if (r <= 0) return 0; got += (uint32_t)r; } return 1; }
+S(CryptGenRandom) { 
+    uint8_t *b = P(2); 
+    uint32_t n = (uint32_t)A(1), got = 0; 
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        while (got < n) {
+            ssize_t r = read(fd, b + got, n - got);
+            if (r <= 0) break;
+            got += (uint32_t)r;
+        }
+        close(fd);
+    }
+    return (got == n) ? 1 : 0; 
+}
 S(CryptReleaseContext) { return 1; }
 S(GetUserNameA) { char *b = P(0); uint32_t *sz = P(1); if (!sz) return 0; if (!b || *sz < 7) { *sz = 7; aot_last_error = 122; return 0; } memcpy(b, "player", 7); *sz = 7; return 1; }
 S(RegOpenKeyExA) { return 2; }       /* ERROR_FILE_NOT_FOUND: the registry is not emulated, so no key exists */
