@@ -118,7 +118,7 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
 }
 void android_main(struct android_app *app) {
   g_app = app; app->onAppCmd = on_cmd; app->onInputEvent = on_input;
-  android_app_set_motion_event_filter(app, NULL);   /* deliver joystick axes as well as touch */
+  //android_app_set_motion_event_filter(app, NULL);   /* deliver joystick axes as well as touch */
   pthread_t th; pthread_create(&th, NULL, game_thread, NULL);
   for (;;) { int ev; struct android_poll_source *src;
     while (ALooper_pollAll(100, NULL, &ev, (void **)&src) >= 0) { if (src) src->process(app, src); if (app->destroyRequested) return; } }
