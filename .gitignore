@@ -1,0 +1,6 @@
+output/
+android/app/src/main/cpp/gen/
+android/app/src/main/assets/
+android/app/build/
+android/.gradle/
+__pycache__/

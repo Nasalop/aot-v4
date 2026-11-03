@@ -1,0 +1,4 @@
+LIBRARY d3d10.dll
+EXPORTS
+  D3D10CreateDevice
+  D3D10CreateDeviceAndSwapChain

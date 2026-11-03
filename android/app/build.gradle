@@ -1,0 +1,47 @@
+plugins {
+  id 'com.android.application'
+  id 'com.chaquo.python'
+}
+android {
+  namespace 'com.aot.game'
+  compileSdk 34
+  ndkVersion '26.1.10909125'
+  defaultConfig {
+    applicationId 'com.aot.game'; minSdk 26; targetSdk 34; versionCode 1; versionName '1.0'
+    ndk { abiFilters 'arm64-v8a' }
+  }
+  sourceSets {
+    main {
+      assets.srcDir("$buildDir/generated/thirdPartyAssets")
+    }
+  }
+  externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' } }
+  defaultConfig { externalNativeBuild { cmake { arguments "-DAOT_MODE=${project.findProperty('aotMode') ?: 'transpiler'}" } } }
+  buildTypes { debug { debuggable true } }
+}
+chaquopy {
+  defaultConfig {
+    version = '3.12'
+    pip {
+      install 'pefile==2023.2.7'
+    }
+  }
+  sourceSets {
+    main {
+      srcDir("$projectDir/src/main/python")
+      srcDir("$projectDir/../../src/transpiler")
+      srcDir("$projectDir/../../src/tools")
+    }
+  }
+}
+tasks.register('copyThirdPartyLicenses', Copy) {
+  from("${rootProject.projectDir.parentFile}/third_party_licenses")
+  into("$buildDir/generated/thirdPartyAssets/third_party_licenses")
+}
+tasks.register('copyRuntimeSources', Copy) {
+  from("${rootProject.projectDir.parentFile}/src/runtime") {
+    include 'shims.c', 'win_file.c', 'win_audio.c', 'win_gfx.c', 'win_d3d10.c'
+  }
+  into("$buildDir/generated/thirdPartyAssets/runtime_sources")
+}
+tasks.named('preBuild').configure { dependsOn 'copyThirdPartyLicenses', 'copyRuntimeSources' }

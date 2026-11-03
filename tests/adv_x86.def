@@ -1,0 +1,5 @@
+LIBRARY advapi32.dll
+EXPORTS
+_CryptAcquireContextA@20=CryptAcquireContextA
+_CryptGenRandom@12=CryptGenRandom
+_RegOpenKeyExA@20=RegOpenKeyExA

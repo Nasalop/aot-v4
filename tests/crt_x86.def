@@ -1,0 +1,8 @@
+LIBRARY msvcrt.dll
+EXPORTS
+sqrt
+pow
+malloc
+strlen
+memcpy
+atan2

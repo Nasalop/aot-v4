@@ -1,0 +1,3 @@
+LIBRARY d3d10.dll
+EXPORTS
+_D3D10CreateDeviceAndSwapChain@32=D3D10CreateDeviceAndSwapChain

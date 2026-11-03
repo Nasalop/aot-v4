@@ -1,0 +1,20 @@
+LIBRARY kernel32.dll
+EXPORTS
+_GetStdHandle@4=GetStdHandle
+_WriteFile@20=WriteFile
+_ExitProcess@4=ExitProcess
+_GetProcessHeap@0=GetProcessHeap
+_HeapAlloc@12=HeapAlloc
+_HeapFree@12=HeapFree
+_GetTickCount@0=GetTickCount
+_VirtualAlloc@16=VirtualAlloc
+_CreateThread@24=CreateThread
+_GetCommandLineA@0=GetCommandLineA
+_InterlockedIncrement@4=InterlockedIncrement
+_InterlockedExchangeAdd@8=InterlockedExchangeAdd
+_InterlockedExchange@8=InterlockedExchange
+_CreateEventA@16=CreateEventA
+_SetEvent@4=SetEvent
+_WaitForSingleObject@8=WaitForSingleObject
+_GetCurrentProcess@0=GetCurrentProcess
+_LocalFree@4=LocalFree

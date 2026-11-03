@@ -1,0 +1,3 @@
+LIBRARY dsound.dll
+EXPORTS
+DirectSoundCreate8@12 @11 NONAME

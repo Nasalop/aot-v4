@@ -1,0 +1,12 @@
+LIBRARY msvcrt.dll
+EXPORTS
+printf
+malloc
+free
+memcpy
+strlen
+sqrt
+sin
+cos
+tan
+exit

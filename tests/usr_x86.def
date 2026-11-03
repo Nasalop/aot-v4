@@ -1,0 +1,8 @@
+LIBRARY user32.dll
+EXPORTS
+_RegisterClassExA@4=RegisterClassExA
+_CreateWindowExA@48=CreateWindowExA
+_PeekMessageA@20=PeekMessageA
+_DispatchMessageA@4=DispatchMessageA
+_ShowWindow@8=ShowWindow
+_DefWindowProcA@16=DefWindowProcA

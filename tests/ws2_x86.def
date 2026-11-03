@@ -1,0 +1,8 @@
+LIBRARY ws2_32.dll
+EXPORTS
+_WSAStartup@8=WSAStartup
+_socket@12=socket
+_closesocket@4=closesocket
+_htons@4=htons
+_inet_addr@4=inet_addr
+_WSAGetLastError@0=WSAGetLastError

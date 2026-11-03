@@ -1,0 +1,299 @@
+name: build-apk
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'auto = available game/test; sprite = 2D sprite; cube = textured cube; multi = 3000 cubes; stress = graphics stress test'
+        type: choice
+        options: [auto, triangle, game, stress, cube, multi, sprite]
+        default: auto
+jobs:
+  gfx-stress:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'stress')
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile shaders and Windows test executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'gfx-stress-build'
+          New-Item -ItemType Directory -Force -Path $build | Out-Null
+
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $fxc) { throw 'fxc.exe was not found in the installed Windows SDK.' }
+
+          & $fxc.FullName /nologo /T vs_5_0 /E VSMain /O3 /Fo "$build\stress_vs.cso" tests\gfx_stress.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile vertex shader.' }
+          & $fxc.FullName /nologo /T ps_5_0 /E PSMain /O3 /Fo "$build\stress_ps.cso" tests\gfx_stress.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile pixel shader.' }
+          py -3 tests\embed_gfx_shaders.py "$build\stress_vs.cso" "$build\stress_ps.cso" "$build\gfx_stress_shaders.h"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to embed DXBC shaders.' }
+
+          lib.exe /nologo /def:tests\d3d11.def /machine:x64 /out:"$build\d3d11.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D11 import library.' }
+          lib.exe /nologo /def:tests\user32.def /machine:x64 /out:"$build\user32.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create user32 import library.' }
+          lib.exe /nologo /def:tests\crt.def /machine:x64 /out:"$build\msvcrt.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create CRT import library.' }
+          lib.exe /nologo /def:tests\gfx_stress_winmm.def /machine:x64 /out:"$build\winmm.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create winmm import library.' }
+
+          cl.exe /nologo /c /O2 /GS- /Zl /I"$build" /Fo"$build\gfx_stress.obj" tests\gfx_stress.c
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile graphics stress program.' }
+          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 `
+            /out:tests\gfx_stress.exe "$build\gfx_stress.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib" "$build\winmm.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to link graphics stress executable.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d3d11-graphics-stress-exe
+          path: tests/gfx_stress.exe
+          if-no-files-found: error
+  gfx-cube:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'cube')
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile textured-cube shaders and executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'gfx-cube-build'
+          New-Item -ItemType Directory -Force -Path $build | Out-Null
+
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $fxc) { throw 'fxc.exe was not found in the installed Windows SDK.' }
+
+          & $fxc.FullName /nologo /T vs_5_0 /E VSMain /O3 /Fo "$build\cube_vs.cso" tests\gfx_textured_cube.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile cube vertex shader.' }
+          & $fxc.FullName /nologo /T ps_5_0 /E PSMain /O3 /Fo "$build\cube_ps.cso" tests\gfx_textured_cube.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile cube pixel shader.' }
+          py -3 tests\embed_gfx_shaders.py "$build\cube_vs.cso" "$build\cube_ps.cso" "$build\gfx_cube_shaders.h" aot_cube_vs aot_cube_ps
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to embed cube DXBC shaders.' }
+
+          lib.exe /nologo /def:tests\d3d11.def /machine:x64 /out:"$build\d3d11.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D11 import library.' }
+          lib.exe /nologo /def:tests\user32.def /machine:x64 /out:"$build\user32.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create user32 import library.' }
+          lib.exe /nologo /def:tests\crt.def /machine:x64 /out:"$build\msvcrt.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create CRT import library.' }
+
+          cl.exe /nologo /c /O2 /GS- /Zl /I"$build" /Fo"$build\gfx_textured_cube.obj" tests\gfx_textured_cube.c
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile textured-cube program.' }
+          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 `
+            /out:tests\gfx_textured_cube.exe "$build\gfx_textured_cube.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to link textured-cube executable.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d3d11-textured-cube-exe
+          path: tests/gfx_textured_cube.exe
+          if-no-files-found: error
+  gfx-sprite:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'sprite')
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile 2D sprite shaders and executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'gfx-sprite-build'
+          New-Item -ItemType Directory -Force -Path $build | Out-Null
+
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $fxc) { throw 'fxc.exe was not found in the installed Windows SDK.' }
+
+          & $fxc.FullName /nologo /T vs_5_0 /E VSMain /O3 /Fo "$build\sprite_vs.cso" tests\gfx_2d_sprite.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile 2D sprite vertex shader.' }
+          & $fxc.FullName /nologo /T ps_5_0 /E PSMain /O3 /Fo "$build\sprite_ps.cso" tests\gfx_2d_sprite.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile 2D sprite pixel shader.' }
+          py -3 tests\embed_gfx_shaders.py "$build\sprite_vs.cso" "$build\sprite_ps.cso" "$build\gfx_2d_sprite_shaders.h" aot_2d_sprite_vs aot_2d_sprite_ps
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to embed 2D sprite DXBC shaders.' }
+
+          lib.exe /nologo /def:tests\d3d11.def /machine:x64 /out:"$build\d3d11.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D11 import library.' }
+          lib.exe /nologo /def:tests\user32.def /machine:x64 /out:"$build\user32.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create user32 import library.' }
+          lib.exe /nologo /def:tests\crt.def /machine:x64 /out:"$build\msvcrt.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create CRT import library.' }
+
+          cl.exe /nologo /c /O2 /GS- /Zl /I"$build" /Fo"$build\gfx_2d_sprite.obj" tests\gfx_2d_sprite.c
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile the 2D sprite test.' }
+          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 `
+            /out:tests\gfx_2d_sprite.exe "$build\gfx_2d_sprite.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to link the 2D sprite test.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d3d11-2d-sprite-exe
+          path: tests/gfx_2d_sprite.exe
+          if-no-files-found: error
+  gfx-multi:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'multi')
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile multi-cube shaders and executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $build = Join-Path $env:RUNNER_TEMP 'gfx-multi-build'
+          New-Item -ItemType Directory -Force -Path $build | Out-Null
+
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse |
+            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $fxc) { throw 'fxc.exe was not found in the installed Windows SDK.' }
+
+          & $fxc.FullName /nologo /T vs_5_0 /E VSMain /O3 /Fo "$build\multi_vs.cso" tests\gfx_multi_cube.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile multi-cube vertex shader.' }
+          & $fxc.FullName /nologo /T ps_5_0 /E PSMain /O3 /Fo "$build\multi_ps.cso" tests\gfx_multi_cube.hlsl
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile multi-cube pixel shader.' }
+          py -3 tests\embed_gfx_shaders.py "$build\multi_vs.cso" "$build\multi_ps.cso" "$build\gfx_multi_cube_shaders.h" aot_multi_cube_vs aot_multi_cube_ps
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to embed multi-cube DXBC shaders.' }
+
+          lib.exe /nologo /def:tests\d3d11.def /machine:x64 /out:"$build\d3d11.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D11 import library.' }
+          lib.exe /nologo /def:tests\user32.def /machine:x64 /out:"$build\user32.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create user32 import library.' }
+          lib.exe /nologo /def:tests\crt.def /machine:x64 /out:"$build\msvcrt.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create CRT import library.' }
+          lib.exe /nologo /def:tests\k32.def /machine:x64 /out:"$build\kernel32.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create kernel32 import library.' }
+          lib.exe /nologo /def:tests\d3d10.def /machine:x64 /out:"$build\d3d10.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D10 import library.' }
+
+          cl.exe /nologo /c /O2 /GS- /Zl /I"$build" /Fo"$build\gfx_multi_cube.obj" tests\gfx_multi_cube.c
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to compile the 3000-cube program.' }
+          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 `
+            /out:tests\gfx_multi_cube.exe "$build\gfx_multi_cube.obj" "$build\d3d11.lib" "$build\d3d10.lib" "$build\user32.lib" "$build\msvcrt.lib" "$build\kernel32.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to link the 3000-cube executable.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d3d11-d3d10-3000-cube-exe
+          path: tests/gfx_multi_cube.exe
+          if-no-files-found: error
+  apk:
+    needs: [gfx-stress, gfx-cube, gfx-multi, gfx-sprite]
+    if: always() && (needs.gfx-stress.result == 'success' || needs.gfx-stress.result == 'skipped') && (needs.gfx-cube.result == 'success' || needs.gfx-cube.result == 'skipped') && (needs.gfx-multi.result == 'success' || needs.gfx-multi.result == 'skipped') && (needs.gfx-sprite.result == 'success' || needs.gfx-sprite.result == 'skipped')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Pick mode (game if game/game.exe exists, otherwise Vulkan triangle test)
+        run: |
+          M="${{ github.event.inputs.mode }}"
+          if [ "$GITHUB_EVENT_NAME" = push ] || [ "$M" = multi ]; then
+            echo "AOT_MODE=game" >> $GITHUB_ENV
+            echo "GFX_MULTI=1" >> $GITHUB_ENV
+          elif [ "$M" = cube ]; then
+            echo "AOT_MODE=game" >> $GITHUB_ENV
+            echo "GFX_CUBE=1" >> $GITHUB_ENV
+          elif [ "$M" = stress ]; then
+            echo "AOT_MODE=game" >> $GITHUB_ENV
+            echo "GFX_STRESS=1" >> $GITHUB_ENV
+          elif [ "$M" = sprite ]; then
+            echo "AOT_MODE=game" >> $GITHUB_ENV
+            echo "GFX_SPRITE=1" >> $GITHUB_ENV
+          elif [ "$M" = triangle ]; then echo "AOT_MODE=triangle" >> $GITHUB_ENV
+          elif [ "$M" = game ] && [ -f game/game.exe ]; then echo "AOT_MODE=game" >> $GITHUB_ENV
+          elif [ "$M" = game ]; then echo "game/game.exe is missing" >&2; exit 1
+          elif [ -f game/textured_cube.exe ]; then
+            echo "AOT_MODE=game" >> $GITHUB_ENV
+            echo "GFX_CUBE=1" >> $GITHUB_ENV
+          elif [ -f game/stresst_test.exe ]; then
+            echo "AOT_MODE=game" >> $GITHUB_ENV
+            echo "GFX_STRESS=1" >> $GITHUB_ENV
+          elif [ -f game/game.exe ]; then echo "AOT_MODE=game" >> $GITHUB_ENV
+          else echo "AOT_MODE=triangle" >> $GITHUB_ENV; fi
+      - uses: actions/download-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'stress'
+        with:
+          name: d3d11-graphics-stress-exe
+          path: tests
+      - uses: actions/download-artifact@v4
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'cube')
+        with:
+          name: d3d11-textured-cube-exe
+          path: tests
+      - uses: actions/download-artifact@v4
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'multi')
+        with:
+          name: d3d11-d3d10-3000-cube-exe
+          path: tests
+      - uses: actions/download-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'sprite'
+        with:
+          name: d3d11-2d-sprite-exe
+          path: tests
+      - name: Recompile exe to C
+        if: env.AOT_MODE == 'game'
+        run: |
+          pip install capstone pefile
+          EXE=game/game.exe
+          if [ "${GFX_MULTI:-0}" = "1" ]; then
+            if [ -f tests/gfx_multi_cube.exe ]; then EXE=tests/gfx_multi_cube.exe
+            else EXE=game/gfx_multi_cube.exe; fi
+          elif [ "${GFX_SPRITE:-0}" = "1" ]; then
+            EXE=tests/gfx_2d_sprite.exe
+          elif [ "${GFX_CUBE:-0}" = "1" ]; then
+            if [ -f tests/gfx_textured_cube.exe ]; then EXE=tests/gfx_textured_cube.exe
+            else EXE=game/textured_cube.exe; fi
+          elif [ "${GFX_STRESS:-0}" = "1" ]; then
+            if [ -f tests/gfx_stress.exe ]; then EXE=tests/gfx_stress.exe
+            else EXE=game/stresst_test.exe; fi
+          fi
+          python src/transpiler/aot_transpiler.py "$EXE" android/app/src/main/cpp/gen | tee transpile.log
+          mkdir -p android/app/src/main/assets && cp "$EXE" android/app/src/main/assets/game.exe
+      - name: Android SDK/NDK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.9' }
+      - name: Build APK
+        working-directory: android
+        run: gradle --no-daemon assembleDebug -PaotMode=$AOT_MODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aotgame-apk
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            transpile.log
