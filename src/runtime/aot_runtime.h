@@ -61,6 +61,11 @@ static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int force_trun
   if (r >= 9223372036854775808.0 || r < -9223372036854775808.0) goto bad; return (int64_t)r;
 bad: return bits == 16 ? INT16_MIN : bits == 32 ? INT32_MIN : INT64_MIN;
 }
+static inline int64_t aot_fist_r(aot_f80 v, uint16_t fcw) {
+    // x87 FIST with rounding. '32' because FIST stores a 32-bit integer.
+    // '0' means force_trunc is false, so it obeys the fcw rounding mode.
+    return aot_fist(v, 32, fcw, 0);
+}
 typedef uint64_t (*aot_host_fn)(CPU *);
 
 /* generated tables (aot_tab.c) */
