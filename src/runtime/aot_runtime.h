@@ -52,7 +52,7 @@ static inline void aot_st80(uint64_t a, aot_f80 v) {
 #endif
 }
 /* x87 float -> integer with FCW rounding control (rc<0: truncate). Out-of-range / NaN -> integer indefinite. */
-static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int trunc) {
+static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int force_trunc) {
   int rc = trunc ? 3 : (fcw >> 10) & 3; aot_f80 r;
   if (v != v) goto bad;
   r = rc == 0 ? F80(nearbyint)(v) : rc == 1 ? F80(floor)(v) : rc == 2 ? F80(ceil)(v) : F80(trunc)(v);
