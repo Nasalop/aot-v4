@@ -268,6 +268,16 @@ jobs:
         with:
           name: d3d11-2d-sprite-exe
           path: tests
+      - name: Free disk space (generated C + objects for AC1 are several GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/share/powershell /usr/local/julia* || true
+          sudo apt-get clean || true
+          df -h / /mnt | cat
+      - name: Add swap (AC1-size translations exceed the 7 GB runner RAM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 13G /mnt/aot.swap && sudo chmod 600 /mnt/aot.swap && sudo mkswap /mnt/aot.swap && sudo swapon /mnt/aot.swap
+          free -h; df -h /mnt | tail -1
       - name: Recompile exe to C
         if: env.AOT_MODE == 'game'
         run: |
