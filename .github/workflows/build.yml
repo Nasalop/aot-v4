@@ -27,20 +27,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $build = Join-Path $env:RUNNER_TEMP 'gfx-stress-build'
           New-Item -ItemType Directory -Force -Path $build | Out-Null
-
-          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse |
-            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse | Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $fxc) { throw 'fxc.exe was not found in the installed Windows SDK.' }
-
           & $fxc.FullName /nologo /T vs_5_0 /E VSMain /O3 /Fo "$build\stress_vs.cso" tests\gfx_stress.hlsl
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile vertex shader.' }
           & $fxc.FullName /nologo /T ps_5_0 /E PSMain /O3 /Fo "$build\stress_ps.cso" tests\gfx_stress.hlsl
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile pixel shader.' }
           py -3 tests\embed_gfx_shaders.py "$build\stress_vs.cso" "$build\stress_ps.cso" "$build\gfx_stress_shaders.h"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to embed DXBC shaders.' }
-
           lib.exe /nologo /def:tests\d3d11.def /machine:x64 /out:"$build\d3d11.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D11 import library.' }
           lib.exe /nologo /def:tests\user32.def /machine:x64 /out:"$build\user32.lib"
@@ -49,11 +43,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create CRT import library.' }
           lib.exe /nologo /def:tests\gfx_stress_winmm.def /machine:x64 /out:"$build\winmm.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create winmm import library.' }
-
           cl.exe /nologo /c /O2 /GS- /Zl /I"$build" /Fo"$build\gfx_stress.obj" tests\gfx_stress.c
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile graphics stress program.' }
-          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 `
-            /out:tests\gfx_stress.exe "$build\gfx_stress.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib" "$build\winmm.lib"
+          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 /out:tests\gfx_stress.exe "$build\gfx_stress.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib" "$build\winmm.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to link graphics stress executable.' }
       - uses: actions/upload-artifact@v4
         with:
@@ -78,31 +70,23 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $build = Join-Path $env:RUNNER_TEMP 'gfx-cube-build'
           New-Item -ItemType Directory -Force -Path $build | Out-Null
-
-          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse |
-            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse | Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $fxc) { throw 'fxc.exe was not found in the installed Windows SDK.' }
-
           & $fxc.FullName /nologo /T vs_5_0 /E VSMain /O3 /Fo "$build\cube_vs.cso" tests\gfx_textured_cube.hlsl
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile cube vertex shader.' }
           & $fxc.FullName /nologo /T ps_5_0 /E PSMain /O3 /Fo "$build\cube_ps.cso" tests\gfx_textured_cube.hlsl
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile cube pixel shader.' }
           py -3 tests\embed_gfx_shaders.py "$build\cube_vs.cso" "$build\cube_ps.cso" "$build\gfx_cube_shaders.h" aot_cube_vs aot_cube_ps
           if ($LASTEXITCODE -ne 0) { throw 'Failed to embed cube DXBC shaders.' }
-
           lib.exe /nologo /def:tests\d3d11.def /machine:x64 /out:"$build\d3d11.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D11 import library.' }
           lib.exe /nologo /def:tests\user32.def /machine:x64 /out:"$build\user32.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create user32 import library.' }
           lib.exe /nologo /def:tests\crt.def /machine:x64 /out:"$build\msvcrt.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create CRT import library.' }
-
           cl.exe /nologo /c /O2 /GS- /Zl /I"$build" /Fo"$build\gfx_textured_cube.obj" tests\gfx_textured_cube.c
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile textured-cube program.' }
-          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 `
-            /out:tests\gfx_textured_cube.exe "$build\gfx_textured_cube.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib"
+          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 /out:tests\gfx_textured_cube.exe "$build\gfx_textured_cube.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to link textured-cube executable.' }
       - uses: actions/upload-artifact@v4
         with:
@@ -127,31 +111,23 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $build = Join-Path $env:RUNNER_TEMP 'gfx-sprite-build'
           New-Item -ItemType Directory -Force -Path $build | Out-Null
-
-          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse |
-            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse | Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $fxc) { throw 'fxc.exe was not found in the installed Windows SDK.' }
-
           & $fxc.FullName /nologo /T vs_5_0 /E VSMain /O3 /Fo "$build\sprite_vs.cso" tests\gfx_2d_sprite.hlsl
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile 2D sprite vertex shader.' }
           & $fxc.FullName /nologo /T ps_5_0 /E PSMain /O3 /Fo "$build\sprite_ps.cso" tests\gfx_2d_sprite.hlsl
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile 2D sprite pixel shader.' }
           py -3 tests\embed_gfx_shaders.py "$build\sprite_vs.cso" "$build\sprite_ps.cso" "$build\gfx_2d_sprite_shaders.h" aot_2d_sprite_vs aot_2d_sprite_ps
           if ($LASTEXITCODE -ne 0) { throw 'Failed to embed 2D sprite DXBC shaders.' }
-
           lib.exe /nologo /def:tests\d3d11.def /machine:x64 /out:"$build\d3d11.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D11 import library.' }
           lib.exe /nologo /def:tests\user32.def /machine:x64 /out:"$build\user32.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create user32 import library.' }
           lib.exe /nologo /def:tests\crt.def /machine:x64 /out:"$build\msvcrt.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create CRT import library.' }
-
           cl.exe /nologo /c /O2 /GS- /Zl /I"$build" /Fo"$build\gfx_2d_sprite.obj" tests\gfx_2d_sprite.c
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile the 2D sprite test.' }
-          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 `
-            /out:tests\gfx_2d_sprite.exe "$build\gfx_2d_sprite.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib"
+          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 /out:tests\gfx_2d_sprite.exe "$build\gfx_2d_sprite.obj" "$build\d3d11.lib" "$build\user32.lib" "$build\msvcrt.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to link the 2D sprite test.' }
       - uses: actions/upload-artifact@v4
         with:
@@ -176,20 +152,14 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $build = Join-Path $env:RUNNER_TEMP 'gfx-multi-build'
           New-Item -ItemType Directory -Force -Path $build | Out-Null
-
-          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse |
-            Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
+          $fxc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter fxc.exe -Recurse | Where-Object { $_.FullName -match '\\x64\\fxc\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $fxc) { throw 'fxc.exe was not found in the installed Windows SDK.' }
-
           & $fxc.FullName /nologo /T vs_5_0 /E VSMain /O3 /Fo "$build\multi_vs.cso" tests\gfx_multi_cube.hlsl
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile multi-cube vertex shader.' }
           & $fxc.FullName /nologo /T ps_5_0 /E PSMain /O3 /Fo "$build\multi_ps.cso" tests\gfx_multi_cube.hlsl
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile multi-cube pixel shader.' }
           py -3 tests\embed_gfx_shaders.py "$build\multi_vs.cso" "$build\multi_ps.cso" "$build\gfx_multi_cube_shaders.h" aot_multi_cube_vs aot_multi_cube_ps
           if ($LASTEXITCODE -ne 0) { throw 'Failed to embed multi-cube DXBC shaders.' }
-
           lib.exe /nologo /def:tests\d3d11.def /machine:x64 /out:"$build\d3d11.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D11 import library.' }
           lib.exe /nologo /def:tests\user32.def /machine:x64 /out:"$build\user32.lib"
@@ -200,11 +170,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create kernel32 import library.' }
           lib.exe /nologo /def:tests\d3d10.def /machine:x64 /out:"$build\d3d10.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create D3D10 import library.' }
-
           cl.exe /nologo /c /O2 /GS- /Zl /I"$build" /Fo"$build\gfx_multi_cube.obj" tests\gfx_multi_cube.c
           if ($LASTEXITCODE -ne 0) { throw 'Failed to compile the 3000-cube program.' }
-          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 `
-            /out:tests\gfx_multi_cube.exe "$build\gfx_multi_cube.obj" "$build\d3d11.lib" "$build\d3d10.lib" "$build\user32.lib" "$build\msvcrt.lib" "$build\kernel32.lib"
+          link.exe /nologo /nodefaultlib /entry:mainCRTStartup /subsystem:console /fixed /base:0x140000000 /out:tests\gfx_multi_cube.exe "$build\gfx_multi_cube.obj" "$build\d3d11.lib" "$build\d3d10.lib" "$build\user32.lib" "$build\msvcrt.lib" "$build\kernel32.lib"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to link the 3000-cube executable.' }
       - uses: actions/upload-artifact@v4
         with:
@@ -222,6 +190,20 @@ jobs:
         with: { python-version: '3.12' }
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
+
+      # --- RESTORED MEMORY & STORAGE STUFF ---
+      - name: Free Disk Space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/share/powershell /usr/local/julia* || true
+
+      - name: Add Swap Space
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 13G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h; df -h /mnt | tail -1
+      # ----------------------------------------
         
       - name: Pick mode (game if game/game.exe exists, otherwise Vulkan triangle test)
         run: |
