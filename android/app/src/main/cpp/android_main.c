@@ -1,6 +1,6 @@
 /* NativeActivity host. Game modes (AOT_ANDROID_APP): extract game.exe, redirect stdout/stderr to <ext>/log.txt, run the
  * recompiled game on a thread and feed touch/keyboard/gamepad input to the Win32 layer. Otherwise: idle host for the Java UI. */
-#include <android_native_app_glue.h>
+// #include <android_native_app_glue.h>
 #ifdef AOT_ANDROID_APP
 #include <android/log.h>
 #include <android/input.h>
