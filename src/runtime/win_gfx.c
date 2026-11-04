@@ -82,10 +82,11 @@ static int method_argc(const char *iface, const char *m) {
   return -1;
 }
 static void **build(const char *iface, int n, const Slot *s) {
-  void **vt = calloc(n, aot_is_pe32 ? 4 : sizeof(void *)); char nm[96];
+  const int pad = n + 64;   /* guests may call interface methods we do not model (or a newer interface): slots past the end must hit a loud named thunk, never heap garbage */
+  void **vt = calloc(pad, aot_is_pe32 ? 4 : sizeof(void *)); char nm[96];
   uint32_t *v32 = (uint32_t *)vt;
 #define VSET(i, a) do { if (aot_is_pe32) v32[i] = (uint32_t)(a); else vt[i] = (void *)(uintptr_t)(a); } while (0)
-  for (int i = 0; i < n; i++) { snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", iface, i); VSET(i, aot_register_thunk(NULL, nm)); }
+  for (int i = 0; i < pad; i++) { snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", iface, i); VSET(i, aot_register_thunk(NULL, nm)); }
   for (; s->fn; s++) {
     snprintf(nm, sizeof nm, "%s::%s", iface, s->name); int argc = aot_is_pe32 ? method_argc(iface, s->name) : 0;
     fn_t fn = (aot_is_pe32 && argc < 0) ? NULL : s->fn;   /* unknown stdcall size in PE32 -> unimplemented, loudly */
@@ -123,8 +124,24 @@ static uint32_t release_obj(Obj *o) {
 }
 F(u_release) { return release_obj((Obj *)A(0)); }
 F(u_ok) { return S_OK; }
+/* PE32 (D3D10/DXGI guests): only answer for interfaces this layer actually implements; everything else is E_NOINTERFACE so the game falls back
+ * (ID3D10Device1, debug/info-queue, multithread ... have different vtable layouts and must never alias our objects). */
+static int iid_supported(const uint8_t *g) {
+  static const uint8_t unk[16] = { 0,0,0,0, 0,0, 0,0, 0xC0,0,0,0,0,0,0,0x46 };
+  static const uint8_t dxgi[][16] = {   /* IDXGIObject, IDXGIDeviceSubObject, IDXGIFactory, IDXGIAdapter, IDXGISwapChain */
+    { 0xb8,0x2f,0xc2,0xae, 0xf3,0x76, 0x39,0x46, 0x9b,0xe0,0x28,0xeb,0x43,0xa6,0x7a,0x2e },
+    { 0x79,0x03,0x3e,0x3d, 0xde,0xf9, 0x58,0x4d, 0xbb,0x6c,0x18,0xd6,0x29,0x92,0xf1,0xa6 },
+    { 0xec,0x66,0x71,0x7b, 0xc7,0x21, 0xae,0x44, 0xb2,0x1a,0xc9,0xae,0x32,0x1a,0xe3,0x69 },
+    { 0xe1,0xe7,0x11,0x24, 0xac,0x12, 0xcf,0x4c, 0xbd,0x14,0x97,0x98,0xe8,0x53,0x4d,0xc0 },
+    { 0xa0,0x36,0x0d,0x31, 0xe4,0xd2, 0x4a,0x4b, 0xaa,0x04,0x6a,0x9d,0x23,0xb8,0x88,0x6a } };
+  static const uint8_t d10tail[10] = { 0x2c,0x34, 0x06,0x41, 0xa1,0x9f,0x4f,0x27,0x04,0xf6 };   /* 9B7E4Cxx-342C-4106-A19F-4F2704F689F0 (base ID3D10 family) */
+  if (!memcmp(g, unk, 16) || !memcmp(g, IID_IDXGIDevice, 16)) return 1;
+  for (unsigned i = 0; i < sizeof dxgi / 16; i++) if (!memcmp(g, dxgi[i], 16)) return 1;
+  return g[1] == 0x4c && g[2] == 0x7e && g[3] == 0x9b && g[0] <= 0x1f && !memcmp(g + 4, d10tail, 10) && g[14] == 0x89 && g[15] == 0xf0;
+}
 F(u_qi) {
   Obj *o = (Obj *)A(0), *r = o; const uint8_t *iid = (const uint8_t *)A(1);
+  if (aot_is_pe32 && !iid_supported(iid)) { STP(A(2), NULL); return 0x80004002u; }   /* E_NOINTERFACE */
   if (o->kind == K_DEV && !memcmp(iid, IID_IDXGIDevice, 16)) { if (!o->dxdev) o->dxdev = mkv(K_DXDEV, o); r = o->dxdev; }
   STP(A(2), r); r->refs++; return S_OK;
 }
