@@ -67,7 +67,6 @@ class Rec:
 
     # ---- discovery -------------------------------------------------------
     
-
     def func_range(self, a):
         k = bisect.bisect_right(self.fstarts, a) - 1
         if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
@@ -113,7 +112,6 @@ class Rec:
         except Exception: pass
         return {a for a in s if self.in_text(a)}
 
-
     def table_targets(self, jm, recent):
         """Heuristic jump-table recovery for `jmp reg` / `jmp [tbl+idx*8]`."""
         lo, hi = self.func_range(jm.address)
@@ -145,39 +143,38 @@ class Rec:
         return out
 
     def discover(self):
-    work = list(self.seeds()); self.leaders |= set(work)
-    while work:
-        a = work.pop(); recent = []
-        while a not in self.insns:
-            i = self.decode(a)
-            if i is None or not self.in_text(a): break
-            self.insns[a] = i; recent = (recent + [i])[-120:]
-            mn = i.mnemonic.split()[-1]; nxt = a + i.size
-            direct = i.operands and i.operands[0].type == X86_OP_IMM
-            if mn in ('lea', 'mov', 'movabs', 'push') and len(i.operands) > 0:
-                o = i.operands[-1]
-                t = (i.address + i.size + o.mem.disp if mn == 'lea' and o.mem.base == X86_REG_RIP else o.imm if o.type == X86_OP_IMM else 0)
-                if t and t not in self.leaders and self.in_text(t) and t != nxt: self.leaders.add(t); work.append(t)
-            if mn in ('jmp', 'ljmp'):
-                target = i.operands[-1] if mn == 'ljmp' else i.operands[0]
-                if target.type == X86_OP_IMM: self.leaders.add(target.imm); work.append(target.imm)
-                elif mn == 'jmp':
-                    for t in self.table_targets(i, recent): self.leaders.add(t); work.append(t)
-                break
-            if (mn[0] == 'j' and mn[1:] in COND) or mn.startswith('loop'):
-                t = i.operands[0].imm; self.leaders.update((t, nxt)); work.append(t)
-            elif mn in ('call', 'lcall'):
-                self.leaders.add(nxt)
-                target = i.operands[-1] if mn == 'lcall' else i.operands[0]
-                if target.type == X86_OP_IMM: 
-                    self.leaders.add(target.imm); work.append(target.imm)
-                elif mn == 'call':
-                    # NEW: Check for indirect call jump tables (the bug that crashed AC1)
-                    for t in self.table_targets(i, recent): 
-                        self.leaders.add(t); work.append(t)
-            elif is_term(mn): break
-            a = nxt
-    return self
+        work = list(self.seeds()); self.leaders |= set(work)
+        while work:
+            a = work.pop(); recent = []
+            while a not in self.insns:
+                i = self.decode(a)
+                if i is None or not self.in_text(a): break
+                self.insns[a] = i; recent = (recent + [i])[-120:]
+                mn = i.mnemonic.split()[-1]; nxt = a + i.size
+                direct = i.operands and i.operands[0].type == X86_OP_IMM
+                if mn in ('lea', 'mov', 'movabs', 'push') and len(i.operands) > 0:
+                    o = i.operands[-1]
+                    t = (i.address + i.size + o.mem.disp if mn == 'lea' and o.mem.base == X86_REG_RIP else o.imm if o.type == X86_OP_IMM else 0)
+                    if t and t not in self.leaders and self.in_text(t) and t != nxt: self.leaders.add(t); work.append(t)
+                if mn in ('jmp', 'ljmp'):
+                    target = i.operands[-1] if mn == 'ljmp' else i.operands[0]
+                    if target.type == X86_OP_IMM: self.leaders.add(target.imm); work.append(target.imm)
+                    elif mn == 'jmp':
+                        for t in self.table_targets(i, recent): self.leaders.add(t); work.append(t)
+                    break
+                if (mn[0] == 'j' and mn[1:] in COND) or mn.startswith('loop'):
+                    t = i.operands[0].imm; self.leaders.update((t, nxt)); work.append(t)
+                elif mn in ('call', 'lcall'):
+                    self.leaders.add(nxt)
+                    target = i.operands[-1] if mn == 'lcall' else i.operands[0]
+                    if target.type == X86_OP_IMM: 
+                        self.leaders.add(target.imm); work.append(target.imm)
+                    elif mn == 'call':
+                        for t in self.table_targets(i, recent): 
+                            self.leaders.add(t); work.append(t)
+                elif is_term(mn): break
+                a = nxt
+        return self
 
     def blocks(self):
         bl = []; cur = None; prev = None
