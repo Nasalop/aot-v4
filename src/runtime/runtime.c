@@ -133,24 +133,33 @@ static void bind_delay_imports(uint8_t *img, uint32_t rva, uint32_t size,
   }
 }
 
+/* last imports the guest called (for crash reports) */
+static int recent[32]; static unsigned recent_n;
+static void dump_context(CPU *c) {
+  fprintf(stderr, "[aot] last guest region entry: 0x%llx\n[aot] last imports called (oldest first):\n", (unsigned long long)aot_last_pc);
+  for (unsigned i = 0; i < 32; i++) { int idx = recent[(recent_n + i) % 32]; if (idx > 0 && idx < nthunks) fprintf(stderr, "  %s\n", thunks[idx].name); }
+  if (aot_is_pe32 && c) { uint32_t sp = (uint32_t)c->r[4]; fprintf(stderr, "[aot] eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n[aot] stack:", (unsigned)c->r[0], (unsigned)c->r[1], (unsigned)c->r[2], (unsigned)c->r[3], sp, (unsigned)c->r[5], (unsigned)c->r[6], (unsigned)c->r[7]);
+    for (int i = 0; i < 8; i++) fprintf(stderr, " %08x", LD(uint32_t, sp + 4 * i)); fprintf(stderr, "\n"); }
+}
+
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
   for (;;) {
     if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
       if (idx == EXIT_IDX) { fflush(stdout); exit((int)c->r[0]); }
       if (idx == RET_IDX) return c->r[0];
-      Thunk *t = &thunks[idx];
-      if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); exit(72); }
+      Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx;
+      if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
       if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); continue; }
       c->r[0] = t->fn(c);
       pc = LD(uint64_t, c->r[4]); c->r[4] += 8; continue;
     }
     int lo = 0, hi = aot_nregions - 1, k = -1;
     while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
-    if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); exit(73); }
+    if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
     aot_last_pc = pc;
     uint64_t np = aot_region_fn[k](c, pc);
-    if (np == pc) { fflush(stdout); fprintf(stderr, "\n[aot] address 0x%llx is inside translated code but is not a known entry point (undiscovered indirect jump target)\n", (unsigned long long)pc); exit(73); }
+    if (np == pc) { fflush(stdout); fprintf(stderr, "\n[aot] address 0x%llx is inside translated code but is not a known entry point (undiscovered indirect jump target)\n", (unsigned long long)pc); dump_context(c); exit(73); }
     pc = np;
   }
   (void)stop_idx;
