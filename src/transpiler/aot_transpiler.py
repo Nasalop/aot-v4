@@ -68,7 +68,7 @@ class Rec:
     # ---- discovery -------------------------------------------------------
     
 
- def func_range(self, a):
+def func_range(self, a):
     k = bisect.bisect_right(self.fstarts, a) - 1
     if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
     return (a - 0x4000, a + 0x4000)
@@ -95,13 +95,11 @@ def seeds(self):
         lo_, hi_ = self.base, self.base + len(self.img)
         
         if sec.Characteristics & 0x20000000:
-            # NEW: Scan .text for absolute pointers (catches hidden jump tables)
             for i in range(0, n - self.psz, self.psz):
                 v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, o + i)[0]
                 if lo_ <= v < hi_ and self.in_text(v):
                     s.add(v)
         else:
-            # Old: Scan .rdata and .data for pointers
             for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
                 if lo_ <= v < hi_ and self.in_text(v): s.add(v)
                 
