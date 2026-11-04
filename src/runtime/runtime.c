@@ -231,7 +231,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "executable fingerprint mismatch (wrong exe for this build?)\n");
     return 2;
   }
-  uint8_t *img = mmap((void *)base, simg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+  /* Android: wrap.sh/aot_reserve.so reserved [lo,hi) before ART started; map over our own reservation (never over foreign memory). */
+  const char *rlo = getenv("AOT_RESERVED_LO"), *rhi = getenv("AOT_RESERVED_HI");
+  int inres = rlo && rhi && base >= strtoull(rlo, 0, 0) && base + simg <= strtoull(rhi, 0, 0);
+  uint8_t *img = mmap((void *)base, simg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | (inres ? MAP_FIXED : MAP_FIXED_NOREPLACE), -1, 0);
   if (img != (void *)base) {
     fprintf(stderr, "cannot map image at 0x%llx (size 0x%x): %s\nmappings overlapping that range (from /proc/self/maps):\n", (unsigned long long)base, simg, strerror(errno));
     FILE *mf = fopen("/proc/self/maps", "r"); char ln[512];
