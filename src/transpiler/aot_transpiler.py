@@ -68,50 +68,51 @@ class Rec:
     # ---- discovery -------------------------------------------------------
     
 
-def func_range(self, a):
-    k = bisect.bisect_right(self.fstarts, a) - 1
-    if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
-    return (a - 0x4000, a + 0x4000)
+    def func_range(self, a):
+        k = bisect.bisect_right(self.fstarts, a) - 1
+        if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
+        return (a - 0x4000, a + 0x4000)
 
-def seeds(self):
-    s = {self.entry}
-    # --- QUICK FIX FOR AC1 ---
-    s.add(0x161d686) 
-    # -------------------------
-    pe = self.pe
-    try:
-        if self.m32: raise KeyError
-        d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
-        for off in range(0, d.Size - 11, 12):
-            b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
-            if b == 0: break
-            self.funcs.append((b + self.base, e + self.base))
-            s.add(b + self.base)
-    except Exception: pass
-    self.funcs.sort(); self.fstarts = [f[0] for f in self.funcs]
-    
-    for sec in pe.sections:
-        o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
-        lo_, hi_ = self.base, self.base + len(self.img)
+    def seeds(self):
+        s = {self.entry}
+        # --- QUICK FIX FOR AC1 ---
+        s.add(0x161d686) 
+        # -------------------------
+        pe = self.pe
+        try:
+            if self.m32: raise KeyError
+            d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+            for off in range(0, d.Size - 11, 12):
+                b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
+                if b == 0: break
+                self.funcs.append((b + self.base, e + self.base))
+                s.add(b + self.base)
+        except Exception: pass
+        self.funcs.sort(); self.fstarts = [f[0] for f in self.funcs]
         
-        if sec.Characteristics & 0x20000000:
-            for i in range(0, n - self.psz, self.psz):
-                v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, o + i)[0]
-                if lo_ <= v < hi_ and self.in_text(v):
-                    s.add(v)
-        else:
-            for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
-                if lo_ <= v < hi_ and self.in_text(v): s.add(v)
-                
-    try:
-        tls = pe.DIRECTORY_ENTRY_TLS.struct
-        cb = tls.AddressOfCallBacks
-        while cb:
-            v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
-            if not v: break
-            s.add(v); cb += self.psz
-    except Exception: pass
-    return {a for a in s if self.in_text(a)}
+        for sec in pe.sections:
+            o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
+            lo_, hi_ = self.base, self.base + len(self.img)
+            
+            if sec.Characteristics & 0x20000000:
+                for i in range(0, n - self.psz, self.psz):
+                    v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, o + i)[0]
+                    if lo_ <= v < hi_ and self.in_text(v):
+                        s.add(v)
+            else:
+                for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
+                    if lo_ <= v < hi_ and self.in_text(v): s.add(v)
+                    
+        try:
+            tls = pe.DIRECTORY_ENTRY_TLS.struct
+            cb = tls.AddressOfCallBacks
+            while cb:
+                v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
+                if not v: break
+                s.add(v); cb += self.psz
+        except Exception: pass
+        return {a for a in s if self.in_text(a)}
+
 
     def table_targets(self, jm, recent):
         """Heuristic jump-table recovery for `jmp reg` / `jmp [tbl+idx*8]`."""
