@@ -16,8 +16,9 @@ android {
     }
   }
   externalNativeBuild { cmake { path 'src/main/cpp/CMakeLists.txt'; version '3.22.1' } }
-  defaultConfig { externalNativeBuild { cmake { arguments "-DAOT_MODE=${project.findProperty('aotMode') ?: 'transpiler'}" } } }
+  defaultConfig { externalNativeBuild { cmake { arguments "-DAOT_MODE=${project.findProperty('aotMode') ?: 'transpiler'}", "-DAOT_PREBUILT_GEN=${project.findProperty('aotPrebuilt') ?: ''}" } } }
   buildTypes { debug { debuggable true } }
+  packaging { jniLibs { useLegacyPackaging = true } }   // wrap.sh + libaotreserve.so must be extracted to disk
 }
 chaquopy {
   defaultConfig {
