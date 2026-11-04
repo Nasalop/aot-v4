@@ -138,7 +138,7 @@ static void bind_delay_imports(uint8_t *img, uint32_t rva, uint32_t size,
 }
 
 /* last imports the guest called (for crash reports) */
-static int recent[32]; static unsigned recent_n;
+static int recent[32]; static unsigned recent_n; static uint64_t recent_pc[16]; static unsigned recent_pc_n;   /* last guest region entries */
 uint64_t g_image_size;
 /* crash report helper (called from the signal handler): recent imports + the original x86 bytes of the block being executed, so the faulting code can be disassembled offline */
 void aot_dump_crash_context(void) {
@@ -150,7 +150,16 @@ void aot_dump_crash_context(void) {
     dprintf(2, "\n");
   }
 }
+static void dump_code(uint64_t pc, int before, int after) {
+  if (!g_image_base || pc < g_image_base + (uint64_t)before || pc + after > g_image_base + g_image_size) return;
+  fprintf(stderr, "[aot] image bytes 0x%llx..0x%llx (target at +%d):", (unsigned long long)(pc - before), (unsigned long long)(pc + after), before);
+  for (int i = -before; i < after; i++) fprintf(stderr, "%s%02x", (i + before) % 32 ? "" : "\n  ", ((const uint8_t *)(uintptr_t)pc)[i]);
+  fprintf(stderr, "\n");
+}
 static void dump_context(CPU *c) {
+  fprintf(stderr, "[aot] last region entries (oldest first):");
+  for (unsigned i = 0; i < 16; i++) { uint64_t v = recent_pc[(recent_pc_n + i) % 16]; if (v) fprintf(stderr, " %llx", (unsigned long long)v); }
+  fprintf(stderr, "\n"); dump_code(aot_last_pc, 64, 96);
   fprintf(stderr, "[aot] last guest region entry: 0x%llx\n[aot] last imports called (oldest first):\n", (unsigned long long)aot_last_pc);
   for (unsigned i = 0; i < 32; i++) { int idx = recent[(recent_n + i) % 32]; if (idx > 0 && idx < nthunks) fprintf(stderr, "  %s\n", thunks[idx].name); }
   if (aot_is_pe32 && c) { uint32_t sp = (uint32_t)c->r[4]; fprintf(stderr, "[aot] eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n[aot] stack:", (unsigned)c->r[0], (unsigned)c->r[1], (unsigned)c->r[2], (unsigned)c->r[3], sp, (unsigned)c->r[5], (unsigned)c->r[6], (unsigned)c->r[7]);
@@ -172,7 +181,7 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
     int lo = 0, hi = aot_nregions - 1, k = -1;
     while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
     if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
-    aot_last_pc = pc;
+    aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc;
     uint64_t np = aot_region_fn[k](c, pc);
     if (np == pc) { fflush(stdout); fprintf(stderr, "\n[aot] address 0x%llx is inside translated code but is not a known entry point (undiscovered indirect jump target)\n", (unsigned long long)pc); dump_context(c); exit(73); }
     pc = np;
