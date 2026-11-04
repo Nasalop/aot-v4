@@ -22,6 +22,7 @@ void aot_exit(int code) { fflush(stdout); dprintf(2, "\n[aot] program exited wit
 
 static void *game_thread(void *arg) {
   (void)arg;
+  static int started; if (__atomic_exchange_n(&started, 1, __ATOMIC_SEQ_CST)) return NULL;   /* activity re-creation must not start a second game (it would fail to map the image again) */
   const char *ext = g_app->activity->externalDataPath; char dir[512], exe[600], lg[600];
   snprintf(dir, sizeof dir, "%s/game", ext); mkdir(ext, 0777); mkdir(dir, 0777);
   snprintf(exe, sizeof exe, "%s/game.exe", dir); snprintf(lg, sizeof lg, "%s/log.txt", ext);
@@ -117,19 +118,9 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
   else if (cmd == APP_CMD_DESTROY) aot_input_quit();
 }
 void android_main(struct android_app *app) {
-  // ADD THIS GUARD:
-  static int game_thread_started = 0;
-  if (game_thread_started) {
-      LOG("Game thread already started, ignoring duplicate android_main call");
-      return; 
-  }
-  game_thread_started = 1;
-
   g_app = app; app->onAppCmd = on_cmd; app->onInputEvent = on_input;
   //android_app_set_motion_event_filter(app, NULL);   /* deliver joystick axes as well as touch */
-  
   pthread_t th; pthread_create(&th, NULL, game_thread, NULL);
-  
   for (;;) { int ev; struct android_poll_source *src;
     while (ALooper_pollAll(100, NULL, &ev, (void **)&src) >= 0) { if (src) src->process(app, src); if (app->destroyRequested) return; } }
 }
