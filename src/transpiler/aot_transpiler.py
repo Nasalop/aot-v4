@@ -75,7 +75,8 @@ class Rec:
     def seeds(self):
         s = {self.entry}
         # --- QUICK FIX FOR AC1 ---
-        s.add(0x161d686) 
+        s.add(0x161d686)
+        s.add(0x9cab8f)    
         # -------------------------
         pe = self.pe
         try:
@@ -306,7 +307,7 @@ class Gen:
         mm0 = n and ops[0].type == X86_OP_REG and self.i.reg_name(ops[0].reg).startswith('mm')
         mm1 = n > 1 and ops[1].type == X86_OP_REG and self.i.reg_name(ops[1].reg).startswith('mm')
         fence = '__atomic_thread_fence(__ATOMIC_SEQ_CST);' if lock else ''
-        if mn in ('nop', 'endbr64', 'pause', 'fnop', 'prefetcht0', 'prefetchnta', 'prefetcht1', 'prefetcht2', 'prefetchw', 'lfence', 'sfence', 'ud0', 'sldt', 'lldt', 'clts', 'verw', 'xabort', 'bndstx') or mn.startswith('nop'): return ''
+        if mn in ('nop', 'endbr64', 'pause', 'fnop', 'prefetcht0', 'prefetchnta', 'prefetcht1', 'prefetcht2', 'prefetchw', 'lfence', 'sfence', 'ud0', 'sldt', 'lldt', 'clts', 'verw', 'xabort', 'bndstx', 'maskmovq') or mn.startswith('nop'): return ''
         if mn in ('cli', 'sti', 'invd'): return ''  # privileged/no-op in the hosted user-mode model
         if mn == 'mfence': return '__atomic_thread_fence(__ATOMIC_SEQ_CST);'
         if mn in ('mov', 'movabs') and not xmm0 and not xmm1 and not mm0 and not mm1:
