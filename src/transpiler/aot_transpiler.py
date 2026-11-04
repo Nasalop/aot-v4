@@ -68,7 +68,12 @@ class Rec:
     # ---- discovery -------------------------------------------------------
     
 
-    def func_range(selfdef seeds(self):
+    def func_range(self, a):
+    k = bisect.bisect_right(self.fstarts, a) - 1
+    if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
+    return (a - 0x4000, a + 0x4000)
+
+def seeds(self):
     s = {self.entry}
     # --- QUICK FIX FOR AC1 ---
     s.add(0x161d686) 
@@ -108,10 +113,7 @@ class Rec:
             if not v: break
             s.add(v); cb += self.psz
     except Exception: pass
-    return {a for a in s if self.in_text(a)}, a):
-        k = bisect.bisect_right(self.fstarts, a) - 1
-        if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
-        return (a - 0x4000, a + 0x4000)
+    return {a for a in s if self.in_text(a)}
 
     def table_targets(self, jm, recent):
         """Heuristic jump-table recovery for `jmp reg` / `jmp [tbl+idx*8]`."""
