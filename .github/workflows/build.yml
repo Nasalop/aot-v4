@@ -289,7 +289,12 @@ jobs:
         run: |
           pip install capstone pefile
           python src/transpiler/aot_transpiler.py "${{ env.GAME_EXE }}" android/app/src/main/cpp/gen | tee transpile.log
-
+      - name: Save Transpiled C Code to Cache Immediately
+        if: env.AOT_MODE == 'game' && steps.cache-transpiled.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: android/app/src/main/cpp/gen
+          key: transpiled-game-${{ hashFiles(env.GAME_EXE) }}-v2
       - name: Prepare Android Assets
         if: env.AOT_MODE == 'game'
         run: |
