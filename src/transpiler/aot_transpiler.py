@@ -68,7 +68,7 @@ class Rec:
     # ---- discovery -------------------------------------------------------
     
 
-    def func_range(self, a):
+ def func_range(self, a):
     k = bisect.bisect_right(self.fstarts, a) - 1
     if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
     return (a - 0x4000, a + 0x4000)
