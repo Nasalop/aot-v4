@@ -47,6 +47,10 @@ void aot_thunk_set_pop(uint64_t addr, int pop) {   /* PE32: bytes the callee pop
   uint64_t i = (addr - THUNK_BASE) / THUNK_SZ; if (i < (uint64_t)nthunks) thunks[i].pop = pop;
 }
 
+void aot_thunk_set_fp(uint64_t addr, int fp) {
+  uint64_t i = (addr - THUNK_BASE) / THUNK_SZ; if (i < (uint64_t)nthunks) thunks[i].fp = fp;
+}
+
 uint64_t aot_register_thunk(aot_host_fn fn, const char *name) {
   if (nthunks >= MAXTHUNK) return 0;
   thunks[nthunks].fn = (shim_fn)fn;
