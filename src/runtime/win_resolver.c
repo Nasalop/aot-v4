@@ -246,7 +246,9 @@ uint64_t aot_module_get_proc(uint64_t module_handle,
     symbol = (const char *)(uintptr_t)name_or_ordinal;
     if (!symbol || !*symbol) return 0;
   }
-  shim_fn fn = aot_resolve_import(module->name, symbol);
+  /* PE32: only APIs with a verified stdcall signature (pop size / fp flag) may be handed out; the thunk must carry that ABI or the guest stack is corrupted */
+  int x86_pop = 0, x86_fp = 0; extern void aot_thunk_set_pop(uint64_t, int), aot_thunk_set_fp(uint64_t, int);
+  shim_fn fn = aot_is_pe32 ? aot_x86_resolve(module->name, symbol, &x86_pop, &x86_fp) : aot_resolve_import(module->name, symbol);
   if (!fn) {
     if (getenv("AOT_VERBOSE"))
       fprintf(stderr, "[aot] dynamic GetProcAddress unresolved: %s!%s\n",
@@ -272,6 +274,7 @@ uint64_t aot_module_get_proc(uint64_t module_handle,
       fprintf(stderr, "[aot] dynamic GetProcAddress unresolved: thunk table full\n");
     return 0;
   }
+  if (aot_is_pe32) { aot_thunk_set_pop(thunk, x86_pop); aot_thunk_set_fp(thunk, x86_fp); }
   DynamicThunk *entry = &dynamic_thunks[dynamic_thunk_count++];
   entry->module = module_handle;
   entry->thunk = thunk;
