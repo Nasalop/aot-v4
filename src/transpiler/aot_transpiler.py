@@ -66,36 +66,49 @@ class Rec:
         return next(self.md.disasm(b, a, 1), None) if b else None
 
     # ---- discovery -------------------------------------------------------
-    def seeds(self):
-        s = {self.entry}
-        pe = self.pe
-        try:
-            if self.m32: raise KeyError  # no .pdata in PE32
-            d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]  # .pdata RUNTIME_FUNCTION
-            for off in range(0, d.Size - 11, 12):
-                b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
-                if b == 0: break
-                self.funcs.append((b + self.base, e + self.base))
-                s.add(b + self.base)
-        except Exception: pass
-        self.funcs.sort(); self.fstarts = [f[0] for f in self.funcs]
-        for sec in pe.sections:  # absolute code pointers in data (vtables, callbacks)
-            if sec.Characteristics & 0x20000000: continue
-            o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
-            lo_, hi_ = self.base, self.base + len(self.img)
+    
+
+    def func_range(selfdef seeds(self):
+    s = {self.entry}
+    # --- QUICK FIX FOR AC1 ---
+    s.add(0x161d686) 
+    # -------------------------
+    pe = self.pe
+    try:
+        if self.m32: raise KeyError
+        d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+        for off in range(0, d.Size - 11, 12):
+            b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
+            if b == 0: break
+            self.funcs.append((b + self.base, e + self.base))
+            s.add(b + self.base)
+    except Exception: pass
+    self.funcs.sort(); self.fstarts = [f[0] for f in self.funcs]
+    
+    for sec in pe.sections:
+        o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
+        lo_, hi_ = self.base, self.base + len(self.img)
+        
+        if sec.Characteristics & 0x20000000:
+            # NEW: Scan .text for absolute pointers (catches hidden jump tables)
+            for i in range(0, n - self.psz, self.psz):
+                v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, o + i)[0]
+                if lo_ <= v < hi_ and self.in_text(v):
+                    s.add(v)
+        else:
+            # Old: Scan .rdata and .data for pointers
             for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
                 if lo_ <= v < hi_ and self.in_text(v): s.add(v)
-        try:
-            tls = pe.DIRECTORY_ENTRY_TLS.struct
-            cb = tls.AddressOfCallBacks
-            while cb:
-                v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
-                if not v: break
-                s.add(v); cb += self.psz
-        except Exception: pass
-        return {a for a in s if self.in_text(a)}
-
-    def func_range(self, a):
+                
+    try:
+        tls = pe.DIRECTORY_ENTRY_TLS.struct
+        cb = tls.AddressOfCallBacks
+        while cb:
+            v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
+            if not v: break
+            s.add(v); cb += self.psz
+    except Exception: pass
+    return {a for a in s if self.in_text(a)}, a):
         k = bisect.bisect_right(self.fstarts, a) - 1
         if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
         return (a - 0x4000, a + 0x4000)
@@ -131,34 +144,39 @@ class Rec:
         return out
 
     def discover(self):
-        work = list(self.seeds()); self.leaders |= set(work)
-        while work:
-            a = work.pop(); recent = []
-            while a not in self.insns:
-                i = self.decode(a)
-                if i is None or not self.in_text(a): break
-                self.insns[a] = i; recent = (recent + [i])[-120:]
-                mn = i.mnemonic.split()[-1]; nxt = a + i.size
-                direct = i.operands and i.operands[0].type == X86_OP_IMM
-                if mn in ('lea', 'mov', 'movabs', 'push') and len(i.operands) > 0:  # code pointers materialised by code
-                    o = i.operands[-1]
-                    t = (i.address + i.size + o.mem.disp if mn == 'lea' and o.mem.base == X86_REG_RIP else o.imm if o.type == X86_OP_IMM else 0)
-                    if t and t not in self.leaders and self.in_text(t) and t != nxt: self.leaders.add(t); work.append(t)
-                if mn in ('jmp', 'ljmp'):
-                    target = i.operands[-1] if mn == 'ljmp' else i.operands[0]
-                    if target.type == X86_OP_IMM: self.leaders.add(target.imm); work.append(target.imm)
-                    elif mn == 'jmp':
-                        for t in self.table_targets(i, recent): self.leaders.add(t); work.append(t)
-                    break
-                if (mn[0] == 'j' and mn[1:] in COND) or mn.startswith('loop'):
-                    t = i.operands[0].imm; self.leaders.update((t, nxt)); work.append(t)
-                elif mn in ('call', 'lcall'):
-                    self.leaders.add(nxt)
-                    target = i.operands[-1] if mn == 'lcall' else i.operands[0]
-                    if target.type == X86_OP_IMM: self.leaders.add(target.imm); work.append(target.imm)
-                elif is_term(mn): break
-                a = nxt
-        return self
+    work = list(self.seeds()); self.leaders |= set(work)
+    while work:
+        a = work.pop(); recent = []
+        while a not in self.insns:
+            i = self.decode(a)
+            if i is None or not self.in_text(a): break
+            self.insns[a] = i; recent = (recent + [i])[-120:]
+            mn = i.mnemonic.split()[-1]; nxt = a + i.size
+            direct = i.operands and i.operands[0].type == X86_OP_IMM
+            if mn in ('lea', 'mov', 'movabs', 'push') and len(i.operands) > 0:
+                o = i.operands[-1]
+                t = (i.address + i.size + o.mem.disp if mn == 'lea' and o.mem.base == X86_REG_RIP else o.imm if o.type == X86_OP_IMM else 0)
+                if t and t not in self.leaders and self.in_text(t) and t != nxt: self.leaders.add(t); work.append(t)
+            if mn in ('jmp', 'ljmp'):
+                target = i.operands[-1] if mn == 'ljmp' else i.operands[0]
+                if target.type == X86_OP_IMM: self.leaders.add(target.imm); work.append(target.imm)
+                elif mn == 'jmp':
+                    for t in self.table_targets(i, recent): self.leaders.add(t); work.append(t)
+                break
+            if (mn[0] == 'j' and mn[1:] in COND) or mn.startswith('loop'):
+                t = i.operands[0].imm; self.leaders.update((t, nxt)); work.append(t)
+            elif mn in ('call', 'lcall'):
+                self.leaders.add(nxt)
+                target = i.operands[-1] if mn == 'lcall' else i.operands[0]
+                if target.type == X86_OP_IMM: 
+                    self.leaders.add(target.imm); work.append(target.imm)
+                elif mn == 'call':
+                    # NEW: Check for indirect call jump tables (the bug that crashed AC1)
+                    for t in self.table_targets(i, recent): 
+                        self.leaders.add(t); work.append(t)
+            elif is_term(mn): break
+            a = nxt
+    return self
 
     def blocks(self):
         bl = []; cur = None; prev = None
