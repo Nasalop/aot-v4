@@ -295,7 +295,11 @@ jobs:
         run: |
           mkdir -p android/app/src/main/assets && cp "${{ env.GAME_EXE }}" android/app/src/main/assets/game.exe
           if [ ! -f transpile.log ]; then touch transpile.log; fi
-
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+         key: ${{ github.job }}-${{ runner.os }}
+         max-size: 2G
       - name: Android SDK/NDK
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
