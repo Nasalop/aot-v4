@@ -24,10 +24,16 @@ SX(LocalFree) { aot_gfree((void *)(uintptr_t)(uint32_t)c->r[1]); return 0; }
 #define D(dll, n, b) { dll, #n, b, 0, NULL }
 #define C(n) { "msvcrt.dll", #n, 0, 0, NULL }
 #define CF(n, nd) { "msvcrt.dll", #n, 0, nd, NULL }
+/* Fiber-local storage maps onto the thread-local-storage shims (the FLS destructor callback is never run) */
+static uint64_t tls_by_name(CPU *c, const char *n) { shim_fn f = aot_resolve_import("kernel32.dll", n); return f ? f(c) : 0; }
+static uint64_t x86_FlsAlloc(CPU *c) { return tls_by_name(c, "TlsAlloc"); }
+static uint64_t x86_FlsGetValue(CPU *c) { return tls_by_name(c, "TlsGetValue"); }
+static uint64_t x86_FlsSetValue(CPU *c) { return tls_by_name(c, "TlsSetValue"); }
+static uint64_t x86_FlsFree(CPU *c) { return tls_by_name(c, "TlsFree"); }
 static const X86Api aot_x86_apis[] = {
   K(GetStdHandle, 4), K(WriteFile, 20), K(ReadFile, 20), K(CloseHandle, 4), K(ExitProcess, 4), K(GetTickCount, 0), K(Sleep, 4),
   K(GetLastError, 0), K(SetLastError, 4), K(QueryPerformanceCounter, 4), K(QueryPerformanceFrequency, 4),
-  K(GetCurrentThreadId, 0), K(GetCurrentProcessId, 0), K(TlsAlloc, 0), K(TlsGetValue, 4), K(TlsSetValue, 8), K(TlsFree, 4),
+  K(GetCurrentThreadId, 0), K(GetCurrentProcessId, 0), K(TlsAlloc, 0), K(TlsGetValue, 4), K(TlsSetValue, 8), K(TlsFree, 4), KL(FlsAlloc, 4), KL(FlsGetValue, 4), KL(FlsSetValue, 8), KL(FlsFree, 4),
   K(InitializeCriticalSection, 4), K(EnterCriticalSection, 4), K(LeaveCriticalSection, 4), K(DeleteCriticalSection, 4),
   K(GetProcessHeap, 0), K(HeapAlloc, 12), K(HeapFree, 12), K(HeapReAlloc, 16), K(VirtualAlloc, 16), K(VirtualFree, 12),
   K(CreateFileA, 28), K(SetFilePointer, 16), K(GetFileSize, 8), K(GetModuleHandleA, 4),
