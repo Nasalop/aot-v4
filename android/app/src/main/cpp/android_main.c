@@ -117,9 +117,19 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
   else if (cmd == APP_CMD_DESTROY) aot_input_quit();
 }
 void android_main(struct android_app *app) {
+  // ADD THIS GUARD:
+  static int game_thread_started = 0;
+  if (game_thread_started) {
+      LOG("Game thread already started, ignoring duplicate android_main call");
+      return; 
+  }
+  game_thread_started = 1;
+
   g_app = app; app->onAppCmd = on_cmd; app->onInputEvent = on_input;
   //android_app_set_motion_event_filter(app, NULL);   /* deliver joystick axes as well as touch */
+  
   pthread_t th; pthread_create(&th, NULL, game_thread, NULL);
+  
   for (;;) { int ev; struct android_poll_source *src;
     while (ALooper_pollAll(100, NULL, &ev, (void **)&src) >= 0) { if (src) src->process(app, src); if (app->destroyRequested) return; } }
 }
