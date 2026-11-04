@@ -135,6 +135,17 @@ static void bind_delay_imports(uint8_t *img, uint32_t rva, uint32_t size,
 
 /* last imports the guest called (for crash reports) */
 static int recent[32]; static unsigned recent_n;
+uint64_t g_image_size;
+/* crash report helper (called from the signal handler): recent imports + the original x86 bytes of the block being executed, so the faulting code can be disassembled offline */
+void aot_dump_crash_context(void) {
+  dprintf(2, "[aot] last imports called (oldest first):\n");
+  for (unsigned i = 0; i < 32; i++) { int idx = recent[(recent_n + i) % 32]; if (idx > 0 && idx < nthunks) dprintf(2, "  %s\n", thunks[idx].name); }
+  if (g_image_base && aot_last_pc >= g_image_base && aot_last_pc + 160 <= g_image_base + g_image_size) {
+    dprintf(2, "[aot] code at 0x%llx:", (unsigned long long)aot_last_pc);
+    for (int i = 0; i < 160; i++) dprintf(2, "%s%02x", i % 32 ? "" : "\n  ", ((const uint8_t *)(uintptr_t)aot_last_pc)[i]);
+    dprintf(2, "\n");
+  }
+}
 static void dump_context(CPU *c) {
   fprintf(stderr, "[aot] last guest region entry: 0x%llx\n[aot] last imports called (oldest first):\n", (unsigned long long)aot_last_pc);
   for (unsigned i = 0; i < 32; i++) { int idx = recent[(recent_n + i) % 32]; if (idx > 0 && idx < nthunks) fprintf(stderr, "  %s\n", thunks[idx].name); }
@@ -251,7 +262,7 @@ int main(int argc, char **argv) {
     if (mf) fclose(mf);
     return 2;
   }
-  g_image_base = base;
+  g_image_base = base; g_image_size = simg;
   memcpy(img, file, shdr);
   for (int i = 0; i < nsec; i++) {
     const uint8_t *s = file + opt + optsz + 40 * i; uint32_t va = u32(s, 12), raw = u32(s, 16), ptr = u32(s, 20), vs = u32(s, 8);
