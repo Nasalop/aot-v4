@@ -231,8 +231,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "executable fingerprint mismatch (wrong exe for this build?)\n");
     return 2;
   }
-  uint8_t *img = mmap((void *)base, simg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-  if (img != (void *)base) { fprintf(stderr, "cannot map image at 0x%llx: %s\n", (unsigned long long)base, strerror(errno)); return 2; }
+  uint8_t *img = mmap((void *)base, simg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+  if (img != (void *)base) {
+    fprintf(stderr, "cannot map image at 0x%llx (size 0x%x): %s\nmappings overlapping that range (from /proc/self/maps):\n", (unsigned long long)base, simg, strerror(errno));
+    FILE *mf = fopen("/proc/self/maps", "r"); char ln[512];
+    while (mf && fgets(ln, sizeof ln, mf)) { unsigned long long lo, hi; if (sscanf(ln, "%llx-%llx", &lo, &hi) == 2 && lo < base + simg && hi > base) fputs(ln, stderr); }
+    if (mf) fclose(mf);
+    return 2;
+  }
   g_image_base = base;
   memcpy(img, file, shdr);
   for (int i = 0; i < nsec; i++) {
