@@ -270,6 +270,17 @@ SYS(AddVectoredExceptionHandler) { pthread_mutex_lock(&G); uint64_t h = 0; if (n
 SYS(RemoveVectoredExceptionHandler) { pthread_mutex_lock(&G); for (int i = 0; i < nveh; i++) if (veh[i] == A(0)) { memmove(veh + i, veh + i + 1, sizeof(uint64_t) * (nveh - i - 1)); nveh--; break; } pthread_mutex_unlock(&G); return 1; }
 SYS(SetUnhandledExceptionFilter) { uint64_t old = unhandled_filter; unhandled_filter = A(0); return old; }
 static int dispatch_exception(CPU *c, uint32_t code, uint32_t flags, uint32_t n, uint64_t args) {   /* 1 = continue execution */
+  /* MSVC Thread Naming Exception: 0x406D1388 */
+  if (code == 0x406D1388) {
+      // fprintf(stderr, "[aot] Ignored thread naming exception 0x406D1388\n");
+      return 1; 
+  }
+  /* Debug Breakpoint Exception */
+  if (code == 0x80000003) {
+      // fprintf(stderr, "[aot] Ignored breakpoint exception 0x80000003\n");
+      return 1;
+  }
+
   if (n > 15) n = 15;
   size_t rec_size = aot_is_pe32 ? 80 : 160, ctx_size = aot_is_pe32 ? 0x2cc : 1280 + 16;
   uint8_t *rec = aot_gcalloc(1, rec_size), *ctx = aot_gcalloc(1, ctx_size);
@@ -290,7 +301,8 @@ static int dispatch_exception(CPU *c, uint32_t code, uint32_t flags, uint32_t n,
   int handled = 0;
   for (int i = 0; i < nveh && !handled; i++) if ((int32_t)aot_call(c, veh[i], 1, (uint64_t)(uintptr_t)ptrs) == -1) handled = 1;
   if (!handled && unhandled_filter && (int32_t)aot_call(c, unhandled_filter, 1, (uint64_t)(uintptr_t)ptrs) == -1) handled = 1;
-  aot_gfree(rec); aot_gfree(ctx); aot_gfree(ptrs); return handled;
+  aot_gfree(rec); aot_gfree(ctx); aot_gfree(ptrs); 
+  return handled;
 }
 SYS(RaiseException) {
   uint32_t code = (uint32_t)A(0), flags = (uint32_t)A(1), n = (uint32_t)A(2);
