@@ -311,11 +311,16 @@ jobs:
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0" >/dev/null
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: '8.9' }
-        
+      - name: Configure CMake with ccache
+        run: |
+          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
       - name: Build APK
         working-directory: android
         run: gradle --no-daemon assembleDebug -PaotMode=$AOT_MODE
-        
+      - name: Check ccache stats
+        if: always()
+        run: ccache -s  
       - uses: actions/upload-artifact@v4
         with:
           name: aotgame-apk
