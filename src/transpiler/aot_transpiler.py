@@ -1202,6 +1202,314 @@ class Gen:
             if ops[1].type == X86_OP_REG and self.i.reg_name(ops[1].reg) in ('es', 'cs', 'ss', 'ds', 'fs', 'gs'):
                 return self.wrop(ops[0], self.sreg(ops[1]), S)
             return self.wrop(ops[0], self.rdop(ops[1], S), S)
+#!/usr/bin/env python3
+"""Static recompiler: x86_64 Windows PE -> portable C (guest addr == host addr, mapped at ImageBase).
+usage: aot_transpiler.py game.exe out_dir"""
+import sys, os, struct, bisect
+from collections import Counter
+import pefile
+from capstone import *
+from capstone.x86 import *
+
+F5 = ('cf', 'zf', 'sf', 'of', 'pf')
+N64 = ['rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi'] + ['r%d' % i for i in range(8, 16)]
+REG = {}
+for i, n in enumerate(N64): REG[n] = (i, 8, 0)
+for i, n in enumerate(['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi'] + ['r%dd' % i for i in range(8, 16)]): REG[n] = (i, 4, 0)
+for i, n in enumerate(['ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'] + ['r%dw' % i for i in range(8, 16)]): REG[n] = (i, 2, 0)
+for i, n in enumerate(['al', 'cl', 'dl', 'bl', 'spl', 'bpl', 'sil', 'dil'] + ['r%db' % i for i in range(8, 16)]): REG[n] = (i, 1, 0)
+for i, n in enumerate(['ah', 'ch', 'dh', 'bh']): REG[n] = (i, 1, 1)
+
+COND = {'o': 'of', 'no': '!of', 'b': 'cf', 'c': 'cf', 'nae': 'cf', 'ae': '!cf', 'nb': '!cf', 'nc': '!cf', 'e': 'zf', 'z': 'zf',
+        'ne': '!zf', 'nz': '!zf', 'be': '(cf|zf)', 'na': '(cf|zf)', 'a': '!(cf|zf)', 'nbe': '!(cf|zf)', 's': 'sf', 'ns': '!sf',
+        'p': 'pf', 'pe': 'pf', 'np': '!pf', 'po': '!pf', 'l': '(sf!=of)', 'nge': '(sf!=of)', 'ge': '(sf==of)', 'nl': '(sf==of)',
+        'rcxz': '(r1==0)', 'ecxz': '((uint32_t)r1==0)', 'le': '(zf|(sf!=of))', 'ng': '(zf|(sf!=of))', 'g': '!(zf|(sf!=of))', 'nle': '!(zf|(sf!=of))'}
+
+def _fm(kinds, f): return sum(getattr(sys.modules['capstone.x86'], 'X86_EFLAGS_%s_%s' % (k, f.upper())) for k in kinds)
+WMASK = {f: _fm(('MODIFY', 'SET', 'RESET', 'UNDEFINED'), f) for f in F5}  # any of these bits is non-overlapping per flag
+TMASK = {f: _fm(('TEST',), f) for f in F5}
+MASK64 = (1 << 64) - 1
+
+def image_fingerprint(path):
+    value = 14695981039346656037
+    with open(path, 'rb') as image:
+        while True:
+            chunk = image.read(1024 * 1024)
+            if not chunk: break
+            for byte in chunk:
+                value = ((value ^ byte) * 1099511628211) & MASK64
+    return value
+
+class Unsup(Exception): pass
+
+def is_term(mn): return mn in ('jmp', 'ljmp', 'ret', 'retf', 'iret', 'iretd', 'iretq', 'ud2', 'int3', 'hlt') or (mn[0] == 'j' and mn[1:] in COND)
+
+class Rec:
+    def __init__(self, path):
+        self.pe = pefile.PE(path)
+        pe = self.pe
+        mg, mc = pe.OPTIONAL_HEADER.Magic, pe.FILE_HEADER.Machine
+        if not ((mg == 0x20b and mc == 0x8664) or (mg == 0x10b and mc == 0x14c)):
+            sys.exit('ERROR: unsupported PE (machine 0x%x, magic 0x%x). Supported: x64 PE32+ and x86 PE32.' % (mc, mg))
+        self.m32 = mg == 0x10b; self.psz = 4 if self.m32 else 8
+        self.base = pe.OPTIONAL_HEADER.ImageBase
+        self.image_hash = image_fingerprint(path)
+        self.img = bytes(pe.get_memory_mapped_image())
+        self.md = Cs(CS_ARCH_X86, CS_MODE_32 if self.m32 else CS_MODE_64); self.md.detail = True
+        self.text = [(s.VirtualAddress + self.base, s.VirtualAddress + self.base + max(s.Misc_VirtualSize, s.SizeOfRawData))
+                     for s in pe.sections if s.Characteristics & 0x20000000]
+        self.insns = {}; self.leaders = set(); self.unsup = Counter(); self.funcs = []
+        self.entry = self.base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
+
+    def in_text(self, a): return any(lo <= a < hi for lo, hi in self.text)
+    def rd(self, a, n):
+        o = a - self.base
+        return self.img[o:o + n] if 0 <= o < len(self.img) else b''
+    def decode(self, a):
+        b = self.rd(a, 15)
+        return next(self.md.disasm(b, a, 1), None) if b else None
+
+    # ---- discovery -------------------------------------------------------
+    def seeds(self):
+        s = {self.entry}
+        pe = self.pe
+        try:
+            if self.m32: raise KeyError  # no .pdata in PE32
+            d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]  # .pdata RUNTIME_FUNCTION
+            for off in range(0, d.Size - 11, 12):
+                b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
+                if b == 0: break
+                self.funcs.append((b + self.base, e + self.base))
+                s.add(b + self.base)
+        except Exception: pass
+        self.funcs.sort(); self.fstarts = [f[0] for f in self.funcs]
+        for sec in pe.sections:  # absolute code pointers in data (vtables, callbacks)
+            if sec.Characteristics & 0x20000000: continue
+            o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
+            lo_, hi_ = self.base, self.base + len(self.img)
+            for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
+                if lo_ <= v < hi_ and self.in_text(v): s.add(v)
+        try:
+            tls = pe.DIRECTORY_ENTRY_TLS.struct
+            cb = tls.AddressOfCallBacks
+            while cb:
+                v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
+                if not v: break
+                s.add(v); cb += self.psz
+        except Exception: pass
+        return {a for a in s if self.in_text(a)}
+
+    def func_range(self, a):
+        k = bisect.bisect_right(self.fstarts, a) - 1
+        if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
+        return (a - 0x4000, a + 0x4000)
+
+    def table_targets(self, jm, recent):
+        """Heuristic jump-table recovery for `jmp reg` / `jmp [tbl+idx*8]`."""
+        lo, hi = self.func_range(jm.address)
+        lo = max(lo, self.text[0][0]); out = set()
+        cands = []  # (table address, kind) kind 'rva' | 'abs' | 'rel:<base>'
+        ops = jm.operands
+        if ops[0].type == X86_OP_MEM and ops[0].mem.scale == self.psz and ops[0].mem.base == 0 and ops[0].mem.index:
+            cands.append((ops[0].mem.disp & MASK64, 'abs'))
+        leas = {}
+        for i in recent:
+            if i.mnemonic == 'lea' and i.operands[1].mem.base == X86_REG_RIP:
+                leas[i.operands[0].reg] = i.address + i.size + i.operands[1].mem.disp
+        for i in reversed(recent):
+            for o in i.operands:
+                if o.type == X86_OP_MEM and o.mem.scale == 4 and o.mem.index and o.mem.base != X86_REG_RIP:
+                    if o.mem.base in leas: cands.append((leas[o.mem.base], 'rel:%d' % leas[o.mem.base]))
+                    if o.mem.disp > 0 and not self.m32: cands.append((self.base + o.mem.disp, 'rva'))
+        for tab, kind in cands:
+            found = []
+            for k in range(0, 2048):
+                if kind == 'abs': v = struct.unpack('<Q', self.rd(tab + self.psz * k, self.psz).ljust(8, b'\0'))[0]
+                else:
+                    raw = self.rd(tab + 4 * k, 4)
+                    if len(raw) < 4: break
+                    v = struct.unpack('<I', raw)[0] + self.base if kind == 'rva' else (tab + struct.unpack('<i', raw)[0]) & MASK64
+                if lo <= v < hi + 1 and self.in_text(v): found.append(v)
+                else: break
+            if found: out.update(found); break
+        return out
+
+    def discover(self):
+        work = list(self.seeds()); self.leaders |= set(work)
+        while work:
+            a = work.pop(); recent = []
+            while a not in self.insns:
+                i = self.decode(a)
+                if i is None or not self.in_text(a): break
+                self.insns[a] = i; recent = (recent + [i])[-120:]
+                mn = i.mnemonic.split()[-1]; nxt = a + i.size
+                direct = i.operands and i.operands[0].type == X86_OP_IMM
+                if mn in ('lea', 'mov', 'movabs', 'push') and len(i.operands) > 0:  # code pointers materialised by code
+                    o = i.operands[-1]
+                    t = (i.address + i.size + o.mem.disp if mn == 'lea' and o.mem.base == X86_REG_RIP else o.imm if o.type == X86_OP_IMM else 0)
+                    if t and t not in self.leaders and self.in_text(t) and t != nxt: self.leaders.add(t); work.append(t)
+                if mn in ('jmp', 'ljmp'):
+                    target = i.operands[-1] if mn == 'ljmp' else i.operands[0]
+                    if target.type == X86_OP_IMM: self.leaders.add(target.imm); work.append(target.imm)
+                    elif mn == 'jmp':
+                        for t in self.table_targets(i, recent): self.leaders.add(t); work.append(t)
+                    break
+                if (mn[0] == 'j' and mn[1:] in COND) or mn.startswith('loop'):
+                    t = i.operands[0].imm; self.leaders.update((t, nxt)); work.append(t)
+                elif mn in ('call', 'lcall'):
+                    self.leaders.add(nxt)
+                    target = i.operands[-1] if mn == 'lcall' else i.operands[0]
+                    if target.type == X86_OP_IMM: self.leaders.add(target.imm); work.append(target.imm)
+                elif is_term(mn): break
+                a = nxt
+            else:
+                # Decoding ran into an already-decoded address: two instruction chains converge here (overlapping decodes from a
+                # mid-instruction seed). That address must be a block entry, or the real chain falls through into a block that
+                # swallowed it and has no case label.
+                self.leaders.add(a)
+        return self
+
+    def blocks(self):
+        bl = []; cur = None; prev = None
+        for a in sorted(self.insns):
+            i = self.insns[a]
+            if cur is None or a in self.leaders or prev is None or prev.address + prev.size != a or is_term(prev.mnemonic.split()[-1]) \
+               or prev.mnemonic.split()[-1] in ('call', 'lcall') or prev.mnemonic.split()[-1].startswith('loop') or (prev.mnemonic.split()[-1][0] == 'j'):
+                cur = []; bl.append(cur)
+            cur.append(i); prev = i
+        return bl
+
+# ---------------------------------------------------------------------------
+class Gen:
+    def __init__(self, rec):
+        self.rec = rec; self.i = None; self.m32 = bool(getattr(rec, 'm32', False))
+
+    # operands ---------------------------------------------------------------
+    def reg(self, r):
+        n = self.i.reg_name(r)
+        if n not in REG: raise Unsup('reg ' + n)
+        return REG[n]
+    _mmx_ctx = None   # set while an MMX op is emulated through its SSE2 lane implementation (8-byte value in the low half)
+    def xr(self, op):
+        n = self.i.reg_name(op.reg)
+        if self._mmx_ctx is not None and n.startswith('mm') and n[2:].isdigit(): return 'mx_d' if op is self._mmx_ctx else 'mx_s'
+        if not n.startswith('xmm'): raise Unsup('reg ' + n)
+        return 'c->x[%s]' % n[3:]
+    def mmr(self, op):
+        n = self.i.reg_name(op.reg)
+        if not n.startswith('mm') or not n[2:].isdigit(): raise Unsup('reg ' + n)
+        return 'c->mm[%s]' % n[2:]
+    def sreg(self, op):
+        n = self.i.reg_name(op.reg)
+        if n not in ('es', 'cs', 'ss', 'ds', 'fs', 'gs'): raise Unsup('reg ' + n)
+        return 'c->sregs[%d]' % ('es cs ss ds fs gs'.split().index(n))
+    def addr(self, op):
+        m = op.mem; i = self.i
+        if self.m32:
+            p = []
+            if m.base: p.append('r%d' % self.reg(m.base)[0])
+            if m.index: p.append('r%d*%d' % (self.reg(m.index)[0], m.scale))
+            if m.disp or not p: p.append('0x%xULL' % (m.disp & 0xFFFFFFFF))
+            e = '(uint64_t)(uint32_t)(%s)' % '+'.join(p)
+        elif m.base == X86_REG_RIP:
+            e = '0x%xULL' % ((i.address + i.size + m.disp) & MASK64)
+        else:
+            p = []
+            if m.base: p.append('r%d' % self.reg(m.base)[0])
+            if m.index: p.append('r%d*%d' % (self.reg(m.index)[0], m.scale))
+            if m.disp or not p: p.append('0x%xULL' % (m.disp & MASK64))
+            e = '(uint64_t)(%s)' % '+'.join(p)
+        if m.segment in (X86_REG_GS, X86_REG_FS): e = '(%s+c->gs)' % e
+        return e
+    def rdop(self, op, S=None):
+        S = S or op.size; T = 'uint%d_t' % (8 * S)
+        if op.type == X86_OP_REG:
+            n, s, h = self.reg(op.reg)
+            return '(uint8_t)(r%d>>8)' % n if h else '(%s)r%d' % (T if s == S else 'uint%d_t' % (8 * s), n)
+        if op.type == X86_OP_IMM: return '((%s)0x%xULL)' % (T, op.imm & ((1 << (8 * S)) - 1))
+        return 'LD(%s,%s)' % (T, self.addr(op))
+    def wrop(self, op, v, S=None):
+        S = S or op.size
+        if op.type == X86_OP_MEM: return 'ST(uint%d_t,%s,%s);' % (8 * S, self.addr(op), v)
+        n, s, h = self.reg(op.reg)
+        if h: return 'r%d=(r%d&~0xFF00ULL)|((uint64_t)(uint8_t)(%s)<<8);' % (n, n, v)
+        if s == 8: return 'r%d=(uint64_t)(%s);' % (n, v)
+        if s == 4: return 'r%d=(uint32_t)(%s);' % (n, v)
+        return 'r%d=(r%d&~0x%xULL)|(uint%d_t)(%s);' % (n, n, (1 << 8 * s) - 1, 8 * s, v)
+
+    def fl(self, need, **kw):  # emit flag assignments that are live
+        return ''.join('%s=%s;' % (f, e) for f, e in kw.items() if f in need)
+
+    # ALU -----------------------------------------------------------------
+    def alu(self, mn, S, a, b, dst, need, nowrite=False):
+        T = 'uint%d_t' % (8 * S); sb = 8 * S - 1; ST_ = 'int%d_t' % (8 * S)
+        com = dict(zf='r==0', sf='(r>>%d)&1' % sb, pf='PAR(r)')
+        pre = '%s a=%s,b=%s;' % (T, a, b)
+        if mn == 'add': core, f = 'T r=a+b;', dict(cf='r<a', of='(((a^r)&(b^r))>>%d)&1' % sb)
+        elif mn in ('sub', 'cmp'): core, f = 'T r=a-b;', dict(cf='a<b', of='(((a^b)&(a^r))>>%d)&1' % sb)
+        elif mn == 'adc': core, f = 'T cin=cf; T r=a+b+cin;', dict(cf='cin?r<=a:r<a', of='(((a^r)&(b^r))>>%d)&1' % sb)
+        elif mn == 'sbb': core, f = 'T cin=cf; T r=a-b-cin;', dict(cf='cin?a<=b:a<b', of='(((a^b)&(a^r))>>%d)&1' % sb)
+        else:
+            op = {'and': '&', 'test': '&', 'or': '|', 'xor': '^'}[mn]
+            core, f = 'T r=a%sb;' % op, dict(cf='0', of='0')
+        s = '{%s%s%s' % (pre, core.replace('T', T), self.fl(need, **{**f, **com}))
+        if mn not in ('cmp', 'test') and not nowrite: s += self.wrop(dst, 'r', S)
+        return s + '}'
+
+    def shift(self, mn, S, ops, need):
+        T = 'uint%d_t' % (8 * S); ST_ = 'int%d_t' % (8 * S); B = 8 * S; sb = B - 1
+        a = self.rdop(ops[0], S)
+        cnt = self.rdop(ops[1], 1) if len(ops) > 1 else '1'
+        mask = 63 if S == 8 else 31
+        pre = '{%s a=%s; unsigned cnt=(unsigned)(%s)&%d; if(cnt){ uint64_t w=a;' % (T, a, cnt, mask)
+        zsp = dict(zf='r==0', sf='(r>>%d)&1' % sb, pf='PAR(r)')
+        if mn in ('shl', 'sal'):
+            body = '%s r=(%s)(w<<cnt);' % (T, T) + self.fl(need, cf='cnt<=%d?(w>>(%d-cnt))&1:0' % (B, B), of='((r>>%d)&1)^(cnt<=%d?(w>>(%d-cnt))&1:0)' % (sb, B, B), **zsp)
+        elif mn == 'shr':
+            body = '%s r=(%s)(w>>cnt);' % (T, T) + self.fl(need, cf='(w>>(cnt-1))&1', of='(a>>%d)&1' % sb, **zsp)
+        elif mn == 'sar':
+            body = '%s s=(%s)a; unsigned k=cnt>%d?%d:cnt; %s r=(%s)(s>>k);' % (ST_, ST_, sb, sb, T, T) + \
+                   self.fl(need, cf='(s>>(k-1))&1', of='0', **zsp)
+        elif mn in ('rol', 'ror'):
+            sh = ('(w<<k)|(w>>(%d-k))' if mn == 'rol' else '(w>>k)|(w<<(%d-k))') % B
+            body = 'unsigned k=cnt%%%d; %s r=k?(%s)(%s):a;' % (B, T, T, sh)
+            if mn == 'rol': body += self.fl(need, cf='r&1', of='((r>>%d)&1)^(r&1)' % sb)
+            else: body += self.fl(need, cf='(r>>%d)&1' % sb, of='((r>>%d)^(r>>%d))&1' % (sb, sb - 1))
+        elif mn in ('rcl', 'rcr'):
+            mod = '%%%d' % (B + 1) if B < 32 else ''
+            if mn == 'rcl':
+                body = '%s r=a; unsigned k=cnt%s; while(k--){unsigned nc=(r>>%d)&1;r=(%s)((r<<1)|cf);cf=nc;}' % (T, mod, sb, T)
+                body += self.fl(need, of='((r>>%d)&1)^cf' % sb)
+            else:
+                body = '%s r=a; unsigned k=cnt%s; while(k--){unsigned nc=r&1;r=(%s)((r>>1)|((%s)cf<<%d));cf=nc;}' % (T, mod, T, T, sb)
+                body += self.fl(need, of='((r>>%d)^(r>>%d))&1' % (sb, sb - 1))
+        else: raise Unsup(mn)
+        return pre + body + self.wrop(ops[0], 'r', S) + '}}'
+
+    def cond(self, mn, pre):
+        return COND[mn[len(pre):]]
+
+    # main translate ---------------------------------------------------------
+    def tr(self, i, need, tgt):
+        """returns C statements. tgt(addr)-> goto statement for a code address."""
+        self.i = i; mn = i.mnemonic.split()[-1]; pre = i.mnemonic.split()[:-1]
+        ops = i.operands; n = len(ops); S = ops[0].size if n else 8; nx = i.address + i.size
+        rep = 0xF3 in i.prefix or 0xF2 in i.prefix; repne = 0xF2 in i.prefix
+        lock = 'lock' in pre or 0xF0 in i.prefix
+        xmm0 = n and ops[0].type == X86_OP_REG and self.i.reg_name(ops[0].reg).startswith('xmm')
+        xmm1 = n > 1 and ops[1].type == X86_OP_REG and self.i.reg_name(ops[1].reg).startswith('xmm')
+        mm0 = n and ops[0].type == X86_OP_REG and self.i.reg_name(ops[0].reg).startswith('mm')
+        mm1 = n > 1 and ops[1].type == X86_OP_REG and self.i.reg_name(ops[1].reg).startswith('mm')
+        fence = '__atomic_thread_fence(__ATOMIC_SEQ_CST);' if lock else ''
+        if mn in ('nop', 'endbr64', 'pause', 'fnop', 'prefetcht0', 'prefetchnta', 'prefetcht1', 'prefetcht2', 'prefetchw', 'lfence', 'sfence', 'ud0', 'sldt', 'lldt', 'clts', 'verw', 'xabort', 'bndstx', 'maskmovq') or mn.startswith('nop'): return ''
+        if mn in ('cli', 'sti', 'invd'): return ''  # privileged/no-op in the hosted user-mode model
+        if mn == 'mfence': return '__atomic_thread_fence(__ATOMIC_SEQ_CST);'
+        if mn in ('mov', 'movabs') and not xmm0 and not xmm1 and not mm0 and not mm1:
+            if ops[0].type == X86_OP_REG and self.i.reg_name(ops[0].reg) in ('es', 'cs', 'ss', 'ds', 'fs', 'gs'):
+                return '%s=(uint16_t)%s;' % (self.sreg(ops[0]), self.rdop(ops[1], 2))
+            if ops[1].type == X86_OP_REG and self.i.reg_name(ops[1].reg) in ('es', 'cs', 'ss', 'ds', 'fs', 'gs'):
+                return self.wrop(ops[0], self.sreg(ops[1]), S)
+            return self.wrop(ops[0], self.rdop(ops[1], S), S)
         if mn in ('add', 'sub', 'and', 'or', 'xor', 'cmp', 'test', 'adc', 'sbb'): return fence + self.alu(mn, S, self.rdop(ops[0], S), self.rdop(ops[1], S), ops[0], need)
         if mn in ('shl', 'sal', 'shr', 'sar', 'rol', 'ror', 'rcl', 'rcr'): return self.shift(mn, S, ops, need)
         if mn in ('movzx', 'movsx', 'movsxd'):
@@ -1229,7 +1537,8 @@ class Gen:
         if mn == 'xlatb':
             a = '(uint32_t)(r3+(uint8_t)r0)' if m32 else '(r3+(uint8_t)r0)'
             return 'r0=(r0&~0xFFULL)|LD(uint8_t,%s);' % a
-        if mn == 'salc': return 'r0=(r0&~0xFFULL)|(cf?0xFF:0);'
+        if mn == 'salc': re
+    if mn == 'salc': return 'r0=(r0&~0xFFULL)|(cf?0xFF:0);'
         if mn in ('aaa', 'a
 uf.append('\n'.join(out))
         if (k + 1) % regions_per_file == 0 or k == len(regions) - 1:
