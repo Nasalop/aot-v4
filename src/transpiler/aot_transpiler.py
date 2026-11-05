@@ -66,22 +66,12 @@ class Rec:
         return next(self.md.disasm(b, a, 1), None) if b else None
 
     # ---- discovery -------------------------------------------------------
-    
-    def func_range(self, a):
-        k = bisect.bisect_right(self.fstarts, a) - 1
-        if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
-        return (a - 0x4000, a + 0x4000)
-
     def seeds(self):
         s = {self.entry}
-        # --- QUICK FIX FOR AC1 ---
-        s.add(0x161d686)
-        s.add(0x9cab8f)    
-        # -------------------------
         pe = self.pe
         try:
-            if self.m32: raise KeyError
-            d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+            if self.m32: raise KeyError  # no .pdata in PE32
+            d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]  # .pdata RUNTIME_FUNCTION
             for off in range(0, d.Size - 11, 12):
                 b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
                 if b == 0: break
@@ -89,20 +79,12 @@ class Rec:
                 s.add(b + self.base)
         except Exception: pass
         self.funcs.sort(); self.fstarts = [f[0] for f in self.funcs]
-        
-        for sec in pe.sections:
+        for sec in pe.sections:  # absolute code pointers in data (vtables, callbacks)
+            if sec.Characteristics & 0x20000000: continue
             o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
             lo_, hi_ = self.base, self.base + len(self.img)
-            
-            if sec.Characteristics & 0x20000000:
-                for i in range(0, n - self.psz, self.psz):
-                    v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, o + i)[0]
-                    if lo_ <= v < hi_ and self.in_text(v):
-                        s.add(v)
-            else:
-                for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
-                    if lo_ <= v < hi_ and self.in_text(v): s.add(v)
-                    
+            for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
+                if lo_ <= v < hi_ and self.in_text(v): s.add(v)
         try:
             tls = pe.DIRECTORY_ENTRY_TLS.struct
             cb = tls.AddressOfCallBacks
@@ -112,6 +94,11 @@ class Rec:
                 s.add(v); cb += self.psz
         except Exception: pass
         return {a for a in s if self.in_text(a)}
+
+    def func_range(self, a):
+        k = bisect.bisect_right(self.fstarts, a) - 1
+        if k >= 0 and self.funcs[k][0] <= a < self.funcs[k][1]: return self.funcs[k]
+        return (a - 0x4000, a + 0x4000)
 
     def table_targets(self, jm, recent):
         """Heuristic jump-table recovery for `jmp reg` / `jmp [tbl+idx*8]`."""
@@ -153,7 +140,7 @@ class Rec:
                 self.insns[a] = i; recent = (recent + [i])[-120:]
                 mn = i.mnemonic.split()[-1]; nxt = a + i.size
                 direct = i.operands and i.operands[0].type == X86_OP_IMM
-                if mn in ('lea', 'mov', 'movabs', 'push') and len(i.operands) > 0:
+                if mn in ('lea', 'mov', 'movabs', 'push') and len(i.operands) > 0:  # code pointers materialised by code
                     o = i.operands[-1]
                     t = (i.address + i.size + o.mem.disp if mn == 'lea' and o.mem.base == X86_REG_RIP else o.imm if o.type == X86_OP_IMM else 0)
                     if t and t not in self.leaders and self.in_text(t) and t != nxt: self.leaders.add(t); work.append(t)
@@ -168,13 +155,14 @@ class Rec:
                 elif mn in ('call', 'lcall'):
                     self.leaders.add(nxt)
                     target = i.operands[-1] if mn == 'lcall' else i.operands[0]
-                    if target.type == X86_OP_IMM: 
-                        self.leaders.add(target.imm); work.append(target.imm)
-                    elif mn == 'call':
-                        for t in self.table_targets(i, recent): 
-                            self.leaders.add(t); work.append(t)
+                    if target.type == X86_OP_IMM: self.leaders.add(target.imm); work.append(target.imm)
                 elif is_term(mn): break
                 a = nxt
+            else:
+                # Decoding ran into an already-decoded address: two instruction chains converge here (overlapping decodes from a
+                # mid-instruction seed). That address must be a block entry, or the real chain falls through into a block that
+                # swallowed it and has no case label.
+                self.leaders.add(a)
         return self
 
     def blocks(self):
@@ -307,7 +295,7 @@ class Gen:
         mm0 = n and ops[0].type == X86_OP_REG and self.i.reg_name(ops[0].reg).startswith('mm')
         mm1 = n > 1 and ops[1].type == X86_OP_REG and self.i.reg_name(ops[1].reg).startswith('mm')
         fence = '__atomic_thread_fence(__ATOMIC_SEQ_CST);' if lock else ''
-        if mn in ('nop', 'endbr64', 'pause', 'fnop', 'prefetcht0', 'prefetchnta', 'prefetcht1', 'prefetcht2', 'prefetchw', 'lfence', 'sfence', 'ud0', 'sldt', 'lldt', 'clts', 'verw', 'xabort', 'bndstx', 'maskmovq') or mn.startswith('nop'): return ''
+        if mn in ('nop', 'endbr64', 'pause', 'fnop', 'prefetcht0', 'prefetchnta', 'prefetcht1', 'prefetcht2', 'prefetchw', 'lfence', 'sfence', 'ud0') or mn.startswith('nop'): return ''
         if mn in ('cli', 'sti', 'invd'): return ''  # privileged/no-op in the hosted user-mode model
         if mn == 'mfence': return '__atomic_thread_fence(__ATOMIC_SEQ_CST);'
         if mn in ('mov', 'movabs') and not xmm0 and not xmm1 and not mm0 and not mm1:
@@ -674,7 +662,7 @@ class Gen:
             n = 4 if src == 'd' else 8; T = 'int16_t' if dst == 'w' else ('int8_t' if mn == 'packsswb' else 'uint8_t'); ST_ = 'int32_t' if src == 'd' else 'int16_t'
             sat = 'v<%d?%d:v>%d?%d:v' % (lo, lo, hi, hi)
             return '{XMM s=%s,d=%s;for(int k=0;k<%d;k++){int v=(%s)d.%s[k];%s.%s[k]=(%s)(%s);v=(%s)s.%s[k];%s.%s[k+%d]=(%s)(%s);}}' % (xv(ops[1]), D, n, ST_, src, D, dst, T, sat, ST_, src, D, dst, n, T, sat)
-        if mn in ('pmullw', 'pmulhw', 'pmulhuw', 'pmuludq', 'pmaddwd', 'pminub', 'pmaxub', 'pminsw', 'pmaxsw', 'paddw', 'psubw', 'pcmpeqw', 'pcmpgtb', 'pcmpgtw', 'pcmpgtd', 'paddusb', 'psubusb', 'paddusw', 'psubusw', 'paddsw', 'psubsw', 'pavgb', 'pavgw', 'psubsb'):
+        if mn in ('pmullw', 'pmulhw', 'pmulhuw', 'pmuludq', 'pmaddwd', 'pminub', 'pmaxub', 'pminsw', 'pmaxsw', 'paddw', 'psubw', 'pcmpeqw', 'pcmpgtb', 'pcmpgtw', 'pcmpgtd', 'paddusb', 'psubusb', 'paddusw', 'psubusw', 'paddsw', 'psubsw', 'pavgb', 'pavgw'):
             g = 'XMM s=%s,d=%s;' % (xv(ops[1]), D); lp = 'for(int j=0;j<%d;j++)%s.%s[j]=%s;'
             if mn == 'pmuludq': return '{%s%s.q[0]=(uint64_t)d.d[0]*s.d[0];%s.q[1]=(uint64_t)d.d[2]*s.d[2];}' % (g, D, D)
             if mn == 'pmaddwd': return '{%sfor(int j=0;j<4;j++)%s.d[j]=(uint32_t)((int32_t)(int16_t)d.w[2*j]*(int16_t)s.w[2*j]+(int32_t)(int16_t)d.w[2*j+1]*(int16_t)s.w[2*j+1]);}' % (g, D)
@@ -686,8 +674,7 @@ class Gen:
                    'paddusb': ('b', 16, '(int)d.b[j]+s.b[j]>255?255:d.b[j]+s.b[j]'), 'psubusb': ('b', 16, 'd.b[j]>s.b[j]?d.b[j]-s.b[j]:0'),
                    'paddusw': ('w', 8, '(int)d.w[j]+s.w[j]>65535?65535:d.w[j]+s.w[j]'), 'psubusw': ('w', 8, 'd.w[j]>s.w[j]?d.w[j]-s.w[j]:0'),
                    'paddsw': ('w', 8, '({int v=(int16_t)d.w[j]+(int16_t)s.w[j];(uint16_t)(v>32767?32767:v<-32768?-32768:v);})'), 'psubsw': ('w', 8, '({int v=(int16_t)d.w[j]-(int16_t)s.w[j];(uint16_t)(v>32767?32767:v<-32768?-32768:v);})'),
-                   'pavgb': ('b', 16, '(d.b[j]+s.b[j]+1)>>1'), 'pavgw': ('w', 8, '(d.w[j]+s.w[j]+1)>>1'),
-                   'psubsb': ('b', 16, '({int v=(int8_t)d.b[j]-(int8_t)s.b[j];(uint8_t)(v>127?127:v<-128?-128:v);})')}[mn]
+                   'pavgb': ('b', 16, '(d.b[j]+s.b[j]+1)>>1'), 'pavgw': ('w', 8, '(d.w[j]+s.w[j]+1)>>1')}[mn]
             return '{%s%s}' % (g, lp % (tab[1], D, tab[0], tab[2]))
         if mn == 'cvtpd2ps': return '{XMM s=%s;float a=(float)s.g[0],b=(float)s.g[1];%s.f[0]=a;%s.f[1]=b;%s.q[1]=0;}' % (xv(ops[1]), D, D, D)
         if mn == 'cvtdq2pd': return '{XMM s=%s;%s.g[0]=(int32_t)s.d[0];%s.g[1]=(int32_t)s.d[1];}' % (xv(ops[1]), D, D)
@@ -751,8 +738,7 @@ class Gen:
               'fninit': 'c->fcw=0x37F;c->fsw=0;c->ftop=0;', 'finit': 'c->fcw=0x37F;c->fsw=0;c->ftop=0;', 'fnclex': 'c->fsw&=0x7f00;', 'fclex': 'c->fsw&=0x7f00;', 'fwait': '', 'wait': '',
               'ffree': '', 'ffreep': 'FPOP();', 'fnop': '',
               'fxam': '{aot_f80 _v=FST(0);int _c=_v!=_v?0x100:(_v==INFINITY||_v==-INFINITY)?0x500:_v==0?0x4000:0x400;c->fsw=(c->fsw&~0x4700)|_c|(signbit(_v)?0x200:0);}',
-              'ftst': '{aot_f80 _v=FST(0);c->fsw=(c->fsw&~0x4500)|(_v!=_v?0x4500:_v<0?0x100:_v==0?0x4000:0);}',
-              'fbld': 'FPUSH(0);',}
+              'ftst': '{aot_f80 _v=FST(0);c->fsw=(c->fsw&~0x4500)|(_v!=_v?0x4500:_v<0?0x100:_v==0?0x4000:0);}'}
         if mn in un: return un[mn]
         if mn in ('fnstenv', 'fnsave'):
             a = A(ops[0])
