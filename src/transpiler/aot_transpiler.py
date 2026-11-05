@@ -67,55 +67,33 @@ class Rec:
 
     # ---- discovery -------------------------------------------------------
     def seeds(self):
-       s = {self.entry}
-    
-    # --- QUICK FIX FOR AC1 x87 MATH JUMP ---
-       s.add(0x9ce391)
-    # ---------------------------------------
-
-       pe = self.pe
-       try:
-           if self.m32: raise KeyError  # no .pdata in PE32
-           d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]  # .pdata RUNTIME_FUNCTION
-           for off in range(0, d.Size - 11, 12):
-               b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
-               if b == 0: break
-               self.funcs.append((b + self.base, e + self.base))
-               s.add(b + self.base)
-       except Exception: pass
-    
-       self.funcs.sort()
-       self.fstarts = [f[0] for f in self.funcs]
-    
-       for sec in pe.sections:  # absolute code pointers in data (vtables, callbacks)
-           if sec.Characteristics & 0x20000000: continue
-           o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
-           lo_, hi_ = self.base, self.base + len(self.img)
-           for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
-               if lo_ <= v < hi_ and self.in_text(v): s.add(v)
-            
-       try:
-           tls = pe.DIRECTORY_ENTRY_TLS.struct
-           cb = tls.AddressOfCallBacks
-           while cb:
-               v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
-               if not v: break
-               s.add(v); cb += self.psz
-       except Exception: pass
-
-    # --- AGGRESSIVE MATH FUNCTION SCAN ---
-       for sec in pe.sections:
-           o = sec.VirtualAddress
-           n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
-           for i in range(0, n - 4, 4):
-               v = struct.unpack_from('<I', self.img, o + i)[0]
-               if self.in_text(v):
-                   first_byte = self.img[v - self.base]
-                   if 0xD8 <= first_byte <= 0xDF: # x87 FPU opcodes
-                       s.add(v)
-    # -------------------------------------
-
-       return {a for a in s if self.in_text(a)}
+        s = {self.entry}
+        pe = self.pe
+        try:
+            if self.m32: raise KeyError  # no .pdata in PE32
+            d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]  # .pdata RUNTIME_FUNCTION
+            for off in range(0, d.Size - 11, 12):
+                b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
+                if b == 0: break
+                self.funcs.append((b + self.base, e + self.base))
+                s.add(b + self.base)
+        except Exception: pass
+        self.funcs.sort(); self.fstarts = [f[0] for f in self.funcs]
+        for sec in pe.sections:  # absolute code pointers in data (vtables, callbacks)
+            if sec.Characteristics & 0x20000000: continue
+            o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
+            lo_, hi_ = self.base, self.base + len(self.img)
+            for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
+                if lo_ <= v < hi_ and self.in_text(v): s.add(v)
+        try:
+            tls = pe.DIRECTORY_ENTRY_TLS.struct
+            cb = tls.AddressOfCallBacks
+            while cb:
+                v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
+                if not v: break
+                s.add(v); cb += self.psz
+        except Exception: pass
+        return {a for a in s if self.in_text(a)}
 
     def func_range(self, a):
         k = bisect.bisect_right(self.fstarts, a) - 1
@@ -152,8 +130,34 @@ class Rec:
             if found: out.update(found); break
         return out
 
+    def inline_table_targets(self):
+        """Jump tables placed inside code sections (MSVC emits them right after the function): runs of >=3 consecutive aligned
+        code pointers in bytes no decoded instruction covers. Their targets are only reachable through `jmp reg`."""
+        if not self.m32: return set()
+        cov = bytearray(len(self.img))
+        for a, i in self.insns.items():
+            o = a - self.base
+            if 0 <= o < len(cov): cov[o:o + i.size] = b'\1' * i.size
+        out = set()
+        for lo, hi in self.text:
+            o0 = (lo - self.base + 3) & ~3; o1 = min(hi - self.base, len(self.img)) & ~3; run = []
+            for o in range(o0, o1, 4):
+                v = struct.unpack_from('<I', self.img, o)[0]
+                if self.in_text(v) and not any(cov[o:o + 4]): run.append(v); continue
+                if len(run) >= 3: out.update(run)
+                run = []
+            if len(run) >= 3: out.update(run)
+        return {t for t in out if t not in self.insns}
+
     def discover(self):
         work = list(self.seeds()); self.leaders |= set(work)
+        while True:
+            self._drain(work)
+            new = self.inline_table_targets() - self.leaders
+            if not new: return self
+            self.leaders |= new; work = list(new)
+
+    def _drain(self, work):
         while work:
             a = work.pop(); recent = []
             while a not in self.insns:
@@ -319,7 +323,7 @@ class Gen:
         mm0 = n and ops[0].type == X86_OP_REG and self.i.reg_name(ops[0].reg).startswith('mm')
         mm1 = n > 1 and ops[1].type == X86_OP_REG and self.i.reg_name(ops[1].reg).startswith('mm')
         fence = '__atomic_thread_fence(__ATOMIC_SEQ_CST);' if lock else ''
-        if mn in ('nop', 'endbr64', 'pause', 'fnop', 'prefetcht0', 'prefetchnta', 'prefetcht1', 'prefetcht2', 'prefetchw', 'lfence', 'sfence', 'ud0', 'sldt', 'lldt', 'clts', 'verw', 'xabort', 'bndstx', 'maskmovq') or mn.startswith('nop'): return ''
+        if mn in ('nop', 'endbr64', 'pause', 'fnop', 'prefetcht0', 'prefetchnta', 'prefetcht1', 'prefetcht2', 'prefetchw', 'lfence', 'sfence', 'ud0') or mn.startswith('nop'): return ''
         if mn in ('cli', 'sti', 'invd'): return ''  # privileged/no-op in the hosted user-mode model
         if mn == 'mfence': return '__atomic_thread_fence(__ATOMIC_SEQ_CST);'
         if mn in ('mov', 'movabs') and not xmm0 and not xmm1 and not mm0 and not mm1:
