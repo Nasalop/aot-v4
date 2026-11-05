@@ -68,6 +68,7 @@ class Rec:
     # ---- discovery -------------------------------------------------------
     def seeds(self):
         s = {self.entry}
+        s.add(0x9ce391) # Known x87 math function
         pe = self.pe
         try:
             if self.m32: raise KeyError  # no .pdata in PE32
@@ -93,6 +94,19 @@ class Rec:
                 if not v: break
                 s.add(v); cb += self.psz
         except Exception: pass
+        # --- AGGRESSIVE MATH FUNCTION SCAN ---
+# Scan the entire image for any 4-byte value that points into the .text section
+# and looks like it might be an x87 math function (starts with d9 or dd)
+        for sec in pe.sections:
+           o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
+           for i in range(0, n - 4, 4):
+              v = struct.unpack_from('<I', self.img, o + i)[0]
+              if self.in_text(v):
+            # Check if the first byte at that address is an x87 opcode (D8-DF)
+                 first_byte = self.img[v - self.base]
+                   if 0xD8 <= first_byte <= 0xDF:
+                      s.add(v)
+# -------------------------------------
         return {a for a in s if self.in_text(a)}
 
     def func_range(self, a):
