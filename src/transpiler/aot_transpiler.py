@@ -67,55 +67,55 @@ class Rec:
 
     # ---- discovery -------------------------------------------------------
     def seeds(self):
-    s = {self.entry}
+       s = {self.entry}
     
     # --- QUICK FIX FOR AC1 x87 MATH JUMP ---
-    s.add(0x9ce391)
+       s.add(0x9ce391)
     # ---------------------------------------
 
-    pe = self.pe
-    try:
-        if self.m32: raise KeyError  # no .pdata in PE32
-        d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]  # .pdata RUNTIME_FUNCTION
-        for off in range(0, d.Size - 11, 12):
-            b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
-            if b == 0: break
-            self.funcs.append((b + self.base, e + self.base))
-            s.add(b + self.base)
-    except Exception: pass
+       pe = self.pe
+       try:
+           if self.m32: raise KeyError  # no .pdata in PE32
+           d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]  # .pdata RUNTIME_FUNCTION
+           for off in range(0, d.Size - 11, 12):
+               b, e, _ = struct.unpack_from('<III', self.img, d.VirtualAddress + off)
+               if b == 0: break
+               self.funcs.append((b + self.base, e + self.base))
+               s.add(b + self.base)
+       except Exception: pass
     
-    self.funcs.sort()
-    self.fstarts = [f[0] for f in self.funcs]
+       self.funcs.sort()
+       self.fstarts = [f[0] for f in self.funcs]
     
-    for sec in pe.sections:  # absolute code pointers in data (vtables, callbacks)
-        if sec.Characteristics & 0x20000000: continue
-        o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
-        lo_, hi_ = self.base, self.base + len(self.img)
-        for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
-            if lo_ <= v < hi_ and self.in_text(v): s.add(v)
+       for sec in pe.sections:  # absolute code pointers in data (vtables, callbacks)
+           if sec.Characteristics & 0x20000000: continue
+           o = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
+           lo_, hi_ = self.base, self.base + len(self.img)
+           for v in memoryview(self.img[o:o + n]).cast('I' if self.m32 else 'Q'):
+               if lo_ <= v < hi_ and self.in_text(v): s.add(v)
             
-    try:
-        tls = pe.DIRECTORY_ENTRY_TLS.struct
-        cb = tls.AddressOfCallBacks
-        while cb:
-            v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
-            if not v: break
-            s.add(v); cb += self.psz
-    except Exception: pass
+       try:
+           tls = pe.DIRECTORY_ENTRY_TLS.struct
+           cb = tls.AddressOfCallBacks
+           while cb:
+               v = struct.unpack_from('<I' if self.m32 else '<Q', self.img, cb - self.base)[0]
+               if not v: break
+               s.add(v); cb += self.psz
+       except Exception: pass
 
     # --- AGGRESSIVE MATH FUNCTION SCAN ---
-    for sec in pe.sections:
-        o = sec.VirtualAddress
-        n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
-        for i in range(0, n - 4, 4):
-            v = struct.unpack_from('<I', self.img, o + i)[0]
-            if self.in_text(v):
-                first_byte = self.img[v - self.base]
-                if 0xD8 <= first_byte <= 0xDF: # x87 FPU opcodes
-                    s.add(v)
+       for sec in pe.sections:
+           o = sec.VirtualAddress
+           n = min(sec.Misc_VirtualSize, sec.SizeOfRawData) & ~(self.psz - 1)
+           for i in range(0, n - 4, 4):
+               v = struct.unpack_from('<I', self.img, o + i)[0]
+               if self.in_text(v):
+                   first_byte = self.img[v - self.base]
+                   if 0xD8 <= first_byte <= 0xDF: # x87 FPU opcodes
+                       s.add(v)
     # -------------------------------------
 
-    return {a for a in s if self.in_text(a)}
+       return {a for a in s if self.in_text(a)}
 
     def func_range(self, a):
         k = bisect.bisect_right(self.fstarts, a) - 1
