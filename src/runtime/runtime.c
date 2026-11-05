@@ -180,7 +180,58 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
     }
     int lo = 0, hi = aot_nregions - 1, k = -1;
     while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
-    if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
+    if (k < 0) { 
+  // FALLBACK INTERPRETER
+  // If we hit an unknown jump, execute instructions dynamically
+  // before jumping back to the translated code.
+  uint8_t *code = (uint8_t *)(uintptr_t)pc;
+  for (int step = 0; step < 20; step++) {
+      uint8_t op = code[0];
+      if (op == 0x55) { /* push ebp */ PUSH32(c->r[5]); code++; pc++; } 
+      else if (op == 0x89) { /* mov r/m, r */ 
+          if (code[1] == 0x65) { /* mov [ebp+disp8], esp */
+              int8_t disp = code[2]; ST(uint32_t, (uint32_t)(c->r[5] + disp), (uint32_t)c->r[4]); code += 3; pc += 3;
+          } else if (code[1] == 0xE5) { /* mov ebp, esp */
+              c->r[5] = c->r[4]; code += 2; pc += 2;
+          } else { 
+              fflush(stdout); fprintf(stderr, "\n[aot] fallback interpreter failed at 0x%llx (op 0x%02x 0x%02x)\n", (unsigned long long)pc, code[0], code[1]); dump_context(c); exit(73); 
+          }
+      }
+      else if (op == 0xC7) { /* mov r/m, imm32 */
+          if (code[1] == 0x45) { /* mov [ebp+disp8], imm32 */
+              int8_t disp = code[2]; uint32_t imm = LD(uint32_t, pc + 3); ST(uint32_t, (uint32_t)(c->r[5] + disp), imm); code += 7; pc += 7;
+          } else { fflush(stdout); fprintf(stderr, "\n[aot] fallback failed mov imm at 0x%llx\n", (unsigned long long)pc); exit(73); }
+      }
+      else if (op == 0x64) { /* fs: prefix */
+          if (code[1] == 0xA3) { /* mov fs:[imm32], eax */
+              uint32_t addr = LD(uint32_t, pc + 2); ST(uint32_t, (uint32_t)(c->gs + addr), (uint32_t)c->r[0]); code += 6; pc += 6;
+          } else if (code[1] == 0xA1) { /* mov eax, fs:[imm32] */
+              uint32_t addr = LD(uint32_t, pc + 2); c->r[0] = LD(uint32_t, (uint32_t)(c->gs + addr)); code += 6; pc += 6;
+          } else { fflush(stdout); fprintf(stderr, "\n[aot] fallback failed fs at 0x%llx\n", (unsigned long long)pc); exit(73); }
+      }
+      else if (op == 0x31) { /* xor r/m, r */ code += 2; pc += 2; }
+      else if (op == 0x33) { /* xor r, r/m */ code += 2; pc += 2; }
+      else if (op == 0x50) { /* push eax */ PUSH32(c->r[0]); code++; pc++; }
+      else if (op == 0x8D) { /* lea */ 
+          if (code[1] == 0x45) { int8_t disp = code[2]; c->r[0] = (uint32_t)(c->r[5] + disp); code += 3; pc += 3; } else { exit(73); }
+      }
+      else if (op == 0x83) { /* sub esp, imm8 */
+          if (code[1] == 0xEC) { c->r[4] -= (int8_t)code[2]; code += 3; pc += 3; } else { exit(73); }
+      }
+      else if (op == 0x53) { PUSH32(c->r[3]); code++; pc++; }
+      else if (op == 0x56) { PUSH32(c->r[6]); code++; pc++; }
+      else if (op == 0x57) { PUSH32(c->r[7]); code++; pc++; }
+      else if (op == 0x5F) { c->r[7] = POP32(); code++; pc++; }
+      else if (op == 0x5E) { c->r[6] = POP32(); code++; pc++; }
+      else if (op == 0x5B) { c->r[3] = POP32(); code++; pc++; }
+      else if (op == 0x5D) { c->r[5] = POP32(); code++; pc++; }
+      else if (op == 0xC3) { /* ret */ pc = POP32(); break; } 
+      else {
+          fflush(stdout); fprintf(stderr, "\n[aot] fallback interpreter unknown opcode 0x%02x at 0x%llx\n", op, (unsigned long long)pc); dump_context(c); exit(73);
+      }
+  }
+  continue; // Jump back to the main dispatch loop with the new pc!
+}
     aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc;
     uint64_t np = aot_region_fn[k](c, pc);
     if (np == pc) { fflush(stdout); fprintf(stderr, "\n[aot] address 0x%llx is inside translated code but is not a known entry point (undiscovered indirect jump target)\n", (unsigned long long)pc); dump_context(c); exit(73); }
