@@ -525,7 +525,7 @@ static uint64_t dsb_get_status(CPU *c) {
 
 static uint64_t ds_create_buffer(CPU *c) {
     uint32_t desc = (uint32_t)c->r[2];
-    uint32_t ppBuffer = (uint32_t)c->r[3];
+    uint32_t ppBuffer = (uint32_t)c->r[8];
     uint32_t size = LD(uint32_t, desc + 4); 
 
     DummyDSBuffer *b = (DummyDSBuffer*)calloc(1, sizeof(DummyDSBuffer));
@@ -576,7 +576,7 @@ const ShimEnt aot_shim_table_audio[] = {
   S(waveOutGetVolume), S(waveOutSetVolume),
   { "DirectSoundCreate8", sys_DirectSoundCreate8 },
   { "DirectSoundCreate", sys_DirectSoundCreate8 },
-  { "#11", sys_DirectSoundCreate8 }, 
-  { "#2", sys_DirectSoundCreate8 },  
+  /* dsound.dll ordinal 11 = DirectSoundCreate8; ordinal 2 = DirectSoundEnumerateA. */
+  { "#11", sys_DirectSoundCreate8 },
   { 0, 0 }
 };
