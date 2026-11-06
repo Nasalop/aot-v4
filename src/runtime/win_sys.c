@@ -22,7 +22,7 @@ static inline uint64_t argn(CPU *c, int n) { return n == 0 ? c->r[1] : n == 1 ? 
 #define H_BASE 0xA07C000000000000ULL
 #define H_MASK 0xFFFF000000000000ULL
 #define NOBJ 512
-enum { K_THREAD = 1, K_MUTEX, K_SEM };
+enum { K_THREAD = 1, K_MUTEX, K_SEM, K_EVENT};
 typedef struct {
   int kind, open; uint32_t gen;
   pthread_t th; uint64_t fn, param; size_t stack; uint32_t tid, exit_code; int done, started;   /* thread */
@@ -58,6 +58,7 @@ static int try_take(Obj *o, uint32_t tid) {   /* G held */
     case K_THREAD: return o->done;
     case K_MUTEX: if (o->count == 0 || o->owner == tid) { o->owner = tid; o->count++; return 1; } return 0;
     case K_SEM: if (o->sem > 0) { o->sem--; return 1; } return 0;
+    case K_EVENT: if (o->count > 0) { o->count = 0; return 1; } return 0;
   }
   return 0;
 }
@@ -76,7 +77,11 @@ static uint32_t wait_one(CPU *c, uint64_t h, uint32_t ms) {
 }
 SYS(WaitForSingleObject) { return wait_one(c, A(0), (uint32_t)A(1)); }
 SYS(WaitForSingleObjectEx) { return wait_one(c, A(0), (uint32_t)A(1)); }
-static void give_back(Obj *o) { if (o->kind == K_MUTEX && o->count) { if (!--o->count) o->owner = 0; } else if (o->kind == K_SEM) o->sem++; }
+static void give_back(Obj *o) { 
+    if (o->kind == K_MUTEX && o->count) { if (!--o->count) o->owner = 0; } 
+    else if (o->kind == K_SEM) o->sem++; 
+    else if (o->kind == K_EVENT) o->count = 1;
+}
 static uint64_t wait_handle_at(uint64_t arr, uint32_t i) {
   if (aot_is_pe32) return aot_x86_alias_in(LD(uint32_t, arr + 4ull * i));
   return LD(uint64_t, arr + 8ull * i);
@@ -166,7 +171,46 @@ SYS(CreateSemaphoreA) { int32_t init = (int32_t)A(1), mx = (int32_t)A(2); if (mx
 SYS(ReleaseSemaphore) { Obj *o = h_get(A(0)); if (!o || o->kind != K_SEM) return 0; int32_t n = (int32_t)A(1); pthread_mutex_lock(&G);
   if (n <= 0 || o->sem + n > o->sem_max) { pthread_mutex_unlock(&G); aot_last_error = 298; return 0; }
   if (A(2)) ST(int32_t, A(2), o->sem); o->sem += n; pthread_cond_broadcast(&C); pthread_mutex_unlock(&G); return 1; }
-
+/* ---- Events ---- */
+SYS(CreateEventA) {
+  pthread_mutex_lock(&G);
+  Obj *o = obj_new(K_EVENT);
+  uint64_t h = 0;
+  if (o) {
+    o->count = A(1) ? 1 : 0; // bManualReset
+    if (A(2)) o->count = 1;  // bInitialState
+    h = h_of(o);
+  }
+  pthread_mutex_unlock(&G);
+  return h;
+}
+SYS(SetEvent) {
+  Obj *o = h_get(A(0));
+  if (!o || o->kind != K_EVENT) return 0;
+  pthread_mutex_lock(&G);
+  o->count = 1;
+  pthread_cond_broadcast(&C);
+  pthread_mutex_unlock(&G);
+  return 1;
+}
+SYS(ResetEvent) {
+  Obj *o = h_get(A(0));
+  if (!o || o->kind != K_EVENT) return 0;
+  pthread_mutex_lock(&G);
+  o->count = 0;
+  pthread_mutex_unlock(&G);
+  return 1;
+}
+SYS(PulseEvent) {
+  Obj *o = h_get(A(0));
+  if (!o || o->kind != K_EVENT) return 0;
+  pthread_mutex_lock(&G);
+  o->count = 1;
+  pthread_cond_broadcast(&C);
+  o->count = 0;
+  pthread_mutex_unlock(&G);
+  return 1;
+}
 /* ---- critical sections: PE32 Recursion@8 Owner@12; PE64 Recursion@12 Owner@16 ---- */
 static size_t cs_recursion_offset(void) { return aot_is_pe32 ? 8 : 12; }
 static size_t cs_owner_offset(void) { return aot_is_pe32 ? 12 : 16; }
@@ -341,5 +385,6 @@ const ShimEnt aot_shim_table_sys[] = {
   E(InterlockedIncrement), E(InterlockedDecrement), E(InterlockedExchange), E(InterlockedExchangeAdd), E(InterlockedCompareExchange), E(InterlockedCompareExchange64),
   E(TlsAlloc), E(TlsFree), E(TlsGetValue), E(TlsSetValue), EA("FlsAlloc", TlsAlloc), EA("FlsFree", TlsFree), EA("FlsGetValue", TlsGetValue), EA("FlsSetValue", TlsSetValue),
   E(AddVectoredExceptionHandler), E(RemoveVectoredExceptionHandler), E(SetUnhandledExceptionFilter), E(RaiseException), E(RtlUnwind), E(RtlCaptureContext),
+  E(CreateEventA), E(SetEvent), E(ResetEvent), E(PulseEvent),
   { 0, 0 }
 };
