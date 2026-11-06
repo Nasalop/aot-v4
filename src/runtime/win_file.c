@@ -536,12 +536,14 @@ static int utf8_to_utf16(const char *source, uint16_t *output,
 
 static uint64_t get_directory_name(uint64_t buffer_address,
                                    uint32_t buffer_size, int wide) {
+  /* PE32 guests expect a Windows path with a drive letter (they match it against GetLogicalDriveStrings); normalize_path strips "C:" */
+  const char *root = aot_is_pe32 ? "C:\\" : game_root_path;
   if (game_root_fd < 0 || !game_root_path[0]) {
     aot_last_error = ERROR_PATH_NOT_FOUND;
     return 0;
   }
   if (!wide) {
-    size_t required = strlen(game_root_path) + 1;
+    size_t required = strlen(root) + 1;
     if (!buffer_size) {
       aot_last_error = 0;
       return required;
@@ -554,12 +556,12 @@ static uint64_t get_directory_name(uint64_t buffer_address,
       aot_last_error = ERROR_INSUFFICIENT_BUFFER;
       return required;
     }
-    memcpy((void *)(uintptr_t)buffer_address, game_root_path, required);
+    memcpy((void *)(uintptr_t)buffer_address, root, required);
     aot_last_error = 0;
     return required - 1;
   }
   size_t units;
-  if (utf8_to_utf16(game_root_path, NULL, 0, &units)) {
+  if (utf8_to_utf16(root, NULL, 0, &units)) {
     aot_last_error = ERROR_INVALID_DATA;
     return 0;
   }
@@ -576,7 +578,7 @@ static uint64_t get_directory_name(uint64_t buffer_address,
     aot_last_error = ERROR_INSUFFICIENT_BUFFER;
     return required;
   }
-  if (utf8_to_utf16(game_root_path, (uint16_t *)(uintptr_t)buffer_address,
+  if (utf8_to_utf16(root, (uint16_t *)(uintptr_t)buffer_address,
       buffer_size, &units)) {
     aot_last_error = ERROR_INVALID_DATA;
     return 0;
@@ -587,21 +589,23 @@ static uint64_t get_directory_name(uint64_t buffer_address,
 
 static uint64_t get_module_filename(uint64_t buffer_address,
                                     uint32_t buffer_size, int wide) {
-  if (!g_exe_path || !buffer_size || !buffer_address) {
+  char vexe[PATH_MAX]; const char *exe = g_exe_path;
+  if (aot_is_pe32 && g_exe_path) { const char *b = strrchr(g_exe_path, '/'); snprintf(vexe, sizeof vexe, "C:\\%s", b ? b + 1 : g_exe_path); exe = vexe; }
+  if (!exe || !buffer_size || !buffer_address) {
     aot_last_error = ERROR_INVALID_PARAMETER;
     return 0;
   }
   if (!wide) {
-    size_t length = strlen(g_exe_path);
+    size_t length = strlen(exe);
     size_t copied = length < buffer_size - 1 ? length : buffer_size - 1;
-    memcpy((void *)(uintptr_t)buffer_address, g_exe_path, copied);
+    memcpy((void *)(uintptr_t)buffer_address, exe, copied);
     ((char *)(uintptr_t)buffer_address)[copied] = 0;
     if (copied != length) aot_last_error = ERROR_INSUFFICIENT_BUFFER;
     else aot_last_error = 0;
     return copied == length ? length : buffer_size;
   }
   size_t units;
-  if (utf8_to_utf16(g_exe_path, NULL, 0, &units)) {
+  if (utf8_to_utf16(exe, NULL, 0, &units)) {
     aot_last_error = ERROR_INVALID_DATA;
     return 0;
   }
@@ -612,7 +616,7 @@ static uint64_t get_module_filename(uint64_t buffer_address,
       return 0;
     }
     size_t converted;
-    if (utf8_to_utf16(g_exe_path, temporary, units + 1, &converted)) {
+    if (utf8_to_utf16(exe, temporary, units + 1, &converted)) {
       free(temporary);
       aot_last_error = ERROR_INVALID_DATA;
       return 0;
@@ -628,7 +632,7 @@ static uint64_t get_module_filename(uint64_t buffer_address,
     aot_last_error = ERROR_INSUFFICIENT_BUFFER;
     return buffer_size;
   }
-  if (utf8_to_utf16(g_exe_path, (uint16_t *)(uintptr_t)buffer_address,
+  if (utf8_to_utf16(exe, (uint16_t *)(uintptr_t)buffer_address,
       buffer_size, &units)) {
     aot_last_error = ERROR_INVALID_DATA;
     return 0;
