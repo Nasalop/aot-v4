@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <strings.h>
-#include <sys/random.h>
+#include <sys/syscall.h>
 
 #define A(n) argn(c, (n))
 static inline uint64_t argn(CPU *c, int n) { return n == 0 ? c->r[1] : n == 1 ? c->r[2] : n == 2 ? c->r[8] : n == 3 ? c->r[9] : LD(uint64_t, c->r[4] + 8 + 8 * n); }
@@ -39,7 +39,7 @@ S(ToUnicode) {   /* US-layout ASCII only: (vk, scan, keystate*, buf*, cch, flags
 
 /* ---- advapi32 ---- */
 S(CryptAcquireContextA) { if (P(0)) ST(uint32_t, A(0), 1); return 1; }
-S(CryptGenRandom) { uint8_t *b = P(2); uint32_t n = (uint32_t)A(1), got = 0; while (got < n) { ssize_t r = getrandom(b + got, n - got, 0); if (r <= 0) return 0; got += (uint32_t)r; } return 1; }
+S(CryptGenRandom) { uint8_t *b = P(2); uint32_t n = (uint32_t)A(1), got = 0; while (got < n) { ssize_t r = syscall(SYS_getrandom, b + got, n - got, 0); if (r <= 0) return 0; got += (uint32_t)r; } return 1; }
 S(CryptReleaseContext) { return 1; }
 S(GetUserNameA) { char *b = P(0); uint32_t *sz = P(1); if (!sz) return 0; if (!b || *sz < 7) { *sz = 7; aot_last_error = 122; return 0; } memcpy(b, "player", 7); *sz = 7; return 1; }
 /* Registry: only the vendor key a normal install creates (HKLM\\SOFTWARE\\Ubisoft\\...) exists, with the install-directory values pointing at the
