@@ -549,7 +549,7 @@ static uint64_t ds_create_buffer(CPU *c) {
 }
 
 uint64_t sys_DirectSoundCreate8(CPU *c) {
-    uint32_t ppDS = (uint32_t)c->r[3]; 
+    uint32_t ppDS = (uint32_t)c->r[2]; 
 
     DummyDSound *ds = (DummyDSound*)calloc(1, sizeof(DummyDSound));
     ds->refs = 1;
@@ -559,7 +559,7 @@ uint64_t sys_DirectSoundCreate8(CPU *c) {
     vt[1] = (void*)(uintptr_t)aot_register_thunk(ds_addref, "DS_AddRef");
     vt[2] = (void*)(uintptr_t)aot_register_thunk(ds_release, "DS_Release");
     vt[3] = (void*)(uintptr_t)aot_register_thunk(ds_create_buffer, "DS_CreateBuffer");
-    vt[5] = (void*)(uintptr_t)aot_register_thunk(ds_get_caps, "DS_GetCaps");
+    vt[4] = (void*)(uintptr_t)aot_register_thunk(ds_get_caps, "DS_GetCaps");
     vt[6] = (void*)(uintptr_t)aot_register_thunk(ds_set_coop, "DS_SetCoop");
     ds->vtbl = vt;
 
