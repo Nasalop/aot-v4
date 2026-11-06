@@ -210,7 +210,7 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
       if (idx == EXIT_IDX) { fflush(stdout); exit((int)c->r[0]); }
       if (idx == RET_IDX) { cur_cpu = prev_cpu; return c->r[0]; }
-      Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx;
+      Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx; { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
       if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
       if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); continue; }
       c->r[0] = t->fn(c);
