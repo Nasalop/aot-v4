@@ -147,6 +147,17 @@ class Rec:
                 if len(run) >= 3: out.update(run)
                 run = []
             if len(run) >= 3: out.update(run)
+        for sec in self.pe.sections:   # packed tables in data sections that are not 4-byte aligned (e.g. the CRT's FP-state jump tables)
+            if sec.Characteristics & 0x20000000: continue
+            o0 = sec.VirtualAddress; n = min(sec.Misc_VirtualSize, sec.SizeOfRawData)
+            for ph in (1, 2, 3):
+                run = []
+                for o in range(o0 + ph, o0 + n - 3, 4):
+                    v = struct.unpack_from('<I', self.img, o)[0]
+                    if self.in_text(v): run.append(v); continue
+                    if len(run) >= 3: out.update(run)
+                    run = []
+                if len(run) >= 3: out.update(run)
         return {t for t in out if t not in self.insns}
 
     def discover(self):
@@ -958,6 +969,8 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                 w = {f for f in F5 if i.eflags & WMASK[f]}; r = {f for f in F5 if i.eflags & TMASK[f]}
                 if mn in ('fcomi', 'fucomi', 'fcompi', 'fucompi', 'fcomip', 'fucomip'): w = set(F5)
                 if mn.startswith('fcmov'): r = {'cf', 'zf', 'pf'}
+                if mn in ('lahf', 'pushfd', 'pushf', 'pushfq'): r = set(F5)   # capstone lists no flag reads for these
+                if mn == 'test': w = set(F5)   # capstone 5.0 reports no eflags for `test r/m, r` with a memory operand (1665 sites in AC1): the branch that follows then read stale flags
                 if mn in ('rcl', 'rcr'): r = r | {'cf'}   # capstone omits the CF read on rotate-through-carry
                 varcnt = (mn in ('shl', 'sal', 'shr', 'sar', 'rol', 'ror') and len(i.operands) > 1 and i.operands[1].type != X86_OP_IMM) or \
                          mn in ('bsf', 'bsr', 'shld', 'shrd', 'bt', 'bts', 'btr', 'btc', 'cmpxchg') or (0xF3 in i.prefix or 0xF2 in i.prefix)
