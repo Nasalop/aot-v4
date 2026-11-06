@@ -1,3 +1,4 @@
+#include <pthread.h>
 /* Win64 API / CRT shims. Each takes the guest CPU (Win64 ABI: rcx,rdx,r8,r9, then stack). Add more here. */
 #define _GNU_SOURCE
 #include "shims.h"
@@ -145,11 +146,34 @@ SH(HeapAlloc) { return (uint64_t)((A1 & 8) ? calloc(1, A2 ? A2 : 1) : malloc(A2 
 SH(HeapReAlloc) { return (uint64_t)realloc((void *)A2, A3); }
 SH(HeapFree) { free((void *)A2); return 1; }
 SH(HeapSize) { return 0; }
-SH(VirtualAlloc) { size_t sz = (A1 + 0xFFF) & ~0xFFFULL; void *p = MAP_FAILED;
-  if (A0) { p = mmap((void *)A0, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0); if (p == MAP_FAILED && errno == EEXIST) return A0; }
-  if (p == MAP_FAILED) { p = aot_map_anon(sz); if (!p) p = MAP_FAILED; }
-  return p == MAP_FAILED ? 0 : (uint64_t)p; }
-SH(VirtualFree) { if (A2 & 0x8000) munmap((void *)A0, (A1 + 0xFFF) & ~0xFFFULL); return 1; }
+/* VirtualAlloc/VirtualFree with Windows semantics the guest allocators rely on: 64 KB-aligned reservations, a fixed address is honoured or the call
+ * fails (never relocated), MEM_RELEASE frees the whole reservation (dwSize must be 0), MEM_DECOMMIT returns zeroed pages on recommit. */
+typedef struct { uint64_t raw, rawn, base, n; } VRes;
+static VRes vres[1024]; static int vres_n; static pthread_mutex_t vres_mu = PTHREAD_MUTEX_INITIALIZER;
+static VRes *vres_find(uint64_t a) { for (int i = 0; i < vres_n; i++) if (vres[i].base && a >= vres[i].base && a < vres[i].base + vres[i].n) return &vres[i]; return NULL; }
+SH(VirtualAlloc) {
+  uint64_t addr = A0, type = A2; size_t sz = (A1 + 0xFFF) & ~0xFFFULL; if (!sz) return 0;
+  pthread_mutex_lock(&vres_mu); uint64_t out = 0;
+  if (addr) {
+    VRes *r = vres_find(addr);
+    if (r) { if (addr + sz <= r->base + r->n) out = addr; }                  /* commit inside our reservation: pages are already there (zero or kept) */
+    else {
+      uint64_t b = addr & ~0xFFFFULL; size_t n = sz + (size_t)(addr - b);
+      void *p = mmap((void *)b, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+      if (p == (void *)b && vres_n < 1024) { vres[vres_n++] = (VRes){ b, n, b, n }; out = addr; }
+      else if (p != MAP_FAILED) munmap(p, n);                                /* not ours, or table full: fail honestly */
+    }
+  } else if (vres_n < 1024) {
+    size_t n = (sz + 0xFFFF) & ~0xFFFFULL; void *raw = aot_map_anon(n + 0x10000);
+    if (raw) { uint64_t base = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; vres[vres_n++] = (VRes){ (uint64_t)raw, n + 0x10000, base, n }; out = base; }
+  }
+  pthread_mutex_unlock(&vres_mu); (void)type; return out; }
+SH(VirtualFree) {
+  uint64_t addr = A0, size = A1, type = A2; int ok = 1; pthread_mutex_lock(&vres_mu); VRes *r = vres_find(addr);
+  if ((type & 0x8000) && r && r->base == addr) { munmap((void *)r->raw, r->rawn); memset(r, 0, sizeof *r); }
+  else if ((type & 0x4000) && r) { size_t n = ((size ? size : r->n) + 0xFFF) & ~0xFFFULL; madvise((void *)(addr & ~0xFFFULL), n, MADV_DONTNEED); }   /* anonymous private: pages come back zeroed */
+  else if (type & 0x8000) ok = 0;
+  pthread_mutex_unlock(&vres_mu); return ok; }
 SH(VirtualProtect) { if (A3) ST(uint32_t, A3, 0x40); return 1; }
 SH(GetCommandLineA) {
   if (!aot_is_pe32) return (uint64_t)g_cmdline;
