@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 #define THUNK_BASE (aot_is_pe32 ? 0x6ff00000ULL : 0x6fff00000000ULL)
 #define THUNK_SZ 16
@@ -167,12 +168,21 @@ static void dump_hex(const char *tag, uint64_t a, size_t n) {
   for (size_t i = 0; i < n; i++) fprintf(stderr, "%s%02x", i % 32 ? "" : "\n  ", ((const uint8_t *)(uintptr_t)a)[i]);
   fprintf(stderr, "\n");
 }
+static int safe_read(uint64_t a, void *buf, size_t n) {   /* readable-memory probe: write() to a pipe fails with EFAULT instead of faulting */
+  int fd[2]; if (pipe(fd)) return 0; int ok = write(fd[1], (void *)(uintptr_t)a, n) == (ssize_t)n && read(fd[0], buf, n) == (ssize_t)n; close(fd[0]); close(fd[1]); return ok;
+}
+static void dump_heap(const char *tag, uint32_t a, size_t n) {
+  uint8_t b[256]; if (n > sizeof b || !safe_read(a, b, n)) return;
+  fprintf(stderr, "[aot] %s 0x%x:", tag, a); for (size_t i = 0; i < n; i++) fprintf(stderr, "%s%02x", i % 32 ? "" : "\n  ", b[i]); fprintf(stderr, "\n");
+}
 static void dump_call_site(void) {
   uint64_t p = aot_last_pc; if (!aot_is_pe32 || !in_img(p - 32, 32)) return;
   const uint8_t *q = (const uint8_t *)(uintptr_t)p;
   if (q[-5] != 0xE8) return;
   int32_t rel; memcpy(&rel, q - 4, 4); uint32_t callee = (uint32_t)(p + rel);
   dump_hex("call target", callee, 96);
+  { const uint8_t *cb = (const uint8_t *)(uintptr_t)callee;   /* the callee's own global object (first `mov ecx,[abs]`) */
+    for (int k = 0; k < 24; k++) if (cb[k] == 0x8B && cb[k + 1] == 0x0D) { uint32_t g, obj; memcpy(&g, cb + k + 2, 4); if (in_img(g, 4)) { memcpy(&obj, (void *)(uintptr_t)g, 4); fprintf(stderr, "[aot] callee global [0x%x] = 0x%x\n", g, obj); dump_heap("callee object", obj, 192); } break; } }
   for (int k = 6; k <= 20; k++) {
     uint32_t v; memcpy(&v, q - k + 1, 4);
     if (q[-k] == 0x68 && in_img(v, 64)) { dump_hex("pushed arg (string?)", v, 64); break; }
