@@ -39,24 +39,35 @@ S(ToUnicode) {   /* US-layout ASCII only: (vk, scan, keystate*, buf*, cch, flags
 
 /* ---- advapi32 ---- */
 S(CryptAcquireContextA) { if (P(0)) ST(uint32_t, A(0), 1); return 1; }
-S(CryptGenRandom) { 
-    uint8_t *b = P(2); 
-    uint32_t n = (uint32_t)A(1), got = 0; 
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        while (got < n) {
-            ssize_t r = read(fd, b + got, n - got);
-            if (r <= 0) break;
-            got += (uint32_t)r;
-        }
-        close(fd);
-    }
-    return (got == n) ? 1 : 0; 
-}
+S(CryptGenRandom) { uint8_t *b = P(2); uint32_t n = (uint32_t)A(1), got = 0; while (got < n) { ssize_t r = getrandom(b + got, n - got, 0); if (r <= 0) return 0; got += (uint32_t)r; } return 1; }
 S(CryptReleaseContext) { return 1; }
 S(GetUserNameA) { char *b = P(0); uint32_t *sz = P(1); if (!sz) return 0; if (!b || *sz < 7) { *sz = 7; aot_last_error = 122; return 0; } memcpy(b, "player", 7); *sz = 7; return 1; }
-S(RegOpenKeyExA) { return 2; }       /* ERROR_FILE_NOT_FOUND: the registry is not emulated, so no key exists */
-S(RegQueryValueExA) { return 2; }
+/* Registry: only the vendor key a normal install creates (HKLM\\SOFTWARE\\Ubisoft\\...) exists, with the install-directory values pointing at the
+ * folder the game runs from. Everything else fails honestly (ERROR_FILE_NOT_FOUND) and is logged so missing keys are visible. */
+#define REGH_BASE 0x7e000000u
+static char reg_open_path[16][160]; static int reg_open_n;
+static int reg_vendor_key(const char *p) { return !strncasecmp(p, "software\\ubisoft", 17) || !strncasecmp(p, "software\\wow6432node\\ubisoft", 30); }
+S(RegOpenKeyExA) {
+  const char *sub = P(1) ? (const char *)P(1) : ""; uint32_t root = (uint32_t)A(0);
+  fflush(stdout); fprintf(stderr, "[aot] RegOpenKeyEx root=0x%x \"%s\"\n", root, sub);
+  if ((root == 0x80000002u || root == 0x80000001u) && reg_vendor_key(sub) && reg_open_n < 16 && P(4)) {
+    snprintf(reg_open_path[reg_open_n], sizeof reg_open_path[0], "%s", sub); ST(uint32_t, A(4), REGH_BASE + (uint32_t)reg_open_n++); return 0;
+  }
+  return 2;
+}
+S(RegQueryValueExA) {
+  uint32_t h = (uint32_t)A(0); const char *nm = P(1) ? (const char *)P(1) : "";
+  static const char *dirs[] = { "installdir", "install dir", "installpath", "path", "gamepath", "rootdir", "installationdir", "installlocation" };
+  int ok = 0; if (h >= REGH_BASE && h < REGH_BASE + 16) for (unsigned i = 0; i < sizeof dirs / sizeof *dirs; i++) if (!strcasecmp(nm, dirs[i])) ok = 1;
+  fflush(stdout); fprintf(stderr, "[aot] RegQueryValueEx \"%s\" -> %s\n", nm, ok ? "game folder" : "not found");
+  if (!ok) return 2;
+  char dir[512]; if (!getcwd(dir, sizeof dir)) return 2;
+  uint32_t need = (uint32_t)strlen(dir) + 1, *sz = P(5);
+  if (P(3)) ST(uint32_t, A(3), 1);                       /* REG_SZ */
+  if (!P(4)) { if (sz) *sz = need; return 0; }
+  if (!sz || *sz < need) { if (sz) *sz = need; return 234; }  /* ERROR_MORE_DATA */
+  memcpy(P(4), dir, need); *sz = need; return 0;
+}
 S(RegCloseKey) { return 0; }
 
 /* ---- ole32 / oleaut32 / shell32 ---- */
