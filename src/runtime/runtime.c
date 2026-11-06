@@ -141,7 +141,10 @@ static void bind_delay_imports(uint8_t *img, uint32_t rva, uint32_t size,
 static int recent[32]; static unsigned recent_n; static uint64_t recent_pc[16]; static unsigned recent_pc_n;   /* last guest region entries */
 uint64_t g_image_size;
 /* crash report helper (called from the signal handler): recent imports + the original x86 bytes of the block being executed, so the faulting code can be disassembled offline */
+static __thread CPU *cur_cpu;   /* guest CPU of this thread, for crash reports */
+static void dump_context(CPU *c);
 void aot_dump_crash_context(void) {
+  if (cur_cpu) dump_context(cur_cpu);
   dprintf(2, "[aot] last imports called (oldest first):\n");
   for (unsigned i = 0; i < 32; i++) { int idx = recent[(recent_n + i) % 32]; if (idx > 0 && idx < nthunks) dprintf(2, "  %s\n", thunks[idx].name); }
   if (g_image_base && aot_last_pc >= g_image_base && aot_last_pc + 160 <= g_image_base + g_image_size) {
@@ -167,11 +170,12 @@ static void dump_context(CPU *c) {
 }
 
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
+  CPU *prev_cpu = cur_cpu; cur_cpu = c;
   for (;;) {
     if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
       if (idx == EXIT_IDX) { fflush(stdout); exit((int)c->r[0]); }
-      if (idx == RET_IDX) return c->r[0];
+      if (idx == RET_IDX) { cur_cpu = prev_cpu; return c->r[0]; }
       Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx;
       if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
       if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); continue; }
