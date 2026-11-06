@@ -159,12 +159,36 @@ static void dump_code(uint64_t pc, int before, int after) {
   for (int i = -before; i < after; i++) fprintf(stderr, "%s%02x", (i + before) % 32 ? "" : "\n  ", ((const uint8_t *)(uintptr_t)pc)[i]);
   fprintf(stderr, "\n");
 }
+/* crash helper: if the faulting block directly follows `[mov ecx,[abs]] [push imm32] call rel32` (a lookup that returned NULL), dump the callee, the pushed string and the object ecx came from */
+static int in_img(uint64_t a, size_t n) { return g_image_base && a >= g_image_base && a + n <= g_image_base + g_image_size; }
+static void dump_hex(const char *tag, uint64_t a, size_t n) {
+  if (!in_img(a, n)) return;
+  fprintf(stderr, "[aot] %s 0x%llx:", tag, (unsigned long long)a);
+  for (size_t i = 0; i < n; i++) fprintf(stderr, "%s%02x", i % 32 ? "" : "\n  ", ((const uint8_t *)(uintptr_t)a)[i]);
+  fprintf(stderr, "\n");
+}
+static void dump_call_site(void) {
+  uint64_t p = aot_last_pc; if (!aot_is_pe32 || !in_img(p - 32, 32)) return;
+  const uint8_t *q = (const uint8_t *)(uintptr_t)p;
+  if (q[-5] != 0xE8) return;
+  int32_t rel; memcpy(&rel, q - 4, 4); uint32_t callee = (uint32_t)(p + rel);
+  dump_hex("call target", callee, 96);
+  for (int k = 6; k <= 20; k++) {
+    uint32_t v; memcpy(&v, q - k + 1, 4);
+    if (q[-k] == 0x68 && in_img(v, 64)) { dump_hex("pushed arg (string?)", v, 64); break; }
+  }
+  for (int k = 7; k <= 24; k++) {
+    uint32_t v; if (q[-k] == 0x8B && q[-k + 1] == 0x0D) { memcpy(&v, q - k + 2, 4);
+      if (in_img(v, 4)) { uint32_t obj; memcpy(&obj, (void *)(uintptr_t)v, 4); fprintf(stderr, "[aot] ecx global [0x%x] = 0x%x\n", v, obj); if (in_img(obj, 64)) dump_hex("object", obj, 64); break; } }
+  }
+}
 static void dump_context(CPU *c) {
   fprintf(stderr, "[aot] last region entries (oldest first):");
   for (unsigned i = 0; i < 16; i++) { uint64_t v = recent_pc[(recent_pc_n + i) % 16]; if (v) fprintf(stderr, " %llx", (unsigned long long)v); }
   fprintf(stderr, "\n"); dump_code(aot_last_pc, 64, 96);
   fprintf(stderr, "[aot] last guest region entry: 0x%llx\n[aot] last imports called (oldest first):\n", (unsigned long long)aot_last_pc);
   for (unsigned i = 0; i < 32; i++) { int idx = recent[(recent_n + i) % 32]; if (idx > 0 && idx < nthunks) fprintf(stderr, "  %s\n", thunks[idx].name); }
+  dump_call_site();
   if (aot_is_pe32 && c) { uint32_t sp = (uint32_t)c->r[4]; fprintf(stderr, "[aot] eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n[aot] stack:", (unsigned)c->r[0], (unsigned)c->r[1], (unsigned)c->r[2], (unsigned)c->r[3], sp, (unsigned)c->r[5], (unsigned)c->r[6], (unsigned)c->r[7]);
     for (int i = 0; i < 8; i++) fprintf(stderr, " %08x", LD(uint32_t, sp + 4 * i)); fprintf(stderr, "\n"); }
 }
