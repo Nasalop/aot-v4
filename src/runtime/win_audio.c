@@ -482,6 +482,91 @@ SH(waveOutGetVolume) {
 SH(waveOutSetVolume) {
   return get_device(ARG(0)) ? MMSYSERR_NOERROR : MMSYSERR_INVALHANDLE;
 }
+/* ---- Dummy DirectSound (Bypasses the missing audio device crash) ---- */
+typedef struct { void **vtbl; uint32_t refs; } DummyDSound;
+typedef struct { void **vtbl; uint32_t refs; uint8_t *data; uint32_t size; } DummyDSBuffer;
+
+static uint64_t ds_stub(CPU *c) { (void)c; return 0; }
+static uint64_t ds_addref(CPU *c) { DummyDSound *d = (DummyDSound*)(uintptr_t)c->r[1]; return ++d->refs; }
+static uint64_t ds_release(CPU *c) { DummyDSound *d = (DummyDSound*)(uintptr_t)c->r[1]; return --d->refs; }
+static uint64_t ds_set_coop(CPU *c) { return 0; }
+static uint64_t ds_get_caps(CPU *c) { 
+    uint32_t ptr = (uint32_t)c->r[2];
+    if (ptr) memset((void*)(uintptr_t)ptr, 0, 96); 
+    return 0; 
+}
+
+static uint64_t dsb_addref(CPU *c) { DummyDSBuffer *b = (DummyDSBuffer*)(uintptr_t)c->r[1]; return ++b->refs; }
+static uint64_t dsb_release(CPU *c) { DummyDSBuffer *b = (DummyDSBuffer*)(uintptr_t)c->r[1]; return --b->refs; }
+static uint64_t dsb_lock(CPU *c) {
+    DummyDSBuffer *b = (DummyDSBuffer*)(uintptr_t)c->r[1];
+    uint32_t offset = (uint32_t)c->r[2];
+    uint32_t bytes = (uint32_t)c->r[3];
+    uint32_t ptr1 = (uint32_t)c->r[8];
+    uint32_t bytes1 = (uint32_t)c->r[9];
+    uint32_t ptr2 = LD(uint32_t, c->r[4] + 8 + 8*0); 
+    uint32_t bytes2 = LD(uint32_t, c->r[4] + 8 + 8*1); 
+
+    if (ptr1 && bytes1) { 
+        ST(uint32_t, ptr1, (uint32_t)(uintptr_t)b->data + offset); 
+        ST(uint32_t, bytes1, bytes); 
+    }
+    if (ptr2 && bytes2) { ST(uint32_t, ptr2, 0); ST(uint32_t, bytes2, 0); }
+    return 0; 
+}
+static uint64_t dsb_unlock(CPU *c) { return 0; }
+static uint64_t dsb_play(CPU *c) { return 0; }
+static uint64_t dsb_stop(CPU *c) { return 0; }
+static uint64_t dsb_get_status(CPU *c) { 
+    uint32_t out = (uint32_t)c->r[2];
+    if (out) ST(uint32_t, out, 1); 
+    return 0; 
+}
+
+static uint64_t ds_create_buffer(CPU *c) {
+    uint32_t desc = (uint32_t)c->r[2];
+    uint32_t ppBuffer = (uint32_t)c->r[3];
+    uint32_t size = LD(uint32_t, desc + 4); 
+
+    DummyDSBuffer *b = (DummyDSBuffer*)calloc(1, sizeof(DummyDSBuffer));
+    b->refs = 1;
+    b->size = size;
+    b->data = calloc(1, size > 0 ? size : 1024);
+    
+    void **vt = calloc(30, 4);
+    for(int i=0; i<30; i++) vt[i] = (void*)(uintptr_t)aot_register_thunk(ds_stub, "DSB_Stub");
+    vt[1] = (void*)(uintptr_t)aot_register_thunk(dsb_addref, "DSB_AddRef");
+    vt[2] = (void*)(uintptr_t)aot_register_thunk(dsb_release, "DSB_Release");
+    vt[3] = (void*)(uintptr_t)aot_register_thunk(dsb_lock, "DSB_Lock");
+    vt[4] = (void*)(uintptr_t)aot_register_thunk(dsb_unlock, "DSB_Unlock");
+    vt[5] = (void*)(uintptr_t)aot_register_thunk(dsb_play, "DSB_Play");
+    vt[6] = (void*)(uintptr_t)aot_register_thunk(dsb_stop, "DSB_Stop");
+    vt[9] = (void*)(uintptr_t)aot_register_thunk(dsb_get_status, "DSB_GetStatus");
+    b->vtbl = vt;
+
+    if (ppBuffer) ST(uint32_t, ppBuffer, (uint32_t)(uintptr_t)b);
+    return 0; 
+}
+
+uint64_t sys_DirectSoundCreate8(CPU *c) {
+    uint32_t ppDS = (uint32_t)c->r[3]; 
+
+    DummyDSound *ds = (DummyDSound*)calloc(1, sizeof(DummyDSound));
+    ds->refs = 1;
+    
+    void **vt = calloc(20, 4);
+    for(int i=0; i<20; i++) vt[i] = (void*)(uintptr_t)aot_register_thunk(ds_stub, "DS_Stub");
+    vt[1] = (void*)(uintptr_t)aot_register_thunk(ds_addref, "DS_AddRef");
+    vt[2] = (void*)(uintptr_t)aot_register_thunk(ds_release, "DS_Release");
+    vt[3] = (void*)(uintptr_t)aot_register_thunk(ds_create_buffer, "DS_CreateBuffer");
+    vt[5] = (void*)(uintptr_t)aot_register_thunk(ds_get_caps, "DS_GetCaps");
+    vt[6] = (void*)(uintptr_t)aot_register_thunk(ds_set_coop, "DS_SetCoop");
+    ds->vtbl = vt;
+
+    if (ppDS) ST(uint32_t, ppDS, (uint32_t)(uintptr_t)ds);
+    fprintf(stderr, "[aot] Faked DirectSound8 device to bypass crash\n");
+    return 0; 
+}
 
 #define S(name) { #name, sh_##name }
 const ShimEnt aot_shim_table_audio[] = {
@@ -489,5 +574,9 @@ const ShimEnt aot_shim_table_audio[] = {
   S(waveOutUnprepareHeader), S(waveOutWrite), S(waveOutReset),
   S(waveOutPause), S(waveOutRestart), S(waveOutClose),
   S(waveOutGetVolume), S(waveOutSetVolume),
+  { "DirectSoundCreate8", sys_DirectSoundCreate8 },
+  { "DirectSoundCreate", sys_DirectSoundCreate8 },
+  { "#11", sys_DirectSoundCreate8 }, 
+  { "#2", sys_DirectSoundCreate8 },  
   { 0, 0 }
 };
