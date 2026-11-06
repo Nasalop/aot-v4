@@ -201,35 +201,102 @@ SYS(TryEnterCriticalSection) { uint64_t cs = A(0), tid = cur_tid(), rec = cs_rec
 SYS(DeleteCriticalSection) { return 0; }
 
 /* ---- SRW locks / condition variables / init-once ---- */
-SYS(InitializeSRWLock) { ST(uint64_t, A(0), 0); return 0; }
-SYS(AcquireSRWLockExclusive) { uint64_t *w = (uint64_t *)(uintptr_t)A(0); for (int s = 0;; s++) { uint64_t z = 0; if (__atomic_compare_exchange_n(w, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0; if (s < 100) sched_yield(); else usleep(100); } }
-SYS(TryAcquireSRWLockExclusive) { uint64_t *w = (uint64_t *)(uintptr_t)A(0), z = 0; return __atomic_compare_exchange_n(w, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED); }
-SYS(ReleaseSRWLockExclusive) { __atomic_store_n((uint64_t *)(uintptr_t)A(0), 0, __ATOMIC_RELEASE); return 0; }
-SYS(AcquireSRWLockShared) { uint64_t *w = (uint64_t *)(uintptr_t)A(0); for (int s = 0;; s++) { uint64_t v = __atomic_load_n(w, __ATOMIC_RELAXED); if (!(v & 1) && __atomic_compare_exchange_n(w, &v, v + 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0; if (s < 100) sched_yield(); else usleep(100); } }
-SYS(TryAcquireSRWLockShared) { uint64_t *w = (uint64_t *)(uintptr_t)A(0); uint64_t v = __atomic_load_n(w, __ATOMIC_RELAXED); return !(v & 1) && __atomic_compare_exchange_n(w, &v, v + 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED); }
-SYS(ReleaseSRWLockShared) { __atomic_sub_fetch((uint64_t *)(uintptr_t)A(0), 2, __ATOMIC_RELEASE); return 0; }
+/* ---- SRW locks / condition variables / init-once ---- */
+SYS(InitializeSRWLock) { 
+    if (aot_is_pe32) ST(uint32_t, A(0), 0); else ST(uint64_t, A(0), 0); 
+    return 0; 
+}
+SYS(AcquireSRWLockExclusive) { 
+    for (int s = 0;; s++) { 
+        if (aot_is_pe32) {
+            uint32_t *w = (uint32_t *)(uintptr_t)A(0), z = 0; 
+            if (__atomic_compare_exchange_n(w, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0; 
+        } else {
+            uint64_t *w = (uint64_t *)(uintptr_t)A(0), z = 0; 
+            if (__atomic_compare_exchange_n(w, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0; 
+        }
+        if (s < 100) sched_yield(); else usleep(100); 
+    } 
+}
+SYS(TryAcquireSRWLockExclusive) { 
+    if (aot_is_pe32) { uint32_t *w = (uint32_t *)(uintptr_t)A(0), z = 0; return __atomic_compare_exchange_n(w, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED); }
+    uint64_t *w = (uint64_t *)(uintptr_t)A(0), z = 0; return __atomic_compare_exchange_n(w, &z, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED); 
+}
+SYS(ReleaseSRWLockExclusive) { 
+    if (aot_is_pe32) __atomic_store_n((uint32_t *)(uintptr_t)A(0), 0, __ATOMIC_RELEASE);
+    else __atomic_store_n((uint64_t *)(uintptr_t)A(0), 0, __ATOMIC_RELEASE);
+    return 0; 
+}
+SYS(AcquireSRWLockShared) { 
+    for (int s = 0;; s++) { 
+        if (aot_is_pe32) {
+            uint32_t *w = (uint32_t *)(uintptr_t)A(0), v = __atomic_load_n(w, __ATOMIC_RELAXED); 
+            if (!(v & 1) && __atomic_compare_exchange_n(w, &v, v + 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0; 
+        } else {
+            uint64_t *w = (uint64_t *)(uintptr_t)A(0), v = __atomic_load_n(w, __ATOMIC_RELAXED); 
+            if (!(v & 1) && __atomic_compare_exchange_n(w, &v, v + 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 0; 
+        }
+        if (s < 100) sched_yield(); else usleep(100); 
+    } 
+}
+SYS(TryAcquireSRWLockShared) { 
+    if (aot_is_pe32) { uint32_t *w = (uint32_t *)(uintptr_t)A(0), v = __atomic_load_n(w, __ATOMIC_RELAXED); return !(v & 1) && __atomic_compare_exchange_n(w, &v, v + 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED); }
+    uint64_t *w = (uint64_t *)(uintptr_t)A(0), v = __atomic_load_n(w, __ATOMIC_RELAXED); return !(v & 1) && __atomic_compare_exchange_n(w, &v, v + 2, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED); 
+}
+SYS(ReleaseSRWLockShared) { 
+    if (aot_is_pe32) __atomic_sub_fetch((uint32_t *)(uintptr_t)A(0), 2, __ATOMIC_RELEASE);
+    else __atomic_sub_fetch((uint64_t *)(uintptr_t)A(0), 2, __ATOMIC_RELEASE);
+    return 0; 
+}
+
 static uint32_t cv_wait(CPU *c, uint64_t cv, uint32_t ms, int srw, uint64_t lock, uint32_t flags) {
-  uint64_t *gen = (uint64_t *)(uintptr_t)cv; struct timespec dl; if (ms != INFINITE_MS) mono_deadline(&dl, ms);
-  pthread_mutex_lock(&G); uint64_t g0 = __atomic_load_n(gen, __ATOMIC_SEQ_CST); pthread_mutex_unlock(&G);
+  struct timespec dl; if (ms != INFINITE_MS) mono_deadline(&dl, ms);
+  
+  // Read generation (pointer-sized)
+  uint64_t g0;
+  if (aot_is_pe32) g0 = __atomic_load_n((uint32_t *)(uintptr_t)cv, __ATOMIC_SEQ_CST);
+  else g0 = __atomic_load_n((uint64_t *)(uintptr_t)cv, __ATOMIC_SEQ_CST);
+
   int32_t rec = 0;
   if (srw) { CPU t = *c; t.r[1] = lock; if (flags & 1) sys_ReleaseSRWLockShared(&t); else sys_ReleaseSRWLockExclusive(&t); }
   else { uint64_t ro = cs_recursion_offset(); rec = LD(int32_t, lock + ro); ST(int32_t, lock + ro, 1); cs_leave(lock); }
+  
   uint32_t ok = 1;
   pthread_mutex_lock(&G);
-  while (__atomic_load_n(gen, __ATOMIC_SEQ_CST) == g0) {
+  while (1) {
+    uint64_t g;
+    if (aot_is_pe32) g = __atomic_load_n((uint32_t *)(uintptr_t)cv, __ATOMIC_SEQ_CST);
+    else g = __atomic_load_n((uint64_t *)(uintptr_t)cv, __ATOMIC_SEQ_CST);
+    if (g != g0) break;
     int e = ms == INFINITE_MS ? pthread_cond_wait(&C, &G) : pthread_cond_timedwait(&C, &G, &dl);
-    if (e == ETIMEDOUT) { ok = __atomic_load_n(gen, __ATOMIC_SEQ_CST) != g0; break; }
+    if (e == ETIMEDOUT) { 
+        if (aot_is_pe32) ok = __atomic_load_n((uint32_t *)(uintptr_t)cv, __ATOMIC_SEQ_CST) != g0;
+        else ok = __atomic_load_n((uint64_t *)(uintptr_t)cv, __ATOMIC_SEQ_CST) != g0;
+        break; 
+    }
   }
   pthread_mutex_unlock(&G);
+  
   if (srw) { CPU t = *c; t.r[1] = lock; if (flags & 1) sys_AcquireSRWLockShared(&t); else sys_AcquireSRWLockExclusive(&t); }
   else { cs_enter(lock); ST(int32_t, lock + cs_recursion_offset(), rec); }
   if (!ok) aot_last_error = 1460;
   return ok;
 }
-SYS(InitializeConditionVariable) { ST(uint64_t, A(0), 0); return 0; }
+
+SYS(InitializeConditionVariable) { 
+    if (aot_is_pe32) ST(uint32_t, A(0), 0); else ST(uint64_t, A(0), 0); 
+    return 0; 
+}
 SYS(SleepConditionVariableCS) { return cv_wait(c, A(0), (uint32_t)A(2), 0, A(1), 0); }
 SYS(SleepConditionVariableSRW) { return cv_wait(c, A(0), (uint32_t)A(2), 1, A(1), (uint32_t)A(3)); }
-SYS(WakeConditionVariable) { pthread_mutex_lock(&G); __atomic_add_fetch((uint64_t *)(uintptr_t)A(0), 1, __ATOMIC_SEQ_CST); pthread_cond_broadcast(&C); pthread_mutex_unlock(&G); return 0; }
+SYS(WakeConditionVariable) { 
+    pthread_mutex_lock(&G); 
+    if (aot_is_pe32) __atomic_add_fetch((uint32_t *)(uintptr_t)A(0), 1, __ATOMIC_SEQ_CST); 
+    else __atomic_add_fetch((uint64_t *)(uintptr_t)A(0), 1, __ATOMIC_SEQ_CST); 
+    pthread_cond_broadcast(&C); 
+    pthread_mutex_unlock(&G); 
+    return 0; 
+}
 SYS(InitOnceExecuteOnce) {   /* once word: 0 new, 1 running, 2 done */
   uint32_t *w = (uint32_t *)(uintptr_t)A(0);
   for (;;) {
