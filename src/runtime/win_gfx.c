@@ -76,6 +76,8 @@ static int method_argc(const char *iface, const char *m) {
   if (!strcmp(m, "GetDevice")) return dxgi ? 3 : 2;
   if (!strcmp(m, "CreateVertexShader") || !strcmp(m, "CreatePixelShader")) return d10 ? 4 : 5;
   if (!strcmp(m, "PSSetShader") || !strcmp(m, "VSSetShader")) return d10 ? 2 : 4;
+  if (!strncmp(iface, "ID3D10Buffer", 12)) { if (!strcmp(m, "Map")) return 4; if (!strcmp(m, "Unmap")) return 1; }
+  if (!strncmp(iface, "ID3D10Texture2D", 15)) { if (!strcmp(m, "Map")) return 5; if (!strcmp(m, "Unmap")) return 2; }
   if (!strcmp(m, "Map")) return ctx ? 6 : 4;
   if (!strcmp(m, "Unmap")) return ctx ? 3 : 2;
   for (int i = 0; t[i].n; i++) if (!strcmp(t[i].n, m)) return t[i].a;
@@ -893,10 +895,21 @@ F(blend_getdesc) { memcpy((void *)A(1), ((Obj *)A(0))->blend_desc, 264); return 
 F(rasterizer_getdesc) { memcpy((void *)A(1), ((Obj *)A(0))->rasterizer_desc, 40); return 0; }
 F(rtv_getresource) { Obj *v = (Obj *)A(0); STP(A(1), v->res); v->res->refs++; return 0; }
 
+/* D3D10 resources carry Map/Unmap/GetDesc themselves (slots 10-12); D3D10 Map(type, flags, ppData) is routed to the one dynamic-buffer path above. */
+F(b10_getdesc) { memcpy((void *)A(1), ((Obj *)A(0))->buffer_desc, 20); return 0; }   /* D3D10_BUFFER_DESC has no StructureByteStride */
+F(b10_map) {
+  Obj *res = (Obj *)A(0); uint64_t fr[16] = { 0 }; uint8_t tmp[16] = { 0 }; CPU cp = *c;
+  cp.r[1] = (uint64_t)(uintptr_t)res->dev; cp.r[2] = (uint64_t)(uintptr_t)res; cp.r[8] = 0; cp.r[9] = A(1); fr[4] = A(2); fr[5] = (uint64_t)(uintptr_t)tmp; cp.r[4] = (uint64_t)(uintptr_t)fr - 8;
+  uint64_t r = x_map(&cp); if (!r && A(3)) STP(A(3), aot_is_pe32 ? (uint64_t)LD(uint32_t, tmp) : LD(uint64_t, tmp)); return r;
+}
+F(b10_unmap) { Obj *res = (Obj *)A(0); CPU cp = *c; cp.r[1] = (uint64_t)(uintptr_t)res->dev; cp.r[2] = (uint64_t)(uintptr_t)res; cp.r[8] = 0; return x_unmap(&cp); }
+F(t10_map) { fprintf(stderr, "[gfx] ID3D10Texture2D::Map is not implemented (CPU access to textures)\n"); return 0x80004001u; }
+F(t10_unmap) { fprintf(stderr, "[gfx] ID3D10Texture2D::Unmap is not implemented\n"); return 0; }
 static uint64_t f_createsc(CPU *c);
 F(d_createvs);
 F(d_createps);
 F(rasterizer_getdesc);
+static void **vt_tex10, **vt_buf10;
 static void **vt_dev, **vt_d10dev, **vt_ctx, **vt_dxdev, **vt_adp, **vt_out, **vt_dss, **vt_fac, **vt_sc, **vt_tex, **vt_rtv, **vt_shader, **vt_buf, **vt_layout, **vt_srv, **vt_sampler, **vt_blend, **vt_rasterizer;
 #define UNK { 0, u_qi, "QueryInterface" }, { 1, u_addref, "AddRef" }, { 2, u_release, "Release" }
 
@@ -1037,6 +1050,10 @@ static void init_vts(void) {
     vt_shader = build("ID3D11Shader", 7, s); }
   { Slot s[] = { UNK, { 3, c_getdevice, "GetDevice" }, { 7, buf_gettype, "GetType" }, { 10, buf_getdesc, "GetDesc" }, { 0, 0, 0 } };
     vt_buf = build("ID3D11Buffer", 11, s); }
+  { Slot s[] = { UNK, { 3, c_getdevice, "GetDevice" }, { 7, res_gettype, "GetType" }, { 8, u_ok, "SetEvictionPriority" }, { 9, d_zero, "GetEvictionPriority" }, { 10, t10_map, "Map" }, { 11, t10_unmap, "Unmap" }, { 12, tex_getdesc, "GetDesc" }, { 0, 0, 0 } };
+    vt_tex10 = build("ID3D10Texture2D", 13, s); }
+  { Slot s[] = { UNK, { 3, c_getdevice, "GetDevice" }, { 7, buf_gettype, "GetType" }, { 10, b10_map, "Map" }, { 11, b10_unmap, "Unmap" }, { 12, b10_getdesc, "GetDesc" }, { 0, 0, 0 } };
+    vt_buf10 = build("ID3D10Buffer", 13, s); }
   { Slot s[] = { UNK, { 3, c_getdevice, "GetDevice" }, { 0, 0, 0 } };
     vt_layout = build("ID3D11InputLayout", 7, s); }
   { Slot s[] = { UNK, { 3, c_getdevice, "GetDevice" }, { 0, 0, 0 } };
@@ -1051,7 +1068,7 @@ static void init_vts(void) {
     vt_dss = build("ID3D10DepthStencilState", 5, s); }
 }
 static void *vt_for(Kind k) { switch (k) { case K_DEV: return vt_dev; case K_CTX: return vt_ctx; case K_DXDEV: return vt_dxdev; case K_ADAPTER: return vt_adp; case K_OUTPUT: return vt_out; case K_FACTORY: return vt_fac; case K_SC: return vt_sc; case K_TEX: return vt_tex; case K_VS: case K_PS: return vt_shader; case K_BUF: return vt_buf; case K_LAYOUT: return vt_layout; case K_SRV: return vt_srv; case K_SAMPLER: return vt_sampler; case K_BLEND: return vt_blend; case K_RASTERIZER: return vt_rasterizer; case K_DSS: return vt_dss; default: return vt_rtv; } }
-static void bind(Obj *o) { o->vt = vt_for(o->kind); }
+static void bind(Obj *o) { o->vt = vt_for(o->kind); if (o->dev && (void *)o->dev->vt == (void *)vt_d10dev && vt_d10dev) { if (o->kind == K_TEX) o->vt = vt_tex10; else if (o->kind == K_BUF) o->vt = vt_buf10; } }
 static Obj *mkv(Kind k, Obj *dev) { init_vts(); Obj *o = mk(k, dev); bind(o); return o; }
 static int spirv_entry_matches(const uint32_t *words, size_t byte_count, uint32_t expected_stage) {
   if (!words || byte_count % sizeof(uint32_t) || byte_count < 5 * sizeof(uint32_t) || words[0] != 0x07230203u) return 0;
