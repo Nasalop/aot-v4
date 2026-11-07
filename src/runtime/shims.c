@@ -169,6 +169,8 @@ SH(VirtualAlloc) {
   }
   if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[va] addr=%llx size=%llx type=%llx -> %llx\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, (unsigned long long)out);
   pthread_mutex_unlock(&vres_mu); (void)type; return out; }
+int aot_vres_lookup(uint64_t a, uint64_t *base, uint64_t *size) {   /* VirtualQuery support: the VirtualAlloc reservation containing a */
+  pthread_mutex_lock(&vres_mu); VRes *r = vres_find(a); int ok = r != NULL; if (ok) { *base = r->base; *size = r->n; } pthread_mutex_unlock(&vres_mu); return ok; }
 SH(VirtualFree) {
   uint64_t addr = A0, size = A1, type = A2; int ok = 1; pthread_mutex_lock(&vres_mu); VRes *r = vres_find(addr);
   if ((type & 0x8000) && r && r->base == addr) { munmap((void *)r->raw, r->rawn); memset(r, 0, sizeof *r); }
