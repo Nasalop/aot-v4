@@ -844,6 +844,7 @@ F(sc_present) {
   Obj *s = (Obj *)A(0), *ctx = s->dev ? s->dev->ctx : NULL;
   AOT_PRESENT_FRAME_STATS stats = { 0 };
   int result = 0;
+  { static unsigned nfr; if (nfr == 0 || nfr == 60 || nfr % 600 == 0) fprintf(stderr, "[gfx] Present #%u (queued draws=%zu)\n", nfr, ctx ? aot_gfx_draw_batch_count(ctx->draw_batch) : (size_t)0); nfr++; }
   if (ctx) {
     size_t queued = aot_gfx_draw_batch_count(ctx->draw_batch);
     if (ctx->draw_error) result = -1;
@@ -1036,6 +1037,7 @@ static int spirv_entry_matches(const uint32_t *words, size_t byte_count, uint32_
   return entries == 1;
 }
 static uint64_t create_shader(CPU *c, Kind kind, uint32_t stage, const char *name) {
+  { static int n; if (n++ < 3) fprintf(stderr, "[gfx] %s called (bytecode %u bytes)\n", name, (unsigned)A(2)); }
   if (A(4)) STP(A(4), 0);
   if (!A(4) || !A(1) || !A(2)) return E_INVALIDARG;
   if (A(3)) return E_NOTIMPL;
