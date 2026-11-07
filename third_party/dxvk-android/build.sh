@@ -22,9 +22,9 @@ endian = 'little'
 cpp_args = ['-Wno-error']
 EOF
 meson setup --cross-file "$W/cross.txt" --buildtype release -Denable_d3d8=false -Denable_d3d9=false build >/dev/null
-ninja -C build src/dxgi/libdxvk_dxgi.so src/d3d11/libdxvk_d3d11.so src/d3d10/libdxvk_d3d10core.so
+ninja -C build
 mkdir -p "$OUT"
-cp build/src/dxgi/libdxvk_dxgi.so build/src/d3d11/libdxvk_d3d11.so build/src/d3d10/libdxvk_d3d10core.so "$OUT/"
+cp -L build/src/dxgi/libdxvk_dxgi.so build/src/d3d11/libdxvk_d3d11.so build/src/d3d10/libdxvk_d3d10core.so "$OUT/"
 cd "$OUT"
 for l in dxgi d3d11 d3d10core; do
   patchelf --set-soname libdxvk_$l.so libdxvk_$l.so
