@@ -32,6 +32,9 @@
 #define EVENT_HANDLE_BASE 0xA07B000000000000ULL
 #define EVENT_HANDLE_MASK 0xFFFF000000000000ULL
 #define EVENT_CAPACITY 128
+static int ev_tr(void) { static int t = -1; if (t < 0) t = getenv("AOT_TRACE_EV") != NULL; return t; }
+#include <sys/syscall.h>
+#define EVT(op, h) do { if (ev_tr()) fprintf(stderr, "[ev] t%ld %s %llx\n", (long)syscall(SYS_gettid), op, (unsigned long long)(h)); } while (0)
 #define OPERATION_CAPACITY 128
 
 typedef struct {
@@ -280,7 +283,7 @@ uint64_t aot_file_async_CreateEventA(CPU *c) {
   }
   pthread_mutex_lock(&async_mutex);
   uint64_t value = install_event((int)ARG(1), (int)ARG(2));
-  pthread_mutex_unlock(&async_mutex);
+  pthread_mutex_unlock(&async_mutex); if (ev_tr()) fprintf(stderr, "[ev] create %llx manual=%d init=%d\n", (unsigned long long)value, (int)ARG(1), (int)ARG(2));
   if (value) aot_last_error = 0;
   return value;
 }
@@ -291,7 +294,7 @@ uint64_t aot_file_async_CreateEventW(CPU *c) {
 
 void aot_wd_set(uint64_t h);
 uint64_t aot_file_async_SetEvent(CPU *c) {
-  aot_wd_set(ARG(0));
+  aot_wd_set(ARG(0)); EVT("set", ARG(0));
   pthread_mutex_lock(&async_mutex);
   EventHandle *event = get_event(ARG(0));
   if (!event) {
@@ -307,6 +310,7 @@ uint64_t aot_file_async_SetEvent(CPU *c) {
 }
 
 uint64_t aot_file_async_ResetEvent(CPU *c) {
+  EVT("reset", ARG(0));
   pthread_mutex_lock(&async_mutex);
   EventHandle *event = get_event(ARG(0));
   if (!event) {
@@ -342,6 +346,7 @@ uint64_t aot_file_async_PulseEvent(CPU *c) {
 uint64_t aot_file_async_WaitForSingleObject(CPU *c) {
   uint64_t value = ARG(0);
   uint32_t timeout = (uint32_t)ARG(1);
+  if (timeout) EVT("wait", value);
   uint32_t pulse_generation = 0;
   int pulse_ready = 0;
   struct timespec deadline = { 0, 0 };
