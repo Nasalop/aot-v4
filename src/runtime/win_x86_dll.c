@@ -4,6 +4,8 @@
  * Tables are parsed by src/tools/pe_dependency_inspect.py: R(dll,name,pop) = reuse existing shim, U(dll,name,pop) = u_<name> here,
  * UO(dll,"#ord",pop,fn) = ordinal import. */
 #define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#include <time.h>
 #include "shims.h"
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -93,8 +95,122 @@ S(waveOutGetDevCapsA) { return 6; }                                   /* MMSYSER
 
 /* ---- DirectInput / DirectSound / EAX / XInput / D3DX10 / Bink: explicit "unavailable" results ---- */
 S(DirectInput8Create) { static int n; note_once(&n, "dinput8: DirectInput unavailable (DIERR_DEVICENOTREG); game must fall back to window messages"); if (P(3)) ST(uint32_t, A(3), 0); return 0x80040154u; }
-S(dsound_enum) { return 0; }                                          /* DirectSoundEnumerateA: no devices enumerated */
-S(dsound_create) { static int n; note_once(&n, "dsound/eax: no audio device layer; DirectSoundCreate* returns DSERR_NODRIVER (game audio disabled)"); if (P(1)) ST(uint32_t, A(1), 0); return 0x88780078u; }
+/* DirectSound (PE32): a complete software device. Buffers hold real memory (Lock/Unlock work), play cursors advance with wall-clock time at the buffer's
+ * frequency, looping/stop semantics follow the API, so a game's streaming code runs normally. The mixed audio is NOT sent anywhere yet (no Android audio
+ * backend): that is announced once on stderr. 3D buffers / IKsPropertySet (EAX) are not offered: QueryInterface answers E_NOINTERFACE. */
+typedef struct { uint32_t vt; int ref; } DSObj;
+typedef struct { uint32_t vt; int ref; uint8_t *data; uint32_t size, flags, pos, freq, align; int playing, looping; int32_t vol, pan; uint64_t t0; uint8_t wfx[18]; } DSBuf;
+static uint32_t ds_vt_dev, ds_vt_buf, ds_vt_lis;
+static const uint8_t IID_DSL_[16] = {0x84,0xFA,0x9A,0x27,0x81,0x49,0xCE,0x11,0xA5,0x21,0x00,0x20,0xAF,0x0B,0xE5,0x60};
+static const uint8_t IID_IUnknown_[16] = {0,0,0,0,0,0,0,0,0xC0,0,0,0,0,0,0,0x46}, IID_DS_[16] = {0x83,0xFA,0x9A,0x27,0x81,0x49,0xCE,0x11,0xA5,0x21,0x00,0x20,0xAF,0x0B,0xE5,0x60},
+  IID_DS8_[16] = {0x93,0x7E,0x0A,0xC5,0x95,0xF3,0x34,0x48,0x9E,0xF6,0x7F,0xA9,0x9D,0xE8,0x25,0x26}, IID_DSB_[16] = {0x85,0xFA,0x9A,0x27,0x81,0x49,0xCE,0x11,0xA5,0x21,0x00,0x20,0xAF,0x0B,0xE5,0x60},
+  IID_DSB8_[16] = {0x49,0xA4,0x25,0x68,0x24,0x75,0x82,0x4D,0x92,0x0F,0x50,0xE3,0x6A,0xB3,0xAB,0x1E};
+#define DS_E_NOIFACE 0x80004002u
+#define DS_E_PARAM 0x80070057u
+#define DS_E_UNSUPPORTED 0x88780038u
+static uint64_t ds_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static uint32_t ds_cursor(DSBuf *b) {
+  if (!b->playing) return b->pos;
+  uint64_t raw = b->pos + (ds_now() - b->t0) * ((uint64_t)b->freq * b->align) / 1000000000ull;
+  if (b->looping) return (uint32_t)(raw % b->size);
+  if (raw >= b->size) { b->playing = 0; b->pos = 0; return 0; }
+  return (uint32_t)raw;
+}
+static uint32_t ds_qi(uint32_t self, const uint8_t *iid, uint32_t *out, int dev) {
+  if (!out) return DS_E_PARAM;
+  int ok = !memcmp(iid, IID_IUnknown_, 16) || (dev == 2 ? !memcmp(iid, IID_DSL_, 16) : dev ? (!memcmp(iid, IID_DS_, 16) || !memcmp(iid, IID_DS8_, 16)) : (!memcmp(iid, IID_DSB_, 16) || !memcmp(iid, IID_DSB8_, 16)));
+  if (!ok) { fprintf(stderr, "[aot] DirectSound QueryInterface: IID {%08x-%04x-%04x-...} not supported\n", *(uint32_t *)iid, *(uint16_t *)(iid + 4), *(uint16_t *)(iid + 6)); *out = 0; return DS_E_NOIFACE; }
+  *out = self; __atomic_add_fetch(&((DSObj *)(uintptr_t)self)->ref, 1, __ATOMIC_RELAXED); return 0;
+}
+#define DSD(n) static uint64_t dsd_##n(CPU *c)
+#define DSB(n) static uint64_t dsb_##n(CPU *c)
+#define THIS_B ((DSBuf *)(uintptr_t)(uint32_t)A(0))
+DSD(QueryInterface) { return ds_qi((uint32_t)A(0), P(1), P(2), 1); }
+DSD(AddRef) { return (uint32_t)__atomic_add_fetch(&((DSObj *)P(0))->ref, 1, __ATOMIC_RELAXED); }
+DSD(Release) { DSObj *o = P(0); int r = __atomic_sub_fetch(&o->ref, 1, __ATOMIC_RELAXED); if (!r) aot_gfree(o); return (uint32_t)r; }
+static DSBuf *ds_newbuf(uint32_t flags, uint32_t size, const uint8_t *wfx) {
+  DSBuf *b = aot_gcalloc(1, sizeof *b); if (!b) return NULL; b->vt = ds_vt_buf; b->ref = 1; b->flags = flags; b->size = size ? size : 0x10000; b->data = aot_gcalloc(1, b->size);
+  if (!b->data) { aot_gfree(b); return NULL; }
+  static const uint8_t def[18] = { 1,0, 2,0, 0x44,0xAC,0,0, 0x10,0xB1,2,0, 4,0, 16,0, 0,0 };   /* PCM 44.1 kHz 16-bit stereo */
+  memcpy(b->wfx, wfx ? wfx : def, 18); b->freq = *(uint32_t *)(b->wfx + 4); b->align = *(uint16_t *)(b->wfx + 12); if (!b->freq) b->freq = 44100; if (!b->align) b->align = 4; return b;
+}
+DSD(CreateSoundBuffer) {
+  const uint8_t *d = P(1); uint32_t *out = P(2); if (!d || !out || *(uint32_t *)d < 20) return DS_E_PARAM;
+  uint32_t flags = *(uint32_t *)(d + 4), bytes = *(uint32_t *)(d + 8); const uint8_t *wfx = (const uint8_t *)(uintptr_t)*(uint32_t *)(d + 16);
+  if (!(flags & 1) && (!wfx || bytes < 4)) return DS_E_PARAM;   /* secondary buffers need a size and a format */
+  DSBuf *b = ds_newbuf(flags, (flags & 1) ? 0 : bytes, (flags & 1) ? NULL : wfx); if (!b) return 0x8007000E; *out = (uint32_t)(uintptr_t)b; return 0;
+}
+DSD(GetCaps) { uint8_t *p = P(1); if (!p || *(uint32_t *)p < 96) return DS_E_PARAM; uint32_t sz = *(uint32_t *)p; memset(p, 0, sz); *(uint32_t *)p = sz;
+  *(uint32_t *)(p + 4) = 0x20 | 0x10 | 0x8 | 0x800 | 0x2 | 0x200;   /* emulated driver, continuous rate, 16-bit stereo */
+  *(uint32_t *)(p + 8) = 100; *(uint32_t *)(p + 12) = 200000; *(uint32_t *)(p + 20) = 1; return 0; }
+DSD(DuplicateSoundBuffer) { DSBuf *s = (DSBuf *)P(1); uint32_t *out = P(2); if (!s || !out) return DS_E_PARAM; DSBuf *b = ds_newbuf(s->flags, s->size, s->wfx); if (!b) return 0x8007000E; memcpy(b->data, s->data, s->size); *out = (uint32_t)(uintptr_t)b; return 0; }
+DSD(Ok) { return 0; }
+DSD(GetSpeakerConfig) { uint32_t *o = P(1); if (!o) return DS_E_PARAM; *o = 3; return 0; }   /* DSSPEAKER_STEREO */
+DSD(Unsupported) { return DS_E_UNSUPPORTED; }
+DSD(LisQI) { return ds_qi((uint32_t)A(0), P(1), P(2), 2); }
+DSB(QueryInterface) {
+  if (P(1) && P(2) && !memcmp(P(1), IID_DSL_, 16)) {   /* 3D listener: parameters are accepted but spatialization is not applied */
+    static int n; note_once(&n, "DirectSound: 3D listener accepts settings but 3D positioning is not applied");
+    DSObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E; l->vt = ds_vt_lis; l->ref = 1; *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; return 0; }
+  return ds_qi((uint32_t)A(0), P(1), P(2), 0);
+}
+DSB(Release) { DSBuf *b = THIS_B; int r = __atomic_sub_fetch(&b->ref, 1, __ATOMIC_RELAXED); if (!r) { aot_gfree(b->data); aot_gfree(b); } return (uint32_t)r; }
+DSB(GetCaps) { uint32_t *p = P(1); if (!p || p[0] < 20) return DS_E_PARAM; DSBuf *b = THIS_B; p[1] = b->flags; p[2] = b->size; p[3] = 0; p[4] = 0; return 0; }
+DSB(GetCurrentPosition) { DSBuf *b = THIS_B; uint32_t pl = ds_cursor(b), *pp = P(1), *pw = P(2); if (pp) *pp = pl; if (pw) *pw = (pl + b->freq * b->align / 50) % b->size / b->align * b->align; return 0; }   /* write cursor ~20 ms ahead */
+DSB(GetFormat) { DSBuf *b = THIS_B; uint8_t *f = P(1); uint32_t n = (uint32_t)A(2), *w = P(3); if (f) memcpy(f, b->wfx, n < 18 ? n : 18); if (w) *w = 18; return 0; }
+DSB(GetVolume) { uint32_t *o = P(1); if (!o) return DS_E_PARAM; *o = (uint32_t)THIS_B->vol; return 0; }
+DSB(GetPan) { uint32_t *o = P(1); if (!o) return DS_E_PARAM; *o = (uint32_t)THIS_B->pan; return 0; }
+DSB(GetFrequency) { uint32_t *o = P(1); if (!o) return DS_E_PARAM; *o = THIS_B->freq; return 0; }
+DSB(GetStatus) { DSBuf *b = THIS_B; uint32_t *o = P(1); if (!o) return DS_E_PARAM; ds_cursor(b); *o = b->playing ? (1u | (b->looping ? 4u : 0u)) : 0; return 0; }
+DSB(Lock) {
+  DSBuf *b = THIS_B; uint32_t off = (uint32_t)A(1), n = (uint32_t)A(2), flags = (uint32_t)A(7); uint32_t *p1 = P(3), *b1 = P(4), *p2 = P(5), *b2 = P(6);
+  if (flags & 1) { uint32_t pl = ds_cursor(b); off = (pl + b->freq * b->align / 50) % b->size / b->align * b->align; }
+  if (flags & 2) { off = 0; n = b->size; }
+  if (!p1 || !b1 || off >= b->size || n > b->size) return DS_E_PARAM;
+  uint32_t first = n < b->size - off ? n : b->size - off; *p1 = (uint32_t)(uintptr_t)(b->data + off); *b1 = first;
+  if (p2) *p2 = n > first ? (uint32_t)(uintptr_t)b->data : 0; if (b2) *b2 = n - first; return 0;
+}
+DSB(Play) {
+  DSBuf *b = THIS_B; static int note; note_once(&note, "DirectSound: audio is mixed/timed in software but NOT output (no Android audio backend yet)");
+  ds_cursor(b); b->looping = (A(3) & 1) != 0; if (!b->playing) { b->playing = 1; b->t0 = ds_now(); } return 0;
+}
+DSB(SetCurrentPosition) { DSBuf *b = THIS_B; uint32_t p = (uint32_t)A(1); if (p >= b->size) return DS_E_PARAM; b->pos = p; b->t0 = ds_now(); return 0; }
+DSB(SetFormat) { DSBuf *b = THIS_B; const uint8_t *f = P(1); if (!f) return DS_E_PARAM; memcpy(b->wfx, f, 16); b->freq = *(uint32_t *)(b->wfx + 4); b->align = *(uint16_t *)(b->wfx + 12); if (!b->freq) b->freq = 44100; if (!b->align) b->align = 4; return 0; }
+DSB(SetVolume) { THIS_B->vol = (int32_t)A(1); return 0; }
+DSB(SetPan) { THIS_B->pan = (int32_t)A(1); return 0; }
+DSB(SetFrequency) { DSBuf *b = THIS_B; uint32_t f = (uint32_t)A(1); b->pos = ds_cursor(b); b->t0 = ds_now(); b->freq = f ? f : *(uint32_t *)(b->wfx + 4); return 0; }
+DSB(Stop) { DSBuf *b = THIS_B; b->pos = ds_cursor(b); b->playing = 0; return 0; }
+DSB(Ok) { return 0; }
+DSB(Unsupported) { return DS_E_UNSUPPORTED; }
+typedef struct { int idx; const char *name; uint64_t (*fn)(CPU *); int argc; } DSSlot;
+static uint32_t ds_build(const char *iface, int n, const DSSlot *s) {
+  uint32_t *vt = aot_gcalloc(n + 64, 4); char nm[96]; if (!vt) return 0;
+  for (int i = 0; i < n + 64; i++) { snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", iface, i); vt[i] = (uint32_t)aot_register_thunk(NULL, nm); }
+  for (; s->fn; s++) { snprintf(nm, sizeof nm, "%s::%s", iface, s->name); uint64_t t = aot_register_thunk((aot_host_fn)s->fn, nm); aot_thunk_set_pop(t, 4 * s->argc); vt[s->idx] = (uint32_t)t; }
+  return (uint32_t)(uintptr_t)vt;
+}
+static void ds_init_tables(void) {
+  static const DSSlot dev[] = { {0,"QueryInterface",dsd_QueryInterface,3}, {1,"AddRef",dsd_AddRef,1}, {2,"Release",dsd_Release,1}, {3,"CreateSoundBuffer",dsd_CreateSoundBuffer,4}, {4,"GetCaps",dsd_GetCaps,2},
+    {5,"DuplicateSoundBuffer",dsd_DuplicateSoundBuffer,3}, {6,"SetCooperativeLevel",dsd_Ok,3}, {7,"Compact",dsd_Ok,1}, {8,"GetSpeakerConfig",dsd_GetSpeakerConfig,2}, {9,"SetSpeakerConfig",dsd_Ok,2},
+    {10,"Initialize",dsd_Ok,2}, {11,"VerifyCertification",dsd_Unsupported,2}, {0,0,0,0} };
+  static const DSSlot buf[] = { {0,"QueryInterface",dsb_QueryInterface,3}, {1,"AddRef",dsd_AddRef,1}, {2,"Release",dsb_Release,1}, {3,"GetCaps",dsb_GetCaps,2}, {4,"GetCurrentPosition",dsb_GetCurrentPosition,3},
+    {5,"GetFormat",dsb_GetFormat,4}, {6,"GetVolume",dsb_GetVolume,2}, {7,"GetPan",dsb_GetPan,2}, {8,"GetFrequency",dsb_GetFrequency,2}, {9,"GetStatus",dsb_GetStatus,2}, {10,"Initialize",dsb_Ok,3},
+    {11,"Lock",dsb_Lock,8}, {12,"Play",dsb_Play,4}, {13,"SetCurrentPosition",dsb_SetCurrentPosition,2}, {14,"SetFormat",dsb_SetFormat,2}, {15,"SetVolume",dsb_SetVolume,2}, {16,"SetPan",dsb_SetPan,2},
+    {17,"SetFrequency",dsb_SetFrequency,2}, {18,"Stop",dsb_Stop,1}, {19,"Unlock",dsb_Ok,5}, {20,"Restore",dsb_Ok,1}, {21,"SetFX",dsb_Unsupported,4}, {22,"AcquireResources",dsb_Unsupported,4}, {23,"GetObjectInPath",dsb_Unsupported,5}, {0,0,0,0} };
+  static const DSSlot lis[] = { {0,"QueryInterface",dsd_LisQI,3}, {1,"AddRef",dsd_AddRef,1}, {2,"Release",dsd_Release,1}, {3,"GetAllParameters",dsd_Unsupported,2}, {4,"GetDistanceFactor",dsd_Unsupported,2},
+    {5,"GetDopplerFactor",dsd_Unsupported,2}, {6,"GetOrientation",dsd_Unsupported,3}, {7,"GetPosition",dsd_Unsupported,2}, {8,"GetRolloffFactor",dsd_Unsupported,2}, {9,"GetVelocity",dsd_Unsupported,2},
+    {10,"SetAllParameters",dsd_Ok,3}, {11,"SetDistanceFactor",dsd_Ok,3}, {12,"SetDopplerFactor",dsd_Ok,3}, {13,"SetOrientation",dsd_Ok,8}, {14,"SetPosition",dsd_Ok,5}, {15,"SetRolloffFactor",dsd_Ok,3},
+    {16,"SetVelocity",dsd_Ok,5}, {17,"CommitDeferredSettings",dsd_Ok,1}, {0,0,0,0} };
+  if (!ds_vt_dev) { ds_vt_lis = ds_build("IDirectSound3DListener", 18, lis); ds_vt_dev = ds_build("IDirectSound8", 12, dev); ds_vt_buf = ds_build("IDirectSoundBuffer8", 24, buf); }
+}
+S(dsound_enum) {   /* DirectSoundEnumerateA(callback, ctx): one default device, as on a normal system */
+  static char *desc, *mod; if (!desc) { desc = aot_gmalloc(64); mod = aot_gmalloc(16); strcpy(desc, "Primary Sound Driver"); strcpy(mod, ""); }
+  if (A(0)) aot_call(c, A(0), 4, (uint64_t)0, (uint64_t)(uintptr_t)desc, (uint64_t)(uintptr_t)mod, A(1)); return 0;
+}
+S(dsound_create) {   /* DirectSoundCreate8 / EAXDirectSoundCreate (guid, IDirectSound**, outer) */
+  uint32_t *out = P(1); if (!out) return DS_E_PARAM; ds_init_tables(); DSObj *d = aot_gcalloc(1, sizeof *d); if (!d || !ds_vt_dev) return 0x8007000E;
+  d->vt = ds_vt_dev; d->ref = 1; *out = (uint32_t)(uintptr_t)d; return 0;
+}
 S(xinput_none) { return 1167; }                                       /* ERROR_DEVICE_NOT_CONNECTED */
 S(D3DX10UnsetAllDeviceObjects) { return 0; }                          /* teardown helper: nothing is cached on our side */
 S(bink_unavail) { static int n; note_once(&n, "binkw32: Bink video is not available; BinkOpen fails so videos are skipped"); return 0; }
