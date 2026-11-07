@@ -8,7 +8,7 @@ jobs:
       - name: Fetch DXVK
         run: |
           git clone --depth 1 --branch v3.1.1 https://github.com/doitsujin/dxvk.git dxvk
-          cd dxvk && git submodule update --init --depth 1
+          cd dxvk && git submodule update --init --recursive --depth 1
           bash ../third_party/dxvk-android/patch.sh .
       - name: Cross-build for arm64 Android (API 28)
         run: |
