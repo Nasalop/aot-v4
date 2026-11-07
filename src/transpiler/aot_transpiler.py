@@ -968,6 +968,7 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                 mn = i.mnemonic.split()[-1]
                 w = {f for f in F5 if i.eflags & WMASK[f]}; r = {f for f in F5 if i.eflags & TMASK[f]}
                 if mn in ('fcomi', 'fucomi', 'fcompi', 'fucompi', 'fcomip', 'fucomip'): w = set(F5)
+                elif mn.startswith('f') and not mn.startswith('fcmov'): w = set()   # capstone 5.0 lists CF as modified by every x87 op (really FPU C0-C3): it dropped the CF of a preceding cmp before `jb`
                 if mn.startswith('fcmov'): r = {'cf', 'zf', 'pf'}
                 if mn in ('lahf', 'pushfd', 'pushf', 'pushfq'): r = set(F5)   # capstone lists no flag reads for these
                 if mn == 'test': w = set(F5)   # capstone 5.0 reports no eflags for `test r/m, r` with a memory operand (1665 sites in AC1): the branch that follows then read stale flags
