@@ -7,7 +7,7 @@
 #include <vulkan/vulkan_android.h>
 #include <cstring>
 
-extern "C" { static ANativeWindow* g_aw; void dxvk_android_set_window(void* w){ g_aw = (ANativeWindow*)w; } }
+extern "C" { static ANativeWindow* g_aw; __attribute__((visibility("default"))) void dxvk_android_set_window(void* w){ g_aw = (ANativeWindow*)w; } }
 
 namespace dxvk::wsi {
   class AndroidWsiDriver : public WsiDriver {
