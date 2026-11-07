@@ -145,6 +145,17 @@ uint64_t g_image_size;
 /* crash report helper (called from the signal handler): recent imports + the original x86 bytes of the block being executed, so the faulting code can be disassembled offline */
 static __thread CPU *cur_cpu;   /* guest CPU of this thread, for crash reports */
 static void dump_context(CPU *c);
+/* File-I/O failures are reported (bounded), never silent: a failed read/seek/lock is exactly what makes a streaming game wait forever. */
+static void io_fail_note(const char *name, uint32_t eax) {
+  static const char *const bools[] = { "ReadFile", "GetOverlappedResult", "LockFileEx", "UnlockFileEx", "GetFileSizeEx", "SetFilePointerEx", "WriteFile", "SetEndOfFile", NULL };
+  static const char *const dwords[] = { "SetFilePointer", "GetFileSize", NULL }; static int cnt[16];
+  const char *dot = strchr(name, '!'); const char *n = dot ? dot + 1 : name; int k = 0, hit = 0;
+  for (; bools[k]; k++) if (!strcmp(n, bools[k])) { hit = (eax == 0); goto done; }
+  for (int j = 0; dwords[j]; j++, k++) if (!strcmp(n, dwords[j])) { hit = (eax == 0xffffffffu); k += 0; goto done; }
+  return;
+done:
+  if (hit && cnt[k % 16]++ < 10) fprintf(stderr, "[aot] %s failed (eax=%u, last error %u)\n", n, (unsigned)eax, (unsigned)aot_last_error);
+}
 typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; volatile uint64_t wh, set; volatile uint32_t wms; volatile int waiting; } WdThread;
 static WdThread wd_t[16]; static int wd_cnt; static __thread WdThread *wd_me;
 static WdThread *wd_self(void);
@@ -229,7 +240,7 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
       if (idx == RET_IDX) { cur_cpu = prev_cpu; return c->r[0]; }
       Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx; { WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx; } { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
       if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
-      if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); continue; }
+      if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); io_fail_note(t->name, (uint32_t)c->r[0]); continue; }
       c->r[0] = t->fn(c);
       pc = LD(uint64_t, c->r[4]); c->r[4] += 8; continue;
     }
