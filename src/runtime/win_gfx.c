@@ -26,7 +26,7 @@ static inline uint64_t argn(CPU *c, int n) { return ARGN(c, n); }
 #define E_INVALIDARG 0x80070057u
 #define DXGI_NOT_FOUND 0x887A0002u
 
-typedef enum { K_DEV = 1, K_CTX, K_DXDEV, K_ADAPTER, K_FACTORY, K_SC, K_TEX, K_RTV, K_VS, K_PS, K_BUF, K_LAYOUT, K_SRV, K_SAMPLER, K_BLEND, K_RASTERIZER, K_OUTPUT } Kind;
+typedef enum { K_DEV = 1, K_CTX, K_DXDEV, K_ADAPTER, K_FACTORY, K_SC, K_TEX, K_RTV, K_VS, K_PS, K_BUF, K_LAYOUT, K_SRV, K_SAMPLER, K_BLEND, K_RASTERIZER, K_OUTPUT, K_DSS } Kind;
 typedef struct Obj {
   void **vt; uint32_t refs; Kind kind; struct Obj *dev, *ctx, *res, *bb, *adapter, *factory, *dxdev, *cur_rtv;
   struct Obj *cur_vs, *cur_ps, *cur_layout, *cur_ib, *cur_blend, *cur_rasterizer;
@@ -72,7 +72,7 @@ static int method_argc(const char *iface, const char *m) {
     {"IASetVertexBuffers",6},{"IsCurrent",1},{"MakeWindowAssociation",3},{"OMSetBlendState",4},{"OMSetRenderTargets",4},{"PSSetSamplers",4},
     {"PSSetShaderResources",4},{"Present",3},{"RSSetScissorRects",3},{"RSSetState",2},{"RSSetViewports",3},{"ResizeBuffers",6},{"ResizeTarget",2},
     {"SetEvictionPriority",2},{"SetExceptionMode",2},{"SetFullscreenState",3},{"SetGPUThreadPriority",2},{"SetPrivateData",4},{"UpdateSubresource",7},
-    {"VSSetConstantBuffers",4}, {"GetDisplayModeList",5},{"FindClosestMatchingMode",4},{"WaitForVBlank",1},{"TakeOwnership",3},{"ReleaseOwnership",1},{"GetGammaControlCapabilities",2},{"SetGammaControl",2},{"GetGammaControl",2},{"SetDisplaySurface",2},{"GetDisplaySurfaceData",2},{"GetFrameStatistics",2}, {0,0} };
+    {"VSSetConstantBuffers",4}, {"GetDisplayModeList",5},{"CreateDepthStencilState",3},{"OMSetDepthStencilState",3},{"FindClosestMatchingMode",4},{"WaitForVBlank",1},{"TakeOwnership",3},{"ReleaseOwnership",1},{"GetGammaControlCapabilities",2},{"SetGammaControl",2},{"GetGammaControl",2},{"SetDisplaySurface",2},{"GetDisplaySurfaceData",2},{"GetFrameStatistics",2}, {0,0} };
   if (!strcmp(m, "GetDevice")) return dxgi ? 3 : 2;
   if (!strcmp(m, "CreateVertexShader") || !strcmp(m, "CreatePixelShader")) return d10 ? 4 : 5;
   if (!strcmp(m, "PSSetShader") || !strcmp(m, "VSSetShader")) return d10 ? 2 : 4;
@@ -897,7 +897,7 @@ static uint64_t f_createsc(CPU *c);
 F(d_createvs);
 F(d_createps);
 F(rasterizer_getdesc);
-static void **vt_dev, **vt_d10dev, **vt_ctx, **vt_dxdev, **vt_adp, **vt_out, **vt_fac, **vt_sc, **vt_tex, **vt_rtv, **vt_shader, **vt_buf, **vt_layout, **vt_srv, **vt_sampler, **vt_blend, **vt_rasterizer;
+static void **vt_dev, **vt_d10dev, **vt_ctx, **vt_dxdev, **vt_adp, **vt_out, **vt_dss, **vt_fac, **vt_sc, **vt_tex, **vt_rtv, **vt_shader, **vt_buf, **vt_layout, **vt_srv, **vt_sampler, **vt_blend, **vt_rasterizer;
 #define UNK { 0, u_qi, "QueryInterface" }, { 1, u_addref, "AddRef" }, { 2, u_release, "Release" }
 
 #define D10_CONTEXT_FORWARD(name) \
@@ -937,6 +937,18 @@ F(d10_createbuffer) {
   CPU copy = *c;
   copy.r[2] = (uint64_t)(uintptr_t)desc;
   return d_createbuffer(&copy);
+}
+/* Depth/stencil: states are created and bound so the game can proceed, but the Vulkan draw path has no depth buffer yet: enabled depth/stencil is NOT applied (announced once). */
+F(d10_createdss) {
+  if (A(2)) STP(A(2), 0);
+  if (!A(1) || !A(2)) return E_INVALIDARG;
+  const uint8_t *desc = (const uint8_t *)A(1); Obj *o = mkv(K_DSS, (Obj *)A(0)); if (!o) return 0x8007000Eu;
+  o->tex[0] = LD(uint32_t, desc); o->tex[1] = LD(uint32_t, desc + 12); STP(A(2), o); return S_OK;
+}
+F(d10_x_setdss) {
+  Obj *s = (Obj *)A(1); static int n;
+  if (s && s->kind == K_DSS && (s->tex[0] || s->tex[1]) && !n++) fprintf(stderr, "[gfx] depth/stencil testing requested but not implemented in the Vulkan backend (rendering will lack depth ordering)\n");
+  return 0;
 }
 F(d10_createblendstate) {
   if (!A(1)) return E_INVALIDARG;
@@ -978,6 +990,7 @@ static void init_vts(void) {
       { 18, d10_x_settopology, "IASetPrimitiveTopology" },
       { 24, d10_x_setrts, "OMSetRenderTargets" },
       { 25, d10_x_setblendstate, "OMSetBlendState" },
+      { 26, d10_x_setdss, "OMSetDepthStencilState" },
       { 29, d10_x_setrasterizerstate, "RSSetState" },
       { 30, d10_x_setviewports, "RSSetViewports" },
       { 31, d10_x_setscissors, "RSSetScissorRects" },
@@ -994,6 +1007,7 @@ static void init_vts(void) {
       { 79, d10_createvs, "CreateVertexShader" },
       { 82, d10_createps, "CreatePixelShader" },
       { 83, d10_createblendstate, "CreateBlendState" },
+      { 84, d10_createdss, "CreateDepthStencilState" },
       { 85, d_createrasterizerstate, "CreateRasterizerState" },
       { 86, d_createsampler, "CreateSamplerState" },
       { 90, d_checkformat, "CheckFormatSupport" },
@@ -1033,8 +1047,10 @@ static void init_vts(void) {
     vt_blend = build("ID3D11BlendState", 8, s); }
   { Slot s[] = { UNK, { 3, c_getdevice, "GetDevice" }, { 7, rasterizer_getdesc, "GetDesc" }, { 0, 0, 0 } };
     vt_rasterizer = build("ID3D11RasterizerState", 8, s); }
+  { Slot s[] = { UNK, { 3, c_getdevice, "GetDevice" }, { 0, 0, 0 } };
+    vt_dss = build("ID3D10DepthStencilState", 5, s); }
 }
-static void *vt_for(Kind k) { switch (k) { case K_DEV: return vt_dev; case K_CTX: return vt_ctx; case K_DXDEV: return vt_dxdev; case K_ADAPTER: return vt_adp; case K_OUTPUT: return vt_out; case K_FACTORY: return vt_fac; case K_SC: return vt_sc; case K_TEX: return vt_tex; case K_VS: case K_PS: return vt_shader; case K_BUF: return vt_buf; case K_LAYOUT: return vt_layout; case K_SRV: return vt_srv; case K_SAMPLER: return vt_sampler; case K_BLEND: return vt_blend; case K_RASTERIZER: return vt_rasterizer; default: return vt_rtv; } }
+static void *vt_for(Kind k) { switch (k) { case K_DEV: return vt_dev; case K_CTX: return vt_ctx; case K_DXDEV: return vt_dxdev; case K_ADAPTER: return vt_adp; case K_OUTPUT: return vt_out; case K_FACTORY: return vt_fac; case K_SC: return vt_sc; case K_TEX: return vt_tex; case K_VS: case K_PS: return vt_shader; case K_BUF: return vt_buf; case K_LAYOUT: return vt_layout; case K_SRV: return vt_srv; case K_SAMPLER: return vt_sampler; case K_BLEND: return vt_blend; case K_RASTERIZER: return vt_rasterizer; case K_DSS: return vt_dss; default: return vt_rtv; } }
 static void bind(Obj *o) { o->vt = vt_for(o->kind); }
 static Obj *mkv(Kind k, Obj *dev) { init_vts(); Obj *o = mk(k, dev); bind(o); return o; }
 static int spirv_entry_matches(const uint32_t *words, size_t byte_count, uint32_t expected_stage) {
