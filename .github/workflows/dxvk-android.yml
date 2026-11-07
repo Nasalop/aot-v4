@@ -1,0 +1,37 @@
+name: dxvk-android
+on: workflow_dispatch
+jobs:
+  dxvk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch DXVK
+        run: |
+          git clone --depth 1 --branch v3.1.1 https://github.com/doitsujin/dxvk.git dxvk
+          cd dxvk && git submodule update --init --depth 1
+          ../third_party/dxvk-android/patch.sh .
+      - name: Cross-build for arm64 Android (API 28)
+        run: |
+          pip install meson glslang 2>/dev/null || pip install --break-system-packages meson
+          sudo apt-get install -y glslang-tools >/dev/null
+          T=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          cat > cross.txt <<EOF
+          [binaries]
+          c = '$T/aarch64-linux-android28-clang'
+          cpp = '$T/aarch64-linux-android28-clang++'
+          ar = '$T/llvm-ar'
+          strip = '$T/llvm-strip'
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          [built-in options]
+          cpp_args = ['-Wno-error']
+          EOF
+          cd dxvk && meson setup --cross-file ../cross.txt --buildtype release -Denable_d3d8=false -Denable_d3d9=false build 2>&1 | tail -30
+          ninja -C build 2>&1 | tail -60
+          find build -name '*.so' | tee ../so.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: dxvk-android, path: "dxvk/build/**/*.so" }
