@@ -49,7 +49,7 @@ else()
     set(GEN ${CMAKE_CURRENT_SOURCE_DIR}/gen/aot_tab.c)
   endif()
   set_source_files_properties(${GEN} PROPERTIES COMPILE_FLAGS "-O1")
-  add_library(aotgame SHARED android_main.c ${GLUE}/android_native_app_glue.c ${RT}/runtime.c ${RT}/win_resolver.c ${RT}/shims.c ${RT}/win_compat.c ${RT}/win_file.c ${RT}/win_file_async.c ${RT}/win_audio.c ${RT}/win_d3d10.c ${RT}/win_sys.c ${RT}/win_x86.c ${RT}/win_x86_dll.c ${RT}/win_input.c ${RT}/win_gfx.c ${RT}/gfx_backend.c ${RT}/gfx_draw_batch.c ${GEN})
+  add_library(aotgame SHARED android_main.c ${GLUE}/android_native_app_glue.c ${RT}/runtime.c ${RT}/win_resolver.c ${RT}/shims.c ${RT}/win_compat.c ${RT}/win_file.c ${RT}/win_file_async.c ${RT}/win_audio.c ${RT}/win_d3d10.c ${RT}/win_sys.c ${RT}/win_x86.c ${RT}/win_x86_dll.c ${RT}/win_input.c ${RT}/win_gfx.c ${RT}/dxvk_proxy.c ${RT}/gfx_backend.c ${RT}/gfx_draw_batch.c ${GEN})
   add_library(aotreserve SHARED ${RT}/aot_reserve.c)   # LD_PRELOADed by wrap.sh to reserve the PE32 image range before ART starts
   target_include_directories(aotgame PRIVATE ${RT} ${GLUE})
   target_compile_definitions(aotgame PRIVATE AOT_ANDROID_APP=1)
