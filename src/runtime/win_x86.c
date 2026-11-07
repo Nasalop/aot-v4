@@ -75,9 +75,19 @@ static uint8_t *low_cur, *low_end; static pthread_mutex_t low_mu = PTHREAD_MUTEX
 #define NCLS 40
 static void *freel[NCLS];
 void *aot_low_map(size_t n, uint64_t hint) {
-  n = (n + 0xFFF) & ~0xFFFULL; static uint64_t next = 0x20000000ULL; pthread_mutex_lock(&map_mu);
-  uint64_t h = hint ? hint : next; void *p = mmap((void *)h, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (p != MAP_FAILED && !hint) next = (uint64_t)p + n + 0x10000;
+  n = (n + 0xFFF) & ~0xFFFULL; static uint64_t next = 0x20000000ULL; pthread_mutex_lock(&map_mu); void *p = MAP_FAILED;
+  if (hint) p = mmap((void *)hint, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  else {   /* first-fit scan of the 32-bit space: occupied ranges are skipped (never relocated above 4 GB), freed holes are found again after wrap-around */
+    const uint64_t lo = 0x10000000ULL, hi = 0xF0000000ULL; uint64_t h = next < lo || next + n > hi ? lo : next, start = h; int wrapped = 0;
+    for (;;) {
+      if (h + n > hi) { if (wrapped) break; wrapped = 1; h = lo; }
+      if (wrapped && h >= start) break;
+      p = mmap((void *)h, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+      if (p == (void *)h) { next = h + n + 0x10000; break; }
+      if (p != MAP_FAILED) { munmap(p, n); p = MAP_FAILED; }   /* kernel without FIXED_NOREPLACE ignored the address */
+      h += (n + 0xFFFFULL) & ~0xFFFFULL; if (h < next && !wrapped) h = next;
+    }
+  }
   pthread_mutex_unlock(&map_mu);
   if (p == MAP_FAILED || (uint64_t)p + n > 0x100000000ULL) { if (p != MAP_FAILED) munmap(p, n); return NULL; }
   return p;
