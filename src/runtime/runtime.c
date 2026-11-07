@@ -145,14 +145,17 @@ uint64_t g_image_size;
 /* crash report helper (called from the signal handler): recent imports + the original x86 bytes of the block being executed, so the faulting code can be disassembled offline */
 static __thread CPU *cur_cpu;   /* guest CPU of this thread, for crash reports */
 static void dump_context(CPU *c);
+typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; } WdThread;
+static WdThread wd_t[16]; static int wd_cnt; static __thread WdThread *wd_me;
+static WdThread *wd_self(void) { if (!wd_me) { int k = __atomic_fetch_add(&wd_cnt, 1, __ATOMIC_RELAXED); wd_me = &wd_t[k % 16]; } return wd_me; }
 /* Watchdog: every 10 s report guest progress (region transitions, imports, recent entries) so a hang/spin is located without a debugger. */
 static void *watchdog(void *arg) {
-  (void)arg; for (int k = 0; k < 12; k++) {
-    sleep(10); unsigned rn = recent_pc_n, in = recent_n;
-    fprintf(stderr, "[aot] watchdog %ds: region entries=%u imports=%u; recent entries:", 10 * (k + 1), rn, in);
-    for (unsigned i = 0; i < 16; i++) { uint64_t v = recent_pc[(rn + i) % 16]; if (v) fprintf(stderr, " %llx", (unsigned long long)v); }
-    fprintf(stderr, "\n[aot] watchdog last imports:"); for (unsigned i = 26; i < 32; i++) { int idx = recent[(in + i) % 32]; if (idx > 0 && idx < nthunks) fprintf(stderr, " %s", thunks[idx].name); }
-    fprintf(stderr, "\n");
+  (void)arg; for (int k = 0; k < 6; k++) {
+    sleep(10); fprintf(stderr, "[aot] watchdog %ds, per guest thread (pc, region entries, last non-sync imports):\n", 10 * (k + 1));
+    for (int t = 0; t < wd_cnt && t < 16; t++) {
+      WdThread *w = &wd_t[t]; fprintf(stderr, "  T%d pc=%llx n=%u:", t, (unsigned long long)w->pc, w->n); unsigned in = w->in; int shown = 0;
+      for (unsigned i = 0; i < 12 && shown < 5; i++) { int idx = w->imp[(in + 11 - i) % 12]; if (idx > 0 && idx < nthunks) { const char *nm = thunks[idx].name; if (strstr(nm, "CriticalSection") || strstr(nm, "Tls") || strstr(nm, "Fls") || strstr(nm, "QueryPerf")) continue; fprintf(stderr, " %s", nm); shown++; } }
+      fprintf(stderr, "\n"); }
   } return NULL;
 }
 void aot_dump_crash_context(void) {
@@ -221,7 +224,7 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
       if (idx == EXIT_IDX) { fflush(stdout); exit((int)c->r[0]); }
       if (idx == RET_IDX) { cur_cpu = prev_cpu; return c->r[0]; }
-      Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx; { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
+      Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx; { WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx; } { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
       if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
       if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); continue; }
       c->r[0] = t->fn(c);
@@ -230,7 +233,7 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
     int lo = 0, hi = aot_nregions - 1, k = -1;
     while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
     if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
-    aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc;
+    aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc; { WdThread *w = wd_self(); w->pc = pc; w->n++; }
     uint64_t np = aot_region_fn[k](c, pc);
     if (np == pc) { fflush(stdout); fprintf(stderr, "\n[aot] address 0x%llx is inside translated code but is not a known entry point (undiscovered indirect jump target)\n", (unsigned long long)pc);
       fprintf(stderr, "[aot] regions containing pc (index lo hi):"); for (int m = 0; m < aot_nregions; m++) if (pc >= aot_region_lo[m] && pc < aot_region_hi[m]) fprintf(stderr, " #%d 0x%llx-0x%llx", m, (unsigned long long)aot_region_lo[m], (unsigned long long)aot_region_hi[m]);
