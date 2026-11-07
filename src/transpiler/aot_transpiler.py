@@ -972,6 +972,8 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                 if mn.startswith('fcmov'): r = {'cf', 'zf', 'pf'}
                 if mn in ('lahf', 'pushfd', 'pushf', 'pushfq'): r = set(F5)   # capstone lists no flag reads for these
                 if mn == 'test': w = set(F5)   # capstone 5.0 reports no eflags for `test r/m, r` with a memory operand (1665 sites in AC1): the branch that follows then read stale flags
+                if mn == 'cmc': r = r | {'cf'}   # capstone omits the CF read of cmc (38 sites in AC1)
+                if mn in ('loope', 'loopz', 'loopne', 'loopnz'): r = r | {'zf'}
                 if mn in ('rcl', 'rcr'): r = r | {'cf'}   # capstone omits the CF read on rotate-through-carry
                 varcnt = (mn in ('shl', 'sal', 'shr', 'sar', 'rol', 'ror') and len(i.operands) > 1 and i.operands[1].type != X86_OP_IMM) or \
                          mn in ('bsf', 'bsr', 'shld', 'shrd', 'bt', 'bts', 'btr', 'btc', 'cmpxchg') or (0xF3 in i.prefix or 0xF2 in i.prefix)
