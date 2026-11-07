@@ -297,15 +297,16 @@ SH(EnumSystemLocalesA) {
   if (!locale) { char *s = aot_gmalloc(9); if (!s) return 0; memcpy(s, "00000409", 9); locale = (uint64_t)(uintptr_t)s; }
   uint64_t r = aot_call(c, A(0), 1, locale); return (uint32_t)r;
 }
-SH(VirtualQuery) {
+int aot_vres_lookup(uint64_t a, uint64_t *base, uint64_t *size);
+SH(VirtualQuery) {   /* Windows semantics: reservations report their real AllocationBase/RegionSize; unmapped space is MEM_FREE (a success, not an error) */
   uintptr_t addr = (uintptr_t)A(0), page = addr & ~(uintptr_t)4095; unsigned char vec;
-  if (mincore((void *)page, 4096, &vec)) { aot_last_error = 87; return 0; }
-  size_t need = aot_is_pe32 ? 28 : 48; if (!A(1) || A(2) < need) return 0; memset((void *)(uintptr_t)A(1), 0, need);
-  if (aot_is_pe32) {
-    ST(uint32_t, A(1), page); ST(uint32_t, A(1) + 4, page); ST(uint32_t, A(1) + 8, 4); ST(uint32_t, A(1) + 12, 4096); ST(uint32_t, A(1) + 16, 0x1000); ST(uint32_t, A(1) + 20, 4); ST(uint32_t, A(1) + 24, 0x40000);
-  } else {
-    ST(uint64_t, A(1), page); ST(uint64_t, A(1) + 8, page); ST(uint32_t, A(1) + 16, 4); ST(uint64_t, A(1) + 24, 4096); ST(uint32_t, A(1) + 32, 0x1000); ST(uint32_t, A(1) + 36, 4); ST(uint32_t, A(1) + 40, 0x40000);
-  } return need;
+  size_t need = aot_is_pe32 ? 28 : 48; if (!A(1) || A(2) < need) { aot_last_error = 24; return 0; } uint8_t *o = (uint8_t *)(uintptr_t)A(1); memset(o, 0, need);
+  uint64_t rb = 0, rn = 0; int vres = aot_vres_lookup(page, &rb, &rn), mapped = vres || !mincore((void *)page, 4096, &vec);
+  uint64_t alloc_base = vres ? rb : mapped ? page : 0, region = vres ? rb + rn - page : mapped ? 4096 : 0x10000 - (page & 0xffff);
+  uint32_t state = mapped ? 0x1000 : 0x10000, prot = mapped ? 4 : 1, alloc_prot = mapped ? 4 : 0, type = mapped ? 0x20000 : 0; if (!mapped) prot = 1, alloc_prot = 0;
+  if (aot_is_pe32) { ST(uint32_t, o, page); ST(uint32_t, o + 4, alloc_base); ST(uint32_t, o + 8, alloc_prot); ST(uint32_t, o + 12, region); ST(uint32_t, o + 16, state); ST(uint32_t, o + 20, mapped ? prot : 1); ST(uint32_t, o + 24, type); }
+  else { ST(uint64_t, o, page); ST(uint64_t, o + 8, alloc_base); ST(uint32_t, o + 16, alloc_prot); ST(uint64_t, o + 24, region); ST(uint32_t, o + 32, state); ST(uint32_t, o + 36, mapped ? prot : 1); ST(uint32_t, o + 40, type); }
+  return need;
 }
 
 /* FormatMessageA: system text, literal source, and numbered string inserts. */
