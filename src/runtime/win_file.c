@@ -897,14 +897,14 @@ SH(SetFilePointer) {
     return INVALID_FILE_SIZE;
   }
   int64_t distance = (int32_t)ARG(1);
-  uint64_t high_address = ARG(3);
+  uint64_t high_address = ARG(2);
   if (high_address) {
     uint64_t bits = ((uint64_t)LD(uint32_t, high_address) << 32) |
         (uint32_t)ARG(1);
     distance = (int64_t)bits;
   }
   int64_t position;
-  if (seek_file(handle->fd, distance, (uint32_t)ARG(2), &position)) {
+  if (seek_file(handle->fd, distance, (uint32_t)ARG(3), &position)) {
     fail_errno();
     return INVALID_FILE_SIZE;
   }
