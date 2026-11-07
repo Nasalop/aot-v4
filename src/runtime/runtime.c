@@ -145,15 +145,18 @@ uint64_t g_image_size;
 /* crash report helper (called from the signal handler): recent imports + the original x86 bytes of the block being executed, so the faulting code can be disassembled offline */
 static __thread CPU *cur_cpu;   /* guest CPU of this thread, for crash reports */
 static void dump_context(CPU *c);
-typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; } WdThread;
+typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; volatile uint64_t wh, set; volatile uint32_t wms; volatile int waiting; } WdThread;
 static WdThread wd_t[16]; static int wd_cnt; static __thread WdThread *wd_me;
+static WdThread *wd_self(void);
+void aot_wd_wait(uint64_t h, uint32_t ms, int on) { WdThread *w = wd_self(); w->wh = h; w->wms = ms; w->waiting = on; }
+void aot_wd_set(uint64_t h) { wd_self()->set = h; }
 static WdThread *wd_self(void) { if (!wd_me) { int k = __atomic_fetch_add(&wd_cnt, 1, __ATOMIC_RELAXED); wd_me = &wd_t[k % 16]; } return wd_me; }
 /* Watchdog: every 10 s report guest progress (region transitions, imports, recent entries) so a hang/spin is located without a debugger. */
 static void *watchdog(void *arg) {
   (void)arg; for (int k = 0; k < 6; k++) {
     sleep(10); fprintf(stderr, "[aot] watchdog %ds, per guest thread (pc, region entries, last non-sync imports):\n", 10 * (k + 1));
     for (int t = 0; t < wd_cnt && t < 16; t++) {
-      WdThread *w = &wd_t[t]; fprintf(stderr, "  T%d pc=%llx n=%u:", t, (unsigned long long)w->pc, w->n); unsigned in = w->in; int shown = 0;
+      WdThread *w = &wd_t[t]; fprintf(stderr, "  T%d pc=%llx n=%u %s h=%llx ms=%x lastSet=%llx:", t, (unsigned long long)w->pc, w->n, w->waiting ? "WAITING" : "running", (unsigned long long)w->wh, w->wms, (unsigned long long)w->set); unsigned in = w->in; int shown = 0;
       for (unsigned i = 0; i < 12 && shown < 5; i++) { int idx = w->imp[(in + 11 - i) % 12]; if (idx > 0 && idx < nthunks) { const char *nm = thunks[idx].name; if (strstr(nm, "CriticalSection") || strstr(nm, "Tls") || strstr(nm, "Fls") || strstr(nm, "QueryPerf")) continue; fprintf(stderr, " %s", nm); shown++; } }
       fprintf(stderr, "\n"); }
   } return NULL;
