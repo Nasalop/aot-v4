@@ -227,6 +227,17 @@ int aot_present_init(void) {
     for (uint32_t k = 0; k < nq; k++) { VkBool32 sup = 0; vkGetPhysicalDeviceSurfaceSupportKHR(pds[i], k, surf, &sup); if ((qp[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && sup) { pd = pds[i]; qf = k; break; } } }
   if (!pd) return -1;
   VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+  { /* capability report for the D3D10/11-over-Vulkan decision: what this phone's driver exposes (DXVK needs several of these) */
+    VkPhysicalDeviceFeatures f; vkGetPhysicalDeviceFeatures(pd, &f); uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, NULL);
+    VkExtensionProperties *ex = ne ? malloc(ne * sizeof *ex) : NULL; if (ex) vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, ex);
+    static const char *const want[] = { "VK_EXT_robustness2", "VK_EXT_extended_dynamic_state", "VK_EXT_extended_dynamic_state2", "VK_EXT_extended_dynamic_state3", "VK_EXT_transform_feedback", "VK_EXT_depth_clip_enable", "VK_EXT_custom_border_color",
+      "VK_EXT_vertex_attribute_divisor", "VK_EXT_shader_demote_to_helper_invocation", "VK_EXT_memory_priority", "VK_EXT_4444_formats", "VK_EXT_graphics_pipeline_library", "VK_EXT_shader_stencil_export", "VK_KHR_dynamic_rendering", "VK_KHR_maintenance4", "VK_KHR_maintenance5",
+      "VK_KHR_timeline_semaphore", "VK_KHR_draw_indirect_count", "VK_KHR_driver_properties", "VK_KHR_push_descriptor", "VK_EXT_conservative_rasterization", NULL };
+    fprintf(stderr, "[vkcaps] %s api=%u.%u.%u driver=0x%x vendor=0x%x device=0x%x\n", props.deviceName, VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion), props.driverVersion, props.vendorID, props.deviceID);
+    fprintf(stderr, "[vkcaps] features: geometryShader=%d tessellation=%d independentBlend=%d depthClamp=%d depthBiasClamp=%d fillModeNonSolid=%d sampleRateShading=%d textureBC=%d fullDrawIndexUint32=%d imageCubeArray=%d shaderClipDistance=%d shaderCullDistance=%d logicOp=%d multiViewport=%d occlusionQueryPrecise=%d pipelineStatistics=%d shaderFloat64=%d samplerAniso=%d robustBufferAccess=%d\n",
+      f.geometryShader, f.tessellationShader, f.independentBlend, f.depthClamp, f.depthBiasClamp, f.fillModeNonSolid, f.sampleRateShading, f.textureCompressionBC, f.fullDrawIndexUint32, f.imageCubeArray, f.shaderClipDistance, f.shaderCullDistance, f.logicOp, f.multiViewport, f.occlusionQueryPrecise, f.pipelineStatisticsQuery, f.shaderFloat64, f.samplerAnisotropy, f.robustBufferAccess);
+    fprintf(stderr, "[vkcaps] extensions:"); for (int w = 0; want[w]; w++) { int has = 0; for (uint32_t e = 0; e < ne && ex; e++) if (!strcmp(ex[e].extensionName, want[w])) { has = 1; break; } fprintf(stderr, " %s=%d", want[w] + 3, has); } fprintf(stderr, "\n"); free(ex);
+  }
   uniform_alignment = props.limits.minUniformBufferOffsetAlignment;
   if (!uniform_alignment) uniform_alignment = 1;
   max_uniform_range = props.limits.maxUniformBufferRange;
