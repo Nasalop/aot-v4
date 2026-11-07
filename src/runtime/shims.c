@@ -142,7 +142,7 @@ SH(SetStdHandle) { int n = (int)A0; if (n < -12 || n > -10) return 0; g_std_hand
 SH(GetACP) { (void)c; return 1252; }
 SH(GetConsoleMode) { if (A1) ST(uint32_t, A1, 0); return 1; }
 SH(GetProcessHeap) { return (uint64_t)&g_heap; }
-SH(HeapAlloc) { return (uint64_t)((A1 & 8) ? calloc(1, A2 ? A2 : 1) : malloc(A2 ? A2 : 1)); }
+SH(HeapAlloc) { void *p = (A1 & 8) ? calloc(1, A2 ? A2 : 1) : malloc(A2 ? A2 : 1); if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[ha] size=%llx -> %p\n", (unsigned long long)A2, p); return (uint64_t)p; }
 SH(HeapReAlloc) { return (uint64_t)realloc((void *)A2, A3); }
 SH(HeapFree) { free((void *)A2); return 1; }
 SH(HeapSize) { return 0; }
@@ -167,6 +167,7 @@ SH(VirtualAlloc) {
     size_t n = (sz + 0xFFFF) & ~0xFFFFULL; void *raw = aot_map_anon(n + 0x10000);
     if (raw) { uint64_t base = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; vres[vres_n++] = (VRes){ (uint64_t)raw, n + 0x10000, base, n }; out = base; }
   }
+  if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[va] addr=%llx size=%llx type=%llx -> %llx\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, (unsigned long long)out);
   pthread_mutex_unlock(&vres_mu); (void)type; return out; }
 SH(VirtualFree) {
   uint64_t addr = A0, size = A1, type = A2; int ok = 1; pthread_mutex_lock(&vres_mu); VRes *r = vres_find(addr);
