@@ -672,7 +672,7 @@ SH(GetModuleFileNameW) {
   return get_module_filename(ARG(1), (uint32_t)ARG(2), 1);
 }
 
-SH(CreateFileA) {
+SH(CreateFileA_real) {
   char path[PATH_MAX];
   if (normalize_path(ARG(0), 0, 0, path)) {
     aot_last_error = ERROR_INVALID_PARAMETER;
@@ -734,6 +734,11 @@ SH(CreateFileA) {
   aot_last_error = existed && (disposition == 2 || disposition == 4) ?
       ERROR_ALREADY_EXISTS : 0;
   return handle;
+}
+SH(CreateFileA) {
+  uint64_t r = sh_CreateFileA_real(c);
+  if (r == UINT64_MAX) { static int n; if (n++ < 40) fprintf(stderr, "[aot] CreateFileA failed (err %u): \"%s\" access=%x disp=%u\n", (unsigned)aot_last_error, ARG(0) ? (const char *)(uintptr_t)ARG(0) : "(null)", (unsigned)ARG(1), (unsigned)ARG(4)); }
+  return r;
 }
 
 SH(CreateFileW) {
