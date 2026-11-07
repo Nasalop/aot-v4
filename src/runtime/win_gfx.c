@@ -189,8 +189,11 @@ F(d_createtex2d) {
       (size_t)width > SIZE_MAX / 4 / height || format != 28 ||
       mip_levels != 1 || array_size != 1 || samples != 1 ||
       usage != 0 || !(bind_flags & 8u) || (bind_flags & ~8u) ||
-      LD(uint32_t, desc + 36) || LD(uint32_t, desc + 40))
+      LD(uint32_t, desc + 36) || LD(uint32_t, desc + 40)) {
+    static int nrej; if (nrej++ < 40) fprintf(stderr, "[gfx] CreateTexture2D unsupported: %ux%u mips=%u array=%u format=%u samples=%u usage=%u bind=0x%x cpu=0x%x misc=0x%x (backend supports only RGBA8 shader-resource textures)\n",
+      width, height, mip_levels, array_size, format, samples, usage, bind_flags, LD(uint32_t, desc + 36), LD(uint32_t, desc + 40));
     return E_NOTIMPL;
+  }
   Obj *texture = mkv(K_TEX, (Obj *)A(0));
   if (!texture) return E_FAIL;
   memcpy(texture->tex, desc, sizeof texture->tex);
@@ -1137,11 +1140,13 @@ static Obj *make_swapchain(Obj *dev, const uint8_t *desc) {
 }
 F(f_createsc) { Obj *s = make_swapchain((Obj *)A(1), (const uint8_t *)A(2)); STP(A(3), s); return S_OK; }
 
+uint64_t aot_dxvk_d3d10_create(uint64_t, uint64_t, uint64_t);
 uint64_t aot_win_gfx_d3d10_create(uint64_t device_output,
                                   uint64_t swapchain_output,
                                   uint64_t swapchain_desc) {
   if (!device_output || (swapchain_output && !swapchain_desc))
     return E_INVALIDARG;
+  { uint64_t dx = aot_dxvk_d3d10_create(device_output, swapchain_output, swapchain_desc); if (dx != (uint64_t)-1) return dx; }
   Obj *device = make_device(NULL);
   if (!device) return E_FAIL;
   device->vt = vt_d10dev;
