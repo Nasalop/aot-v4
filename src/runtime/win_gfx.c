@@ -26,7 +26,7 @@ static inline uint64_t argn(CPU *c, int n) { return ARGN(c, n); }
 #define E_INVALIDARG 0x80070057u
 #define DXGI_NOT_FOUND 0x887A0002u
 
-typedef enum { K_DEV = 1, K_CTX, K_DXDEV, K_ADAPTER, K_FACTORY, K_SC, K_TEX, K_RTV, K_VS, K_PS, K_BUF, K_LAYOUT, K_SRV, K_SAMPLER, K_BLEND, K_RASTERIZER } Kind;
+typedef enum { K_DEV = 1, K_CTX, K_DXDEV, K_ADAPTER, K_FACTORY, K_SC, K_TEX, K_RTV, K_VS, K_PS, K_BUF, K_LAYOUT, K_SRV, K_SAMPLER, K_BLEND, K_RASTERIZER, K_OUTPUT } Kind;
 typedef struct Obj {
   void **vt; uint32_t refs; Kind kind; struct Obj *dev, *ctx, *res, *bb, *adapter, *factory, *dxdev, *cur_rtv;
   struct Obj *cur_vs, *cur_ps, *cur_layout, *cur_ib, *cur_blend, *cur_rasterizer;
@@ -72,7 +72,7 @@ static int method_argc(const char *iface, const char *m) {
     {"IASetVertexBuffers",6},{"IsCurrent",1},{"MakeWindowAssociation",3},{"OMSetBlendState",4},{"OMSetRenderTargets",4},{"PSSetSamplers",4},
     {"PSSetShaderResources",4},{"Present",3},{"RSSetScissorRects",3},{"RSSetState",2},{"RSSetViewports",3},{"ResizeBuffers",6},{"ResizeTarget",2},
     {"SetEvictionPriority",2},{"SetExceptionMode",2},{"SetFullscreenState",3},{"SetGPUThreadPriority",2},{"SetPrivateData",4},{"UpdateSubresource",7},
-    {"VSSetConstantBuffers",4}, {0,0} };
+    {"VSSetConstantBuffers",4}, {"GetDisplayModeList",5},{"FindClosestMatchingMode",4},{"WaitForVBlank",1},{"TakeOwnership",3},{"ReleaseOwnership",1},{"GetGammaControlCapabilities",2},{"SetGammaControl",2},{"GetGammaControl",2},{"SetDisplaySurface",2},{"GetDisplaySurfaceData",2},{"GetFrameStatistics",2}, {0,0} };
   if (!strcmp(m, "GetDevice")) return dxgi ? 3 : 2;
   if (!strcmp(m, "CreateVertexShader") || !strcmp(m, "CreatePixelShader")) return d10 ? 4 : 5;
   if (!strcmp(m, "PSSetShader") || !strcmp(m, "VSSetShader")) return d10 ? 2 : 4;
@@ -156,7 +156,21 @@ F(f_makeassoc) { return S_OK; }
 F(f_iscurrent) { return 1; }
 F(adapter_getparent) { STP(A(2), get_factory()); return S_OK; }
 F(adapter_getdesc) { uint8_t *d = (uint8_t *)A(1); memset(d, 0, aot_is_pe32 ? 292 : 304); const char *n = "AOT Vulkan GPU"; for (int i = 0; n[i]; i++) ST(uint16_t, d + 2 * i, n[i]); ST(uint32_t, d + 256, 0x1AE0); if (aot_is_pe32) ST(uint32_t, d + 272, 3u << 30); else ST(uint64_t, d + 272, 4ULL << 30); return S_OK; }
-F(adapter_enumoutputs) { return DXGI_NOT_FOUND; }
+/* IDXGIOutput: one primary output. The Vulkan surface scales to the window, so the output advertises a fixed set of standard modes (not a monitor query). */
+static Obj *get_output(Obj *adapter) { static Obj *o; if (!o) o = mkv(K_OUTPUT, adapter->dev); return o; }
+F(adapter_enumoutputs) { if ((uint32_t)A(1)) return DXGI_NOT_FOUND; Obj *o = get_output((Obj *)A(0)); STP(A(2), o); o->refs++; return S_OK; }
+F(out_getdesc) { uint8_t *d = (uint8_t *)A(1); if (!d) return E_INVALIDARG; memset(d, 0, aot_is_pe32 ? 92 : 96); const char *n = "\\\\.\\DISPLAY1"; for (int i = 0; n[i]; i++) ST(uint16_t, d + 2 * i, n[i]);
+  ST(int32_t, d + 72, 1920); ST(int32_t, d + 76, 1080); ST(uint32_t, d + 80, 1); ST(uint32_t, d + 84, 1);   /* RECT 0,0,1920,1080; attached; DXGI_MODE_ROTATION_IDENTITY */
+  if (aot_is_pe32) ST(uint32_t, d + 88, 1); else ST(uint64_t, d + 88, 1); return S_OK; }
+F(out_getmodes) {   /* GetDisplayModeList(format, flags, *count, *modes) */
+  static const uint32_t m[][2] = { {640,480}, {800,600}, {1024,768}, {1280,720}, {1280,1024}, {1366,768}, {1600,900}, {1920,1080} }; const uint32_t n = sizeof m / sizeof m[0];
+  uint32_t fmt = (uint32_t)A(1); uint32_t *cnt = (uint32_t *)A(3); uint8_t *out = (uint8_t *)A(4); if (!cnt) return E_INVALIDARG;
+  if (fmt != 28 && fmt != 87 && fmt != 24 && fmt != 10) { *cnt = 0; return S_OK; }   /* only 32-bit RGB scanout formats */
+  if (!out) { *cnt = n; return S_OK; }
+  uint32_t k = *cnt < n ? *cnt : n; for (uint32_t i = 0; i < k; i++) { uint8_t *e = out + 28 * i; ST(uint32_t, e, m[i][0]); ST(uint32_t, e + 4, m[i][1]); ST(uint32_t, e + 8, 60); ST(uint32_t, e + 12, 1); ST(uint32_t, e + 16, fmt); ST(uint32_t, e + 20, 0); ST(uint32_t, e + 24, 0); }
+  *cnt = k; return k < n ? 0x887A0003u : S_OK; }   /* DXGI_ERROR_MORE_DATA */
+F(out_findclosest) { const uint8_t *want = (const uint8_t *)A(1); uint8_t *got = (uint8_t *)A(2); if (!want || !got) return E_INVALIDARG; memcpy(got, want, 28); if (!LD(uint32_t, got + 8)) { ST(uint32_t, got + 8, 60); ST(uint32_t, got + 12, 1); } return S_OK; }
+F(out_unsupported) { return 0x887A0004u; }   /* DXGI_ERROR_UNSUPPORTED */
 F(dxdev_getadapter) { Obj *o = (Obj *)A(0); STP(A(1), get_adapter(o, get_factory())); return S_OK; }
 F(dxdev_getparent) { return dxdev_getadapter(c); }
 
@@ -883,7 +897,7 @@ static uint64_t f_createsc(CPU *c);
 F(d_createvs);
 F(d_createps);
 F(rasterizer_getdesc);
-static void **vt_dev, **vt_d10dev, **vt_ctx, **vt_dxdev, **vt_adp, **vt_fac, **vt_sc, **vt_tex, **vt_rtv, **vt_shader, **vt_buf, **vt_layout, **vt_srv, **vt_sampler, **vt_blend, **vt_rasterizer;
+static void **vt_dev, **vt_d10dev, **vt_ctx, **vt_dxdev, **vt_adp, **vt_out, **vt_fac, **vt_sc, **vt_tex, **vt_rtv, **vt_shader, **vt_buf, **vt_layout, **vt_srv, **vt_sampler, **vt_blend, **vt_rasterizer;
 #define UNK { 0, u_qi, "QueryInterface" }, { 1, u_addref, "AddRef" }, { 2, u_release, "Release" }
 
 #define D10_CONTEXT_FORWARD(name) \
@@ -994,6 +1008,8 @@ static void init_vts(void) {
     vt_dxdev = build("IDXGIDevice", 12, s); }
   { Slot s[] = { UNK, { 6, adapter_getparent, "GetParent" }, { 7, adapter_enumoutputs, "EnumOutputs" }, { 8, adapter_getdesc, "GetDesc" }, { 9, u_ok, "CheckInterfaceSupport" }, { 0, 0, 0 } };
     vt_adp = build("IDXGIAdapter", 10, s); }
+  { Slot s[] = { UNK, { 3, u_ok, "SetPrivateData" }, { 6, adapter_getparent, "GetParent" }, { 7, out_getdesc, "GetDesc" }, { 8, out_getmodes, "GetDisplayModeList" }, { 9, out_findclosest, "FindClosestMatchingMode" }, { 10, u_ok, "WaitForVBlank" }, { 11, u_ok, "TakeOwnership" }, { 12, u_ok, "ReleaseOwnership" }, { 13, out_unsupported, "GetGammaControlCapabilities" }, { 14, out_unsupported, "SetGammaControl" }, { 15, out_unsupported, "GetGammaControl" }, { 16, out_unsupported, "SetDisplaySurface" }, { 17, out_unsupported, "GetDisplaySurfaceData" }, { 18, out_unsupported, "GetFrameStatistics" }, { 0, 0, 0 } };
+    vt_out = build("IDXGIOutput", 19, s); }
   { Slot s[] = { UNK, { 7, f_enumadapters, "EnumAdapters" }, { 8, f_makeassoc, "MakeWindowAssociation" }, { 10, f_createsc, "CreateSwapChain" }, { 12, f_enumadapters, "EnumAdapters1" }, { 13, f_iscurrent, "IsCurrent" }, { 0, 0, 0 } };
     vt_fac = build("IDXGIFactory1", 14, s); }
   { Slot s[] = { UNK, { 6, sc_getparent, "GetParent" }, { 7, sc_getdevice, "GetDevice" }, { 8, sc_present, "Present" }, { 9, sc_getbuffer, "GetBuffer" }, { 10, u_ok, "SetFullscreenState" }, { 11, sc_getfs, "GetFullscreenState" },
@@ -1018,7 +1034,7 @@ static void init_vts(void) {
   { Slot s[] = { UNK, { 3, c_getdevice, "GetDevice" }, { 7, rasterizer_getdesc, "GetDesc" }, { 0, 0, 0 } };
     vt_rasterizer = build("ID3D11RasterizerState", 8, s); }
 }
-static void *vt_for(Kind k) { switch (k) { case K_DEV: return vt_dev; case K_CTX: return vt_ctx; case K_DXDEV: return vt_dxdev; case K_ADAPTER: return vt_adp; case K_FACTORY: return vt_fac; case K_SC: return vt_sc; case K_TEX: return vt_tex; case K_VS: case K_PS: return vt_shader; case K_BUF: return vt_buf; case K_LAYOUT: return vt_layout; case K_SRV: return vt_srv; case K_SAMPLER: return vt_sampler; case K_BLEND: return vt_blend; case K_RASTERIZER: return vt_rasterizer; default: return vt_rtv; } }
+static void *vt_for(Kind k) { switch (k) { case K_DEV: return vt_dev; case K_CTX: return vt_ctx; case K_DXDEV: return vt_dxdev; case K_ADAPTER: return vt_adp; case K_OUTPUT: return vt_out; case K_FACTORY: return vt_fac; case K_SC: return vt_sc; case K_TEX: return vt_tex; case K_VS: case K_PS: return vt_shader; case K_BUF: return vt_buf; case K_LAYOUT: return vt_layout; case K_SRV: return vt_srv; case K_SAMPLER: return vt_sampler; case K_BLEND: return vt_blend; case K_RASTERIZER: return vt_rasterizer; default: return vt_rtv; } }
 static void bind(Obj *o) { o->vt = vt_for(o->kind); }
 static Obj *mkv(Kind k, Obj *dev) { init_vts(); Obj *o = mk(k, dev); bind(o); return o; }
 static int spirv_entry_matches(const uint32_t *words, size_t byte_count, uint32_t expected_stage) {
