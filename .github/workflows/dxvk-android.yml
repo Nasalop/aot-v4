@@ -9,7 +9,7 @@ jobs:
         run: |
           git clone --depth 1 --branch v3.1.1 https://github.com/doitsujin/dxvk.git dxvk
           cd dxvk && git submodule update --init --depth 1
-          ../third_party/dxvk-android/patch.sh .
+          bash ../third_party/dxvk-android/patch.sh .
       - name: Cross-build for arm64 Android (API 28)
         run: |
           pip install meson glslang 2>/dev/null || pip install --break-system-packages meson
