@@ -98,6 +98,7 @@ S(DirectInput8Create) { static int n; note_once(&n, "dinput8: DirectInput unavai
 /* DirectSound (PE32): a complete software device. Buffers hold real memory (Lock/Unlock work), play cursors advance with wall-clock time at the buffer's
  * frequency, looping/stop semantics follow the API, so a game's streaming code runs normally. The mixed audio is NOT sent anywhere yet (no Android audio
  * backend): that is announced once on stderr. 3D buffers / IKsPropertySet (EAX) are not offered: QueryInterface answers E_NOINTERFACE. */
+void aot_thunk_set_pop(uint64_t addr, int pop);
 typedef struct { uint32_t vt; int ref; } DSObj;
 typedef struct { uint32_t vt; int ref; uint8_t *data; uint32_t size, flags, pos, freq, align; int playing, looping; int32_t vol, pan; uint64_t t0; uint8_t wfx[18]; } DSBuf;
 static uint32_t ds_vt_dev, ds_vt_buf, ds_vt_lis;
