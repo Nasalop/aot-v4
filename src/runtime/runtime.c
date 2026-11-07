@@ -7,6 +7,7 @@
 #include <time.h>
 #include <errno.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define THUNK_BASE (aot_is_pe32 ? 0x6ff00000ULL : 0x6fff00000000ULL)
 #define THUNK_SZ 16
@@ -144,6 +145,16 @@ uint64_t g_image_size;
 /* crash report helper (called from the signal handler): recent imports + the original x86 bytes of the block being executed, so the faulting code can be disassembled offline */
 static __thread CPU *cur_cpu;   /* guest CPU of this thread, for crash reports */
 static void dump_context(CPU *c);
+/* Watchdog: every 10 s report guest progress (region transitions, imports, recent entries) so a hang/spin is located without a debugger. */
+static void *watchdog(void *arg) {
+  (void)arg; for (int k = 0; k < 12; k++) {
+    sleep(10); unsigned rn = recent_pc_n, in = recent_n;
+    fprintf(stderr, "[aot] watchdog %ds: region entries=%u imports=%u; recent entries:", 10 * (k + 1), rn, in);
+    for (unsigned i = 0; i < 16; i++) { uint64_t v = recent_pc[(rn + i) % 16]; if (v) fprintf(stderr, " %llx", (unsigned long long)v); }
+    fprintf(stderr, "\n[aot] watchdog last imports:"); for (unsigned i = 26; i < 32; i++) { int idx = recent[(in + i) % 32]; if (idx > 0 && idx < nthunks) fprintf(stderr, " %s", thunks[idx].name); }
+    fprintf(stderr, "\n");
+  } return NULL;
+}
 void aot_dump_crash_context(void) {
   if (cur_cpu) dump_context(cur_cpu);
   dprintf(2, "[aot] last imports called (oldest first):\n");
@@ -285,6 +296,7 @@ uint64_t aot_thread_run(uint64_t fn, uint64_t param, size_t ssz, uint32_t tid) {
 int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s game.exe [args...]\n", argv[0]); return 2; }
   g_exe_path = argv[1];
+  { pthread_t wt; if (!pthread_create(&wt, NULL, watchdog, NULL)) pthread_detach(wt); }
   FILE *f = fopen(argv[1], "rb"); if (!f) { perror(argv[1]); return 2; }
   fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
   uint8_t *file = malloc(fsz); if (fread(file, 1, fsz, f) != (size_t)fsz) return 2; fclose(f);
