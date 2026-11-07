@@ -149,7 +149,12 @@ SH(HeapSize) { return 0; }
 /* VirtualAlloc/VirtualFree with Windows semantics the guest allocators rely on: 64 KB-aligned reservations, a fixed address is honoured or the call
  * fails (never relocated), MEM_RELEASE frees the whole reservation (dwSize must be 0), MEM_DECOMMIT returns zeroed pages on recommit. */
 typedef struct { uint64_t raw, rawn, base, n; } VRes;
-static VRes vres[1024]; static int vres_n; static pthread_mutex_t vres_mu = PTHREAD_MUTEX_INITIALIZER;
+static VRes *vres; static int vres_n, vres_cap; static pthread_mutex_t vres_mu = PTHREAD_MUTEX_INITIALIZER;
+static int vres_add(VRes v) {   /* mu held: reuse a released slot, else grow (no fixed cap: guest allocators map thousands of 64 KB blocks) */
+  for (int i = 0; i < vres_n; i++) if (!vres[i].base) { vres[i] = v; return 1; }
+  if (vres_n == vres_cap) { int nc = vres_cap ? vres_cap * 2 : 4096; VRes *nv = realloc(vres, (size_t)nc * sizeof *nv); if (!nv) return 0; vres = nv; vres_cap = nc; }
+  vres[vres_n++] = v; return 1;
+}
 static VRes *vres_find(uint64_t a) { for (int i = 0; i < vres_n; i++) if (vres[i].base && a >= vres[i].base && a < vres[i].base + vres[i].n) return &vres[i]; return NULL; }
 SH(VirtualAlloc) {
   uint64_t addr = A0, type = A2; size_t sz = (A1 + 0xFFF) & ~0xFFFULL; if (!sz) return 0;
@@ -160,13 +165,14 @@ SH(VirtualAlloc) {
     else {
       uint64_t b = addr & ~0xFFFFULL; size_t n = sz + (size_t)(addr - b);
       void *p = mmap((void *)b, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
-      if (p == (void *)b && vres_n < 1024) { vres[vres_n++] = (VRes){ b, n, b, n }; out = addr; }
-      else if (p != MAP_FAILED) munmap(p, n);                                /* not ours, or table full: fail honestly */
+      if (p == (void *)b && vres_add((VRes){ b, n, b, n })) out = addr;
+      else if (p != MAP_FAILED) munmap(p, n);                                /* address taken, or out of memory: fail honestly */
     }
-  } else if (vres_n < 1024) {
+  } else {
     size_t n = (sz + 0xFFFF) & ~0xFFFFULL; void *raw = aot_map_anon(n + 0x10000);
-    if (raw) { uint64_t base = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; vres[vres_n++] = (VRes){ (uint64_t)raw, n + 0x10000, base, n }; out = base; }
+    if (raw) { uint64_t base = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; if (vres_add((VRes){ (uint64_t)raw, n + 0x10000, base, n })) out = base; else munmap(raw, n + 0x10000); }
   }
+  if (!out) { static int nf; if (nf++ < 20) fprintf(stderr, "[aot] VirtualAlloc failed: addr=%llx size=%llx type=%llx (reservations=%d)\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, vres_n); }
   if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[va] addr=%llx size=%llx type=%llx -> %llx\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, (unsigned long long)out);
   pthread_mutex_unlock(&vres_mu); (void)type; return out; }
 int aot_vres_lookup(uint64_t a, uint64_t *base, uint64_t *size) {   /* VirtualQuery support: the VirtualAlloc reservation containing a */
