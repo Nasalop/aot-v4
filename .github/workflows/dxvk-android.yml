@@ -30,7 +30,7 @@ jobs:
           cpp_args = ['-Wno-error']
           EOF
           cd dxvk && meson setup --cross-file ../cross.txt --buildtype release -Denable_d3d8=false -Denable_d3d9=false build 2>&1 | tail -30
-          ninja -C build 2>&1 | tail -60
+          ninja -C build -k 0 2>&1 | grep -A12 "FAILED:" | head -50 || true
           find build -name '*.so' | tee ../so.txt
       - uses: actions/upload-artifact@v4
         if: always()
