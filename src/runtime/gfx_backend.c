@@ -1269,3 +1269,8 @@ void aot_present_clear(const float c4[4]) {
   (void)aot_present_draw(c4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 #endif
+#ifdef __ANDROID__
+void *aot_present_window(void) { return g_win; }
+#else
+void *aot_present_window(void) { return 0; }
+#endif
