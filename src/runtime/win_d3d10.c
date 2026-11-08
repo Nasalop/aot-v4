@@ -195,6 +195,9 @@ static uint64_t d3d10_reflect_shader(CPU *c) {
   r->shdr = dxbc_chunk(copy, n, "SHDR", &sz); if (!r->shdr) r->shdr = dxbc_chunk(copy, n, "SHEX", &sz); r->stat = dxbc_chunk(copy, n, "STAT", &sz);
   if (!r->rdef) { fprintf(stderr, "[aot] D3D10ReflectShader: bytecode has no RDEF chunk (%zu bytes)\n", n); return 0x80004005u; }
   static const shim_fn f[9] = { r_qi, r_addref, rf_release, rf_getdesc, rf_cbidx, rf_cbname, rf_resdesc, rf_in, rf_out }; static const int ac[9] = { 3, 1, 1, 2, 2, 2, 3, 3, 3 };
+  { static int nlog; if (nlog++ < 12) { uint32_t ncb = U32(r->rdef); const uint8_t *b = ncb ? cb_rec(r, 0) : NULL;
+    fprintf(stderr, "[aot] reflect: ver=%08x cbuffers=%u resources=%u in=%u out=%u%s%s size=%u vars=%u\n", r->shdr ? U32(r->shdr) : 0, ncb, U32(r->rdef + 8), r->isgn ? U32(r->isgn) : 0, r->osgn ? U32(r->osgn) : 0,
+      b ? " cb0=" : "", b ? rs(r, U32(b)) : "", b ? U32(b + 12) : 0, b ? U32(b + 4) : 0); } }
   r->vt = robj_vt("ID3D10ShaderReflection", 9, f, ac, &g_vt_refl); r->refs = 1; put_ptr(ARG(2), (uint64_t)(uintptr_t)r); return 0;
 }
 
