@@ -72,7 +72,9 @@ typedef uint64_t (*GF)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_
                        uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static uint64_t hcall(void *o, int slot, const uint64_t *iv, int ni, const float *fv) {   /* iv[0] is the object */
   uint64_t a[32] = { 0 }; memcpy(a, iv, ni * 8); (void)o;
-  GF f = (GF)(*(void ***)iv[0])[slot];
+  void **hvt = *(void ***)iv[0];
+  if (!hvt) { fprintf(stderr, "[dxvk] host object %#llx has no vtable (slot %d)\n", (unsigned long long)iv[0], slot); return 0x80004005u; }
+  GF f = (GF)hvt[slot];
   return f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], fv[0], fv[1], fv[2], fv[3], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23]);
 }
 static void conv_scd_in(const uint8_t *g, uint8_t *h) { memset(h, 0, 72); memcpy(h, g, 44); uint64_t w = LD(uint32_t, g + 44); memcpy(h + 48, &w, 8); memcpy(h + 56, g + 48, 4); memcpy(h + 60, g + 52, 4); memcpy(h + 64, g + 56, 4); }
@@ -80,7 +82,10 @@ static void conv_wstr(uint8_t *g, const uint8_t *h, int n) { for (int i = 0; i <
 static uint32_t sat(uint64_t v) { return v > 0x7fffffffu ? 0x7fffffffu : (uint32_t)v; }
 typedef struct { uint8_t kind; uint8_t ti; uint32_t g; void *tmp; uint32_t n, sub, type; } Post;
 static uint64_t px_call(CPU *c, const PI *pi, int slot) {
-  const PM *m = &pi->m[slot]; PX *o = (PX *)(uintptr_t)A(0);
+  static int ntr; PX *o = (PX *)(uintptr_t)A(0);
+  if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
+  const PM *m = &pi->m[slot];
+  if (ntr < 400) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)(uintptr_t)o, (o && o->magic == MAGIC) ? o->host : NULL); }
   if (!o || o->magic != MAGIC) { fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %p\n", pi->name, m->name, o); return E_NOTIMPL_; }
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
 #define ALLOC(sz) ({ size_t _s = ((sz) + 15) & ~15u; if (ap + _s > sizeof ar) { fprintf(stderr, "[dxvk] %s::%s: argument too large for marshalling arena\n", pi->name, m->name); return E_NOTIMPL_; } void *_p = ar + ap; ap += _s; memset(_p, 0, _s); _p; })
