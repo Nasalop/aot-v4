@@ -27,11 +27,14 @@ typedef struct { void **vt; uint32_t magic, id; } GO;
 typedef struct PX { uint32_t gaddr; void *host; const PI *pi; Shadow sh[4]; } PX;
 #define NPX (1 << 16)
 static PX *pxs[NPX]; static uint32_t npx;
+#define GN (1 << 17)
+static PX *gt[GN];   /* guest address -> PX, kept host-side so guest writes to the object cannot break lookup */
 static PX *px_of(uint32_t g) {
-  if (!g) return NULL; const GO *go = (const GO *)(uintptr_t)g;
-  if (go->magic != MAGIC || go->id >= npx || pxs[go->id]->gaddr != g) return NULL;
-  return pxs[go->id];
+  if (!g) return NULL;
+  for (unsigned i = (g >> 4) * 2654435761u >> 15 & (GN - 1), n = 0; n < GN && gt[i]; n++, i = (i + 1) & (GN - 1)) if (gt[i]->gaddr == g) return gt[i];
+  return NULL;
 }
+static void gt_add(PX *x) { unsigned i = (x->gaddr >> 4) * 2654435761u >> 15 & (GN - 1); while (gt[i]) i = (i + 1) & (GN - 1); gt[i] = x; }
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static void **vts[64];
 static void **px_vt(int ti) {
@@ -61,7 +64,7 @@ static GO *wrap(void *h, int ti) {
   }
   GO *p = aot_gcalloc(1, sizeof *p); PX *x = calloc(1, sizeof *x);
   if (!p || !x || npx >= NPX) { pthread_mutex_unlock(&mu); fprintf(stderr, "[dxvk] out of memory while wrapping a host object\n"); return NULL; }
-  x->gaddr = (uint32_t)(uintptr_t)p; x->host = h; x->pi = &PIS[ti]; p->vt = vt; p->magic = MAGIC; p->id = npx; pxs[npx++] = x;
+  x->gaddr = (uint32_t)(uintptr_t)p; x->host = h; x->pi = &PIS[ti]; p->vt = vt; p->magic = MAGIC; p->id = npx; pxs[npx++] = x; gt_add(x);
   if (tomb == TN) { pthread_mutex_unlock(&mu); fprintf(stderr, "[dxvk] proxy table full\n"); return NULL; }
   tab[tomb].h = h; tab[tomb].ti = ti; tab[tomb].px = p; pthread_mutex_unlock(&mu); return p;
 }
@@ -97,7 +100,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
   const PM *m = &pi->m[slot];
   if (ntr < 400) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
-  if (!o) { fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x\n", pi->name, m->name, (unsigned)A(0)); return E_NOTIMPL_; }
+  if (!o) { const uint32_t *w = (const uint32_t *)(uintptr_t)A(0); fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x [%#x %#x %#x %#x]\n", pi->name, m->name, (unsigned)A(0), w?w[0]:0, w?w[1]:0, w?w[2]:0, w?w[3]:0); return E_NOTIMPL_; }
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
 #define ALLOC(sz) ({ size_t _s = ((sz) + 15) & ~15u; if (ap + _s > sizeof ar) { fprintf(stderr, "[dxvk] %s::%s: argument too large for marshalling arena\n", pi->name, m->name); return E_NOTIMPL_; } void *_p = ar + ap; ap += _s; memset(_p, 0, _s); _p; })
   if (m->name[0] == 'U' && !strcmp(m->name, "Unmap")) {   /* flush a low-memory shadow back into the host mapping */
