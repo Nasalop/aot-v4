@@ -10,7 +10,7 @@ V=$PWD/libs/vkd3d; S=$V/libs/vkd3d-shader; G=$W/gen; mkdir -p "$G"
 flex -o "$G/hlsl.yy.c" $S/hlsl.l; bison -d -o "$G/hlsl.tab.c" $S/hlsl.y 2>/dev/null
 flex -o "$G/preproc.yy.c" $S/preproc.l; bison -d -o "$G/preproc.tab.c" $S/preproc.y 2>/dev/null
 T=${ANDROID_NDK_LATEST_HOME:?}/toolchains/llvm/prebuilt/linux-x86_64/bin; CC=$T/aarch64-linux-android28-clang
-CF="-O2 -w -fPIC -fvisibility=default -D_GNU_SOURCE -DLIBVKD3D_SOURCE -DLIBVKD3D_SHADER_SOURCE -DVKD3D_NO_WIN32_TYPES -DVKD3D_NO_VULKAN_H -DHAVE_ATOMIC_EXCHANGE_N=1 -DHAVE_BUILTIN_ADD_OVERFLOW=1 -DHAVE_BUILTIN_CLZ=1 -DHAVE_BUILTIN_CTZ=1 -DHAVE_SYNC_ADD_AND_FETCH=1 -DHAVE_SYNC_BOOL_COMPARE_AND_SWAP=1 -fno-strict-aliasing -I$G -I$V -I$V/include -I$V/include/private -I$S -I$H/shim -include $H/shim/compat.h"
+CF="-O2 -w -fPIC -fvisibility=default -D_GNU_SOURCE -DLIBVKD3D_SOURCE -DLIBVKD3D_SHADER_SOURCE -DVKD3D_NO_WIN32_TYPES -DVKD3D_NO_VULKAN_H -DHAVE_ATOMIC_EXCHANGE_N=1 -DHAVE_BUILTIN_ADD_OVERFLOW=1 -DHAVE_BUILTIN_CLZ=1 -DHAVE_BUILTIN_CTZ=1 -DHAVE_SYNC_ADD_AND_FETCH=1 -DHAVE_SYNC_BOOL_COMPARE_AND_SWAP=1 -DHAVE_STRTOF_L=1 -fno-strict-aliasing -I$H/shim -I$G -I$V -I$V/include -I$V/include/private -I$S -I$H/shim -include $H/shim/compat.h"
 objs=(); for f in $V/libs/vkd3d-common/{debug,error,memory,utf8}.c $S/{checksum,d3d_asm,d3dbc,dxbc,dxil,fx,glsl,hlsl,hlsl_codegen,hlsl_constant_ops,ir,msl,spirv,tpf,vkd3d_shader_main}.c $G/{hlsl.yy,hlsl.tab,preproc.yy,preproc.tab}.c; do
   o=$G/$(basename "$f" .c).o; $CC $CF -c "$f" -o "$o"; objs+=("$o"); done
 mkdir -p "$OUT"; $CC -shared -o "$OUT/libvkd3dshader.so" "${objs[@]}" -lm -ldl
