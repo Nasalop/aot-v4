@@ -249,6 +249,9 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
     if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
     aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc; { WdThread *w = wd_self(); w->pc = pc; w->n++; }
     uint64_t np = aot_region_fn[k](c, pc);
+    if (np == pc) {   /* regions overlap: the binary search may land on one that does not enter at pc, so try every region covering pc */
+      for (int m = 0; m < aot_nregions && np == pc; m++) if (m != k && pc >= aot_region_lo[m] && pc < aot_region_hi[m]) np = aot_region_fn[m](c, pc);
+    }
     if (np == pc) { fflush(stdout); fprintf(stderr, "\n[aot] address 0x%llx is inside translated code but is not a known entry point (undiscovered indirect jump target)\n", (unsigned long long)pc);
       fprintf(stderr, "[aot] regions containing pc (index lo hi):"); for (int m = 0; m < aot_nregions; m++) if (pc >= aot_region_lo[m] && pc < aot_region_hi[m]) fprintf(stderr, " #%d 0x%llx-0x%llx", m, (unsigned long long)aot_region_lo[m], (unsigned long long)aot_region_hi[m]);
       fprintf(stderr, "\n[aot] searched region #%d\n", k); dump_context(c); exit(73); }
