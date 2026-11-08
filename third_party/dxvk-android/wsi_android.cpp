@@ -6,6 +6,8 @@
 #include <android/native_window.h>
 #include <vulkan/vulkan_android.h>
 #include <cstring>
+#include <dlfcn.h>
+#include <cstdio>
 
 extern "C" { static ANativeWindow* g_aw; __attribute__((visibility("default"))) void dxvk_android_set_window(void* w){ g_aw = (ANativeWindow*)w; } }
 
@@ -39,11 +41,12 @@ namespace dxvk::wsi {
     bool isOccluded(HWND) override { return false; }
     void updateFullscreenWindow(HMONITOR, HWND, bool) override {}
     VkResult createSurface(HWND, PFN_vkGetInstanceProcAddr gipa, VkInstance inst, VkSurfaceKHR* out) override {
-      if (!g_aw) return VK_ERROR_INITIALIZATION_FAILED;
+      if (!g_aw) { auto pw = (void* (*)())dlsym(RTLD_DEFAULT, "aot_present_window"); if (pw) g_aw = (ANativeWindow*)pw(); }
+      if (!g_aw) { fprintf(stderr, "[dxvk-wsi] no ANativeWindow set in this library\n"); return VK_ERROR_INITIALIZATION_FAILED; }
       auto fn = (PFN_vkCreateAndroidSurfaceKHR)gipa(inst, "vkCreateAndroidSurfaceKHR");
       if (!fn) return VK_ERROR_EXTENSION_NOT_PRESENT;
       VkAndroidSurfaceCreateInfoKHR ci = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR }; ci.window = g_aw;
-      return fn(inst, &ci, nullptr, out);
+      VkResult r = fn(inst, &ci, nullptr, out); fprintf(stderr, "[dxvk-wsi] vkCreateAndroidSurfaceKHR(window=%p) -> %d\n", (void*)g_aw, (int)r); return r;
     }
   };
   static bool createAndroid(WsiDriver** d) { *d = new AndroidWsiDriver(); return true; }
