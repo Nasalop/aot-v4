@@ -117,9 +117,11 @@ static uint32_t ds_cursor(DSBuf *b) {
   if (raw >= b->size) { b->playing = 0; b->pos = 0; return 0; }
   return (uint32_t)raw;
 }
+static const uint8_t IID_DS3DB_[16] = { 0x86, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0x00, 0x20, 0xaf, 0x0b, 0xe5, 0x60 };   /* IDirectSound3DBuffer */
+static uint32_t ds_vt_3db;
 static uint32_t ds_qi(uint32_t self, const uint8_t *iid, uint32_t *out, int dev) {
   if (!out) return DS_E_PARAM;
-  int ok = !memcmp(iid, IID_IUnknown_, 16) || (dev == 2 ? !memcmp(iid, IID_DSL_, 16) : dev ? (!memcmp(iid, IID_DS_, 16) || !memcmp(iid, IID_DS8_, 16)) : (!memcmp(iid, IID_DSB_, 16) || !memcmp(iid, IID_DSB8_, 16)));
+  int ok = !memcmp(iid, IID_IUnknown_, 16) || (dev == 3 ? !memcmp(iid, IID_DS3DB_, 16) : dev == 2 ? !memcmp(iid, IID_DSL_, 16) : dev ? (!memcmp(iid, IID_DS_, 16) || !memcmp(iid, IID_DS8_, 16)) : (!memcmp(iid, IID_DSB_, 16) || !memcmp(iid, IID_DSB8_, 16)));
   if (!ok) { fprintf(stderr, "[aot] DirectSound QueryInterface: IID {%08x-%04x-%04x-...} not supported\n", *(uint32_t *)iid, *(uint16_t *)(iid + 4), *(uint16_t *)(iid + 6)); *out = 0; return DS_E_NOIFACE; }
   *out = self; __atomic_add_fetch(&((DSObj *)(uintptr_t)self)->ref, 1, __ATOMIC_RELAXED); return 0;
 }
@@ -148,8 +150,12 @@ DSD(DuplicateSoundBuffer) { DSBuf *s = (DSBuf *)P(1); uint32_t *out = P(2); if (
 DSD(Ok) { return 0; }
 DSD(GetSpeakerConfig) { uint32_t *o = P(1); if (!o) return DS_E_PARAM; *o = 3; return 0; }   /* DSSPEAKER_STEREO */
 DSD(Unsupported) { return DS_E_UNSUPPORTED; }
+DSD(DbQI) { return ds_qi((uint32_t)A(0), P(1), P(2), 3); }
 DSD(LisQI) { return ds_qi((uint32_t)A(0), P(1), P(2), 2); }
 DSB(QueryInterface) {
+  if (P(1) && P(2) && !memcmp(P(1), IID_DS3DB_, 16)) {   /* 3D buffer: positioning parameters are accepted but spatialization is not applied */
+    static int n3; note_once(&n3, "DirectSound: 3D buffer accepts settings but 3D positioning is not applied");
+    DSObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E; l->vt = ds_vt_3db; l->ref = 1; *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; return 0; }
   if (P(1) && P(2) && !memcmp(P(1), IID_DSL_, 16)) {   /* 3D listener: parameters are accepted but spatialization is not applied */
     static int n; note_once(&n, "DirectSound: 3D listener accepts settings but 3D positioning is not applied");
     DSObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E; l->vt = ds_vt_lis; l->ref = 1; *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; return 0; }
@@ -202,7 +208,11 @@ static void ds_init_tables(void) {
     {5,"GetDopplerFactor",dsd_Unsupported,2}, {6,"GetOrientation",dsd_Unsupported,3}, {7,"GetPosition",dsd_Unsupported,2}, {8,"GetRolloffFactor",dsd_Unsupported,2}, {9,"GetVelocity",dsd_Unsupported,2},
     {10,"SetAllParameters",dsd_Ok,3}, {11,"SetDistanceFactor",dsd_Ok,3}, {12,"SetDopplerFactor",dsd_Ok,3}, {13,"SetOrientation",dsd_Ok,8}, {14,"SetPosition",dsd_Ok,5}, {15,"SetRolloffFactor",dsd_Ok,3},
     {16,"SetVelocity",dsd_Ok,5}, {17,"CommitDeferredSettings",dsd_Ok,1}, {0,0,0,0} };
-  if (!ds_vt_dev) { ds_vt_lis = ds_build("IDirectSound3DListener", 18, lis); ds_vt_dev = ds_build("IDirectSound8", 12, dev); ds_vt_buf = ds_build("IDirectSoundBuffer8", 24, buf); }
+  static const DSSlot db3[] = { {0,"QueryInterface",dsd_DbQI,3}, {1,"AddRef",dsd_AddRef,1}, {2,"Release",dsd_Release,1}, {3,"GetAllParameters",dsd_Unsupported,2}, {4,"GetConeAngles",dsd_Unsupported,3},
+    {5,"GetConeOrientation",dsd_Unsupported,2}, {6,"GetConeOutsideVolume",dsd_Unsupported,2}, {7,"GetMaxDistance",dsd_Unsupported,2}, {8,"GetMinDistance",dsd_Unsupported,2}, {9,"GetMode",dsd_Unsupported,2},
+    {10,"GetPosition",dsd_Unsupported,2}, {11,"GetVelocity",dsd_Unsupported,2}, {12,"SetAllParameters",dsd_Ok,3}, {13,"SetConeAngles",dsd_Ok,4}, {14,"SetConeOrientation",dsd_Ok,5}, {15,"SetConeOutsideVolume",dsd_Ok,3},
+    {16,"SetMaxDistance",dsd_Ok,3}, {17,"SetMinDistance",dsd_Ok,3}, {18,"SetMode",dsd_Ok,3}, {19,"SetPosition",dsd_Ok,5}, {20,"SetVelocity",dsd_Ok,5}, {0,0,0,0} };
+  if (!ds_vt_dev) { ds_vt_3db = ds_build("IDirectSound3DBuffer", 21, db3); ds_vt_lis = ds_build("IDirectSound3DListener", 18, lis); ds_vt_dev = ds_build("IDirectSound8", 12, dev); ds_vt_buf = ds_build("IDirectSoundBuffer8", 24, buf); }
 }
 S(dsound_enum) {   /* DirectSoundEnumerateA(callback, ctx): one default device, as on a normal system */
   static char *desc, *mod; if (!desc) { desc = aot_gmalloc(64); mod = aot_gmalloc(16); strcpy(desc, "Primary Sound Driver"); strcpy(mod, ""); }
