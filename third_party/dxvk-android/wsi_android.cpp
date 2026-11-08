@@ -9,12 +9,15 @@
 #include <dlfcn.h>
 #include <cstdio>
 
-extern "C" { static ANativeWindow* g_aw; __attribute__((visibility("default"))) void dxvk_android_set_window(void* w){ g_aw = (ANativeWindow*)w; } }
+#include <cstdlib>
+static ANativeWindow* g_aw;
+static ANativeWindow* aw() { if (!g_aw) { const char* e = getenv("AOT_ANDROID_WINDOW"); if (e) g_aw = (ANativeWindow*)strtoull(e, nullptr, 16); } return g_aw; }
+extern "C" { __attribute__((visibility("default"))) void dxvk_android_set_window(void* w){ g_aw = (ANativeWindow*)w; } }
 
 namespace dxvk::wsi {
   class AndroidWsiDriver : public WsiDriver {
-    static uint32_t W() { return g_aw ? (uint32_t)ANativeWindow_getWidth(g_aw)  : 1920; }
-    static uint32_t H() { return g_aw ? (uint32_t)ANativeWindow_getHeight(g_aw) : 1080; }
+    static uint32_t W() { return aw() ? (uint32_t)ANativeWindow_getWidth(aw())  : 1920; }
+    static uint32_t H() { return aw() ? (uint32_t)ANativeWindow_getHeight(aw()) : 1080; }
     static HMONITOR mon() { return (HMONITOR)(uintptr_t)1; }
   public:
     std::vector<const char*> getInstanceExtensions() override { return { "VK_KHR_surface", "VK_KHR_android_surface" }; }
@@ -36,17 +39,16 @@ namespace dxvk::wsi {
     bool leaveFullscreenMode(HWND, DxvkWindowState*) override { return true; }
     bool restoreDisplayMode() override { return true; }
     HMONITOR getWindowMonitor(HWND) override { return mon(); }
-    bool isWindow(HWND) override { return g_aw != nullptr; }
+    bool isWindow(HWND) override { return aw() != nullptr; }
     bool isMinimized(HWND) override { return false; }
     bool isOccluded(HWND) override { return false; }
     void updateFullscreenWindow(HMONITOR, HWND, bool) override {}
     VkResult createSurface(HWND, PFN_vkGetInstanceProcAddr gipa, VkInstance inst, VkSurfaceKHR* out) override {
-      if (!g_aw) { auto pw = (void* (*)())dlsym(RTLD_DEFAULT, "aot_present_window"); if (pw) g_aw = (ANativeWindow*)pw(); }
-      if (!g_aw) { fprintf(stderr, "[dxvk-wsi] no ANativeWindow set in this library\n"); return VK_ERROR_INITIALIZATION_FAILED; }
+      if (!aw()) { fprintf(stderr, "[dxvk-wsi] no ANativeWindow set in this library\n"); return VK_ERROR_INITIALIZATION_FAILED; }
       auto fn = (PFN_vkCreateAndroidSurfaceKHR)gipa(inst, "vkCreateAndroidSurfaceKHR");
       if (!fn) return VK_ERROR_EXTENSION_NOT_PRESENT;
-      VkAndroidSurfaceCreateInfoKHR ci = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR }; ci.window = g_aw;
-      VkResult r = fn(inst, &ci, nullptr, out); fprintf(stderr, "[dxvk-wsi] vkCreateAndroidSurfaceKHR(window=%p) -> %d\n", (void*)g_aw, (int)r); return r;
+      VkAndroidSurfaceCreateInfoKHR ci = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR }; ci.window = aw();
+      VkResult r = fn(inst, &ci, nullptr, out); fprintf(stderr, "[dxvk-wsi] vkCreateAndroidSurfaceKHR(window=%p) -> %d\n", (void*)aw(), (int)r); return r;
     }
   };
   static bool createAndroid(WsiDriver** d) { *d = new AndroidWsiDriver(); return true; }
