@@ -180,6 +180,19 @@ static int init_dxvk(void) {
   for (int i = 0; i < 3; i++) { void (*sw)(void *) = dlsym(hd[i], "dxvk_android_set_window"); if (sw) sw(w); }
   inited = 1; return 0;
 }
+static void *g_fac;
+static void *fac_get(void) {
+  if (g_fac || init_dxvk() != 0) return g_fac;
+  uint32_t (*cf)(const void *, void **) = (uint32_t (*)(const void *, void **))sym("CreateDXGIFactory1"); int tf = ti_by_name("IDXGIFactory1");
+  if (!cf || tf < 0) return NULL;
+  uint32_t hr = cf(PIS[tf].guid, &g_fac); if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] CreateDXGIFactory1 failed %#x\n", hr); g_fac = NULL; }
+  return g_fac;
+}
+/* the game's own CreateDXGIFactory must return a DXVK factory, otherwise its swapchain is the old emulated one */
+uint64_t aot_dxvk_factory(uint64_t out) {
+  void *f = fac_get(); if (!f) return (uint64_t)-1;
+  G32(out, wrap(f, ti_by_name("IDXGIFactory1"))); return 0;
+}
 uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_desc) {
   if (init_dxvk() != 0) return (uint64_t)-1;
   typedef uint32_t (*CF)(const void *, void **); typedef uint32_t (*CD)(void *, void *, uint32_t, uint32_t, void **);
@@ -187,7 +200,7 @@ uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_de
   if (!cf || !cd) { fprintf(stderr, "[dxvk] missing entry points\n"); return (uint64_t)-1; }
   int tf = ti_by_name("IDXGIFactory1"), tdev = ti_by_name("ID3D10Device"), tsc = ti_by_name("IDXGISwapChain");
   void *fac = NULL, *ad = NULL, *dev = NULL, *sc = NULL; uint32_t hr;
-  hr = cf(PIS[tf].guid, &fac); if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] CreateDXGIFactory1 failed %#x\n", hr); return hr; }
+  fac = fac_get(); if (!fac) return (uint64_t)-1; hr = 0;
   { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
   if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] EnumAdapters failed %#x\n", hr); return hr; }
   hr = cd(fac, ad, 0, 0xA000, &dev); if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] D3D10CoreCreateDevice failed %#x\n", hr); return hr; }
