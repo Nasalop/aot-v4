@@ -28,6 +28,7 @@ static void **px_vt(int ti) {
   pthread_mutex_lock(&mu);
   if (!vts[ti]) {
     const PI *pi = &PIS[ti]; uint32_t *v = aot_gcalloc(pi->nm + 64, 4); char nm[96];
+    if (!v) { fprintf(stderr, "[dxvk] out of 32-bit guest memory building %s vtable\n", pi->name); pthread_mutex_unlock(&mu); return NULL; }
     for (int i = 0; i < pi->nm + 64; i++) {
       if (i < pi->nm) { snprintf(nm, sizeof nm, "%s::%s", pi->name, pi->m[i].name); uint64_t t = aot_register_thunk(pi->wf[i], nm); aot_thunk_set_pop(t, 4 * (pi->m[i].n + 1)); v[i] = (uint32_t)t; }
       else { snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", pi->name, i); v[i] = (uint32_t)aot_register_thunk(NULL, nm); }
@@ -41,14 +42,15 @@ static struct { void *h; int ti; PX *px; } tab[TN];
 static PX *wrap(void *h, int ti) {
   if (!h) return NULL;
   if (ti < 0 || ti >= NPI) { fprintf(stderr, "[dxvk] cannot wrap host object %p: interface not in proxy table\n", h); return NULL; }
-  void **vt = px_vt(ti); pthread_mutex_lock(&mu);
+  void **vt = px_vt(ti); if (!vt) return NULL; pthread_mutex_lock(&mu);
   unsigned i = (unsigned)((((uintptr_t)h >> 4) ^ (unsigned)ti * 0x9E37u)) & (TN - 1), tomb = TN;
   for (unsigned n = 0; n < TN; n++, i = (i + 1) & (TN - 1)) {
     if (tab[i].h == h && tab[i].ti == ti) { PX *p = tab[i].px; pthread_mutex_unlock(&mu); return p; }
     if (!tab[i].h) { if (tomb == TN) tomb = i; break; }
     if (tab[i].h == (void *)1 && tomb == TN) tomb = i;
   }
-  PX *p = aot_gcalloc(1, sizeof *p); p->vt = vt; p->host = h; p->pi = &PIS[ti]; p->magic = MAGIC;
+  PX *p = aot_gcalloc(1, sizeof *p); if (!p) { pthread_mutex_unlock(&mu); fprintf(stderr, "[dxvk] out of 32-bit guest memory while wrapping a host object\n"); return NULL; }
+  p->vt = vt; p->host = h; p->pi = &PIS[ti]; p->magic = MAGIC;
   if (tomb == TN) { pthread_mutex_unlock(&mu); fprintf(stderr, "[dxvk] proxy table full\n"); return NULL; }
   tab[tomb].h = h; tab[tomb].ti = ti; tab[tomb].px = p; pthread_mutex_unlock(&mu); return p;
 }
