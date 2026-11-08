@@ -1175,7 +1175,8 @@ F(sh_D3D11CreateDeviceAndSwapChain) {   /* (adapter,type,sw,flags,pFL,nFL,sdk,pS
   if (A(8) && A(7)) STP(A(8), make_swapchain(d, (const uint8_t *)A(7)));
   if (A(9)) STP(A(9), d); if (A(10)) ST(uint32_t, A(10), 0xB000); if (A(11)) { STP(A(11), x); x->refs++; } return S_OK;
 }
-F(sh_CreateDXGIFactory) { init_vts(); Obj *f = get_factory(); bind(f); STP(A(1), f); return S_OK; }
+uint64_t aot_dxvk_factory(uint64_t);
+F(sh_CreateDXGIFactory) { if (aot_dxvk_factory(A(1)) == 0) return S_OK; init_vts(); Obj *f = get_factory(); bind(f); STP(A(1), f); return S_OK; }
 
 /* ---- user32 / winmm: just enough for a game to open a "window" and run a message loop ---- */
 #define HWND_FAKE 0x10001
