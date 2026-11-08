@@ -150,7 +150,7 @@ static void io_fail_note(const char *name, uint32_t eax) {
   static const char *const bools[] = { "ReadFile", "GetOverlappedResult", "LockFileEx", "UnlockFileEx", "GetFileSizeEx", "SetFilePointerEx", "WriteFile", "SetEndOfFile", NULL };
   static const char *const dwords[] = { "SetFilePointer", "GetFileSize", NULL }; static int cnt[16];
   const char *dot = strchr(name, '!'); const char *n = dot ? dot + 1 : name; int k = 0, hit = 0;
-  for (; bools[k]; k++) if (!strcmp(n, bools[k])) { hit = (eax == 0); goto done; }
+  for (; bools[k]; k++) if (!strcmp(n, bools[k])) { hit = (eax == 0) && !(aot_last_error == 997 && (!strcmp(n, "ReadFile") || !strcmp(n, "WriteFile") || !strcmp(n, "GetOverlappedResult"))); goto done; }   /* ERROR_IO_PENDING (997) is the normal answer of an overlapped read */
   for (int j = 0; dwords[j]; j++, k++) if (!strcmp(n, dwords[j])) { hit = (eax == 0xffffffffu); k += 0; goto done; }
   return;
 done:
