@@ -166,10 +166,19 @@ static uint64_t hcall(const PI *pi, void *o, int slot, const uint64_t *iv, int n
     return 0x80004005u;
   }
 
-  GF f = (GF)hvt[slot];
+  /* The guest-side bridge keeps the observed AC1 vtable numbering.
+     ID3D11Texture2D's real COM vtable has GetDesc at slot 10, while the
+     guest import observed in this binary is labelled vtbl[12]. Translate
+     only that known boundary mismatch; all other interfaces use their
+     normal COM slot. */
+  int host_slot = slot;
+  if (pi && !strcmp(pi->name, "ID3D11Texture2D") && slot == 12)
+    host_slot = 10;
+
+  GF f = (GF)hvt[host_slot];
   if (!f) {
-    fprintf(stderr, "[dxvk] FATAL: host interface %p (%s) vtable slot %d is NULL!\n",
-            iface, pi ? pi->name : "<unknown>", slot);
+    fprintf(stderr, "[dxvk] FATAL: host interface %p (%s) vtable slot %d (host slot %d) is NULL!\n",
+            iface, pi ? pi->name : "<unknown>", slot, host_slot);
     if (release_qi_ref && hvt[2]) ((COM_REF)hvt[2])(iface);
     return E_NOTIMPL_;
   }
