@@ -320,6 +320,28 @@ jobs:
       - name: Build DXVK for Android (cache miss only)
         if: steps.dxvkc.outputs.cache-hit != 'true'
         run: bash third_party/dxvk-android/build.sh android/app/src/main/jniLibs/arm64-v8a
+      - name: Restore vkd3d-shader (HLSL compiler)
+        id: vkdc
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/jniLibs-vkd3d
+          key: vkd3d-shader-${{ hashFiles('third_party/vkd3d/**') }}
+      - name: Build vkd3d-shader for Android (cache miss only)
+        if: steps.vkdc.outputs.cache-hit != 'true'
+        run: bash third_party/vkd3d/build.sh android/app/src/main/jniLibs-vkd3d
+      - name: Stage vkd3d-shader into jniLibs
+        run: mkdir -p android/app/src/main/jniLibs/arm64-v8a && cp android/app/src/main/jniLibs-vkd3d/libvkd3dshader.so android/app/src/main/jniLibs/arm64-v8a/
+      - name: Restore vkd3d-shader (HLSL compiler)
+        id: vkdc
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/jniLibs-vkd3d
+          key: vkd3d-shader-${{ hashFiles('third_party/vkd3d/**') }}
+      - name: Build vkd3d-shader for Android (cache miss only)
+        if: steps.vkdc.outputs.cache-hit != 'true'
+        run: bash third_party/vkd3d/build.sh android/app/src/main/jniLibs-vkd3d
+      - name: Stage vkd3d-shader into jniLibs
+        run: mkdir -p android/app/src/main/jniLibs/arm64-v8a && cp android/app/src/main/jniLibs-vkd3d/libvkd3dshader.so android/app/src/main/jniLibs/arm64-v8a/
       - name: Configure CMake with ccache
         run: |
           echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
