@@ -134,7 +134,9 @@ static RObj *mk_var(Refl *r, int cb, int i) {
 static const uint8_t *cb_rec(Refl *r, int cb) { return rp(r, U32(rp(r, 0) + 4) + 24 * cb); }
 static uint64_t cb_getdesc(CPU *c) {
   RObj *o = (RObj *)(uintptr_t)A(0); Refl *r = o->r; const uint8_t *b = cb_rec(r, o->a); uint8_t *d = (uint8_t *)(uintptr_t)A(1);
-  put_ptr((uint64_t)(uintptr_t)d, (uint64_t)(uintptr_t)rs(r, U32(b))); ST(uint32_t, d + 4, U32(b + 20)); ST(uint32_t, d + 8, U32(b + 4)); ST(uint32_t, d + 12, U32(b + 12)); ST(uint32_t, d + 16, U32(b + 16)); return 0;
+  put_ptr((uint64_t)(uintptr_t)d, (uint64_t)(uintptr_t)rs(r, U32(b))); ST(uint32_t, d + 4, U32(b + 20)); ST(uint32_t, d + 8, U32(b + 4)); uint32_t sz = U32(b + 12);
+  if (!sz) { const uint8_t *v = rp(r, U32(b + 8)); for (uint32_t i = 0; i < U32(b + 4); i++, v += rdef_varsz(r)) { uint32_t e = U32(v + 4) + U32(v + 8); if (e > sz) sz = e; } sz = (sz + 15) & ~15u; }
+  ST(uint32_t, d + 12, sz); ST(uint32_t, d + 16, U32(b + 16)); if (!sz) fprintf(stderr, "[aot] reflection: constant buffer '%s' has size 0 (vars=%u)\n", rs(r, U32(b)), U32(b + 4)); return 0;
 }
 static uint64_t cb_varidx(CPU *c) { RObj *o = (RObj *)(uintptr_t)A(0); uint32_t i = (uint32_t)A(1); if (i >= U32(cb_rec(o->r, o->a) + 4)) return 0; return (uint64_t)(uintptr_t)mk_var(o->r, o->a, i); }
 static uint64_t cb_varname(CPU *c) {
