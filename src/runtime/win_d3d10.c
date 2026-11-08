@@ -99,10 +99,9 @@ static uint64_t t_getdesc(CPU *c) {
 static RObj *mk_type(Refl *r, uint32_t off, uint32_t memoff) {
   for (int i = 0; i < r->nty; i++) if (r->tyoff[i] == off && r->ty[i]->b == memoff) return r->ty[i];
   if (r->nty >= 256) return NULL;
-  static const shim_fn f[10] = { r_qi, r_addref, r_release_sub, t_getdesc, NULL, NULL, NULL }; (void)f;
-  extern uint64_t t_member_idx(CPU *), t_member_name(CPU *), t_member_tname(CPU *);
-  static const shim_fn fn[7] = { r_qi, r_addref, r_release_sub, t_getdesc, t_member_idx, t_member_name, t_member_tname }; static const int ac[7] = { 3, 1, 1, 2, 2, 2, 2 };
-  RObj *o = aot_gcalloc(1, sizeof *o); if (!o) return NULL; o->vt = robj_vt("ID3D10ShaderReflectionType", 7, fn, ac, &g_vt_type); o->refs = 1; o->r = r; o->a = off; o->b = memoff;
+    extern uint64_t t_member_idx(CPU *), t_member_name(CPU *), t_member_tname(CPU *);
+  static const shim_fn fn[4] = { t_getdesc, t_member_idx, t_member_name, t_member_tname }; static const int ac[4] = { 2, 2, 2, 2 };
+  RObj *o = aot_gcalloc(1, sizeof *o); if (!o) return NULL; o->vt = robj_vt("ID3D10ShaderReflectionType", 4, fn, ac, &g_vt_type); o->refs = 1; o->r = r; o->a = off; o->b = memoff;
   r->tyoff[r->nty] = off; r->ty[r->nty++] = o; return o;
 }
 uint64_t t_member_idx(CPU *c) {
@@ -128,8 +127,8 @@ static uint64_t v_gettype(CPU *c) { RObj *o = (RObj *)(uintptr_t)A(0); return (u
 /* --- constant buffers --- */
 static RObj *mk_var(Refl *r, int cb, int i) {
   if (cb >= 64 || i >= 128) return NULL; if (r->var[cb][i]) return r->var[cb][i];
-  const uint8_t *b = rp(r, U32(rp(r, 0) + 4) + 24 * cb); static const shim_fn f[5] = { r_qi, r_addref, r_release_sub, v_getdesc, v_gettype }; static const int ac[5] = { 3, 1, 1, 2, 1 };
-  RObj *o = aot_gcalloc(1, sizeof *o); if (!o) return NULL; o->vt = robj_vt("ID3D10ShaderReflectionVariable", 5, f, ac, &g_vt_var); o->refs = 1; o->r = r;
+  const uint8_t *b = rp(r, U32(rp(r, 0) + 4) + 24 * cb); static const shim_fn f[2] = { v_getdesc, v_gettype }; static const int ac[2] = { 2, 1 };
+  RObj *o = aot_gcalloc(1, sizeof *o); if (!o) return NULL; o->vt = robj_vt("ID3D10ShaderReflectionVariable", 2, f, ac, &g_vt_var); o->refs = 1; o->r = r;
   o->a = U32(b + 8) + (uint32_t)(rdef_varsz(r) * i); return r->var[cb][i] = o;
 }
 static const uint8_t *cb_rec(Refl *r, int cb) { return rp(r, U32(rp(r, 0) + 4) + 24 * cb); }
@@ -145,8 +144,8 @@ static uint64_t cb_varname(CPU *c) {
 }
 static RObj *mk_cb(Refl *r, int i) {
   if (i < 0 || i >= 64 || (uint32_t)i >= U32(rp(r, 0))) return NULL; if (r->cb[i]) return r->cb[i];
-  static const shim_fn f[6] = { r_qi, r_addref, r_release_sub, cb_getdesc, cb_varidx, cb_varname }; static const int ac[6] = { 3, 1, 1, 2, 2, 2 };
-  RObj *o = aot_gcalloc(1, sizeof *o); if (!o) return NULL; o->vt = robj_vt("ID3D10ShaderReflectionConstantBuffer", 6, f, ac, &g_vt_cb); o->refs = 1; o->r = r; o->a = i; return r->cb[i] = o;
+  static const shim_fn f[3] = { cb_getdesc, cb_varidx, cb_varname }; static const int ac[3] = { 2, 2, 2 };
+  RObj *o = aot_gcalloc(1, sizeof *o); if (!o) return NULL; o->vt = robj_vt("ID3D10ShaderReflectionConstantBuffer", 3, f, ac, &g_vt_cb); o->refs = 1; o->r = r; o->a = i; return r->cb[i] = o;
 }
 /* --- signature --- */
 static const uint8_t *sig_rec(const uint8_t *s, uint32_t i, int *esz) { *esz = (s && U32(s + 4) == 8) ? 24 : 24; return s + 8 + (size_t)*esz * i; }
