@@ -17,6 +17,7 @@ typedef struct { const char *name; uint8_t n; char k[17]; uint8_t ci[16], ty[16]
 typedef struct { const char *name; int nm; const PM *m; const fn_t *wf; const uint8_t *guid; } PI;
 static uint64_t px_call(CPU *c, const PI *pi, int slot);
 #include "d3d10_proxy_gen.inc"
+
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
 #define E_NOTIMPL_ 0x80004001u
 #define E_NOINTF_ 0x80004002u
@@ -39,6 +40,7 @@ static void **px_vt(int ti) {
   if (!vts[ti]) {
     const PI *pi = &PIS[ti]; uint32_t *v = aot_gcalloc(pi->nm + 64, 4); char nm[96];
     if (!v) { fprintf(stderr, "[dxvk] out of 32-bit guest memory building %s vtable\n", pi->name); pthread_mutex_unlock(&mu); return NULL; }
+    
     for (int i = 0; i < pi->nm + 64; i++) {
       if (i < pi->nm) { 
         snprintf(nm, sizeof nm, "%s::%s", pi->name, pi->m[i].name); 
@@ -48,12 +50,21 @@ static void **px_vt(int ti) {
       }
       else { 
         snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", pi->name, i); 
-        // FIX 1 applied here: use the dummy function
         uint64_t t = aot_register_thunk(d3d10_unimplemented, nm); 
-        aot_thunk_set_pop(t, 16); // stdcall cleanup
+        aot_thunk_set_pop(t, 16); 
         v[i] = (uint32_t)t; 
       }
     }
+
+    // FIX 2: The Engine Wrapper Layout fix.
+    // AC1 does: mov edx, [ecx] -> mov edx, [edx+4] -> call edx
+    // It expects vtable[0] to point to a struct where offset 4 is AddRef.
+    uint32_t *wrapper = aot_gcalloc(4, 4);
+    wrapper[0] = v[0]; // QueryInterface
+    wrapper[1] = v[1]; // AddRef
+    wrapper[2] = v[2]; // Release
+    v[0] = (uint32_t)wrapper; // Point vtable[0] to the wrapper
+
     vts[ti] = (void **)v;
   }
   pthread_mutex_unlock(&mu); return vts[ti];
@@ -104,7 +115,7 @@ static uint64_t hcall(void *o, int slot, const uint64_t *iv, int ni, const float
   if (!hvt) { fprintf(stderr, "[dxvk] host object %#llx has no vtable (slot %d)\n", (unsigned long long)iv[0], slot); return 0x80004005u; }
   GF f = (GF)hvt[slot];
   
-  // FIX 2: Protect against NULL function pointers in the host vtable
+  // FIX 3: Protect against NULL function pointers in the host vtable
   if (!f) {
       fprintf(stderr, "[dxvk] FATAL: host vtable slot %d is NULL!\n", slot);
       return E_NOTIMPL_;
@@ -187,7 +198,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   }
   (void)ok;
   
-  // FIX 3: Free the guest wrapper when the host refcount hits zero
+  // FIX 4: Free the guest wrapper when the host refcount hits zero
   if (m->name[0] == 'R' && !strcmp(m->name, "Release") && (uint32_t)r == 0) { 
       unwrap_dead(o); 
       aot_gfree(o); 
