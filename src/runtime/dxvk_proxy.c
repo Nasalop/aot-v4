@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
 typedef uint64_t (*fn_t)(CPU *);
 #define ARGN(c, n) ((n) == 0 ? (c)->r[1] : (n) == 1 ? (c)->r[2] : (n) == 2 ? (c)->r[8] : (n) == 3 ? (c)->r[9] : LD(uint64_t, (c)->r[4] + 8 + 8 * (n)))
 #define A(n) ((uint32_t)ARGN(c, (n)))
@@ -20,25 +21,47 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot);
 #define E_NOTIMPL_ 0x80004001u
 #define E_NOINTF_ 0x80004002u
 #define MAGIC 0x50583130u
+
 typedef struct { void *g, *h; size_t sz; uint32_t sub, type; } Shadow;
 typedef struct PX { void **vt; void *host; const PI *pi; uint32_t magic; Shadow sh[4]; } PX;
+
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static void **vts[64];
+
+// FIX 1: Dummy function for unimplemented slots so we never jump to 0x0
+static uint64_t d3d10_unimplemented(CPU *c) {
+  (void)c;
+  return E_NOTIMPL_;
+}
+
 static void **px_vt(int ti) {
   pthread_mutex_lock(&mu);
   if (!vts[ti]) {
     const PI *pi = &PIS[ti]; uint32_t *v = aot_gcalloc(pi->nm + 64, 4); char nm[96];
     if (!v) { fprintf(stderr, "[dxvk] out of 32-bit guest memory building %s vtable\n", pi->name); pthread_mutex_unlock(&mu); return NULL; }
     for (int i = 0; i < pi->nm + 64; i++) {
-      if (i < pi->nm) { snprintf(nm, sizeof nm, "%s::%s", pi->name, pi->m[i].name); uint64_t t = aot_register_thunk(pi->wf[i], nm); aot_thunk_set_pop(t, 4 * (pi->m[i].n + 1)); v[i] = (uint32_t)t; }
-      else { snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", pi->name, i); v[i] = (uint32_t)aot_register_thunk(NULL, nm); }
+      if (i < pi->nm) { 
+        snprintf(nm, sizeof nm, "%s::%s", pi->name, pi->m[i].name); 
+        uint64_t t = aot_register_thunk(pi->wf[i], nm); 
+        aot_thunk_set_pop(t, 4 * (pi->m[i].n + 1)); 
+        v[i] = (uint32_t)t; 
+      }
+      else { 
+        snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", pi->name, i); 
+        // FIX 1 applied here: use the dummy function
+        uint64_t t = aot_register_thunk(d3d10_unimplemented, nm); 
+        aot_thunk_set_pop(t, 16); // stdcall cleanup
+        v[i] = (uint32_t)t; 
+      }
     }
     vts[ti] = (void **)v;
   }
   pthread_mutex_unlock(&mu); return vts[ti];
 }
+
 #define TN (1 << 15)
 static struct { void *h; int ti; PX *px; } tab[TN];
+
 static PX *wrap(void *h, int ti) {
   if (!h) return NULL;
   if (ti < 0 || ti >= NPI) { fprintf(stderr, "[dxvk] cannot wrap host object %p: interface not in proxy table\n", h); return NULL; }
@@ -54,33 +77,48 @@ static PX *wrap(void *h, int ti) {
   if (tomb == TN) { pthread_mutex_unlock(&mu); fprintf(stderr, "[dxvk] proxy table full\n"); return NULL; }
   tab[tomb].h = h; tab[tomb].ti = ti; tab[tomb].px = p; pthread_mutex_unlock(&mu); return p;
 }
+
 static void unwrap_dead(PX *p) {
   pthread_mutex_lock(&mu);
   unsigned i = (unsigned)((((uintptr_t)p->host >> 4) ^ (unsigned)(p->pi - PIS) * 0x9E37u)) & (TN - 1);
   for (unsigned n = 0; n < TN && tab[i].h; n++, i = (i + 1) & (TN - 1)) if (tab[i].px == p) { tab[i].h = (void *)1; break; }
   pthread_mutex_unlock(&mu);
 }
+
 static int ti_by_guid(const uint8_t *g) { for (int i = 0; i < NPI; i++) if (!memcmp(PIS[i].guid, g, 16)) return i; return -1; }
 static int ti_by_name(const char *n) { for (int i = 0; i < NPI; i++) if (!strcmp(PIS[i].name, n)) return i; return -1; }
 static int slot_by_name(const PI *pi, const char *n) { for (int i = 0; i < pi->nm; i++) if (!strcmp(pi->m[i].name, n)) return i; return -1; }
+
 static void *hostof(uint32_t g) {
   if (!g) return NULL; PX *p = (PX *)(uintptr_t)g;
   if (p->magic != MAGIC) { fprintf(stderr, "[dxvk] guest passed %#x that is not a DXVK proxy object\n", g); return NULL; }
   return p->host;
 }
+
 typedef uint64_t (*GF)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, float, float, float, float,
                        uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
 static uint64_t hcall(void *o, int slot, const uint64_t *iv, int ni, const float *fv) {   /* iv[0] is the object */
   uint64_t a[32] = { 0 }; memcpy(a, iv, ni * 8); (void)o;
   void **hvt = *(void ***)iv[0];
   if (!hvt) { fprintf(stderr, "[dxvk] host object %#llx has no vtable (slot %d)\n", (unsigned long long)iv[0], slot); return 0x80004005u; }
   GF f = (GF)hvt[slot];
+  
+  // FIX 2: Protect against NULL function pointers in the host vtable
+  if (!f) {
+      fprintf(stderr, "[dxvk] FATAL: host vtable slot %d is NULL!\n", slot);
+      return E_NOTIMPL_;
+  }
+  
   return f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], fv[0], fv[1], fv[2], fv[3], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23]);
 }
+
 static void conv_scd_in(const uint8_t *g, uint8_t *h) { memset(h, 0, 72); memcpy(h, g, 44); uint64_t w = LD(uint32_t, g + 44); memcpy(h + 48, &w, 8); memcpy(h + 56, g + 48, 4); memcpy(h + 60, g + 52, 4); memcpy(h + 64, g + 56, 4); }
 static void conv_wstr(uint8_t *g, const uint8_t *h, int n) { for (int i = 0; i < n; i++) ST(uint16_t, g + 2 * i, LD(uint32_t, h + 4 * i)); }
 static uint32_t sat(uint64_t v) { return v > 0x7fffffffu ? 0x7fffffffu : (uint32_t)v; }
+
 typedef struct { uint8_t kind; uint8_t ti; uint32_t g; void *tmp; uint32_t n, sub, type; } Post;
+
 static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   static int ntr; PX *o = (PX *)(uintptr_t)A(0);
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
@@ -148,9 +186,16 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     }
   }
   (void)ok;
-  if (m->name[0] == 'R' && !strcmp(m->name, "Release") && (uint32_t)r == 0) unwrap_dead(o);
+  
+  // FIX 3: Free the guest wrapper when the host refcount hits zero
+  if (m->name[0] == 'R' && !strcmp(m->name, "Release") && (uint32_t)r == 0) { 
+      unwrap_dead(o); 
+      aot_gfree(o); 
+  }
+  
   return m->ret ? (uint32_t)r : 0;
 }
+
 /* ---- creation: D3D10CreateDeviceAndSwapChain -> real DXVK ---- */
 static void *hd[3]; static int inited;
 extern void *aot_present_window(void);
@@ -165,6 +210,7 @@ static int init_dxvk(void) {
   for (int i = 0; i < 3; i++) { void (*sw)(void *) = dlsym(hd[i], "dxvk_android_set_window"); if (sw) sw(w); }
   inited = 1; return 0;
 }
+
 uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_desc) {
   if (init_dxvk() != 0) return (uint64_t)-1;
   typedef uint32_t (*CF)(const void *, void **); typedef uint32_t (*CD)(void *, void *, uint32_t, uint32_t, void **);
