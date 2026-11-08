@@ -310,10 +310,25 @@ SYS(RtlCaptureContext) {
   else { memset((void *)(uintptr_t)ctx, 0, 1232); ST(uint64_t, ctx + 0x98, c->r[4]); ST(uint64_t, ctx + 0xf8, aot_last_pc); }
   return 0;
 }
+#if defined(__aarch64__) && defined(__ANDROID__)
+#include <dlfcn.h>
+#include <ucontext.h>
+#include <sys/prctl.h>
+static void crash_host_frames(void *uc) {   /* host-side pc/lr/frame-pointer chain: tells a DXVK/driver crash from a guest-code crash */
+  mcontext_t *m = &((ucontext_t *)uc)->uc_mcontext; char b[300], tn[20] = { 0 }; prctl(PR_GET_NAME, (unsigned long)tn, 0, 0, 0);
+  uint64_t fr[2 + 12]; int nf = 0; fr[nf++] = m->pc; fr[nf++] = m->regs[30]; uint64_t fp = m->regs[29];
+  for (int i = 0; i < 12 && fp && !(fp & 7); i++) { uint64_t *p = (uint64_t *)fp; uint64_t nfp = p[0], lr = p[1]; fr[nf++] = lr; if (nfp <= fp) break; fp = nfp; }
+  int n = snprintf(b, sizeof b, "[aot] crashing thread \"%s\"; host frames (pc, lr, fp-chain):\n", tn); if (write(2, b, n) < 0) {}
+  for (int i = 0; i < nf; i++) { Dl_info d; const char *f = "?", *sy = "?"; uint64_t base = 0; if (dladdr((void *)fr[i], &d)) { f = d.dli_fname ? d.dli_fname : "?"; sy = d.dli_sname ? d.dli_sname : "?"; base = (uint64_t)d.dli_fbase; }
+    n = snprintf(b, sizeof b, "  #%d %#llx %s+%#llx (%s)\n", i, (unsigned long long)fr[i], f, (unsigned long long)(fr[i] - base), sy); if (write(2, b, n) < 0) {} }
+}
+#else
+static void crash_host_frames(void *uc) { (void)uc; }
+#endif
 static void crash_handler(int sig, siginfo_t *si, void *uc) {
-  (void)uc; char b[200]; int n = snprintf(b, sizeof b, "\n[aot] fatal signal %d at address %p (last guest block 0x%llx)\n", sig, si->si_addr, (unsigned long long)aot_last_pc);
+  char b[200]; int n = snprintf(b, sizeof b, "\n[aot] fatal signal %d at address %p (last guest block 0x%llx)\n", sig, si->si_addr, (unsigned long long)aot_last_pc);
   if (write(2, b, n) < 0) {}
-  { extern void aot_dump_crash_context(void); n = snprintf(b, sizeof b, "[aot] si_code=%d (1=unmapped address, 2=permission)\n", si->si_code); if (write(2, b, n) < 0) {} aot_dump_crash_context(); }
+  { extern void aot_dump_crash_context(void); n = snprintf(b, sizeof b, "[aot] si_code=%d (1=unmapped address, 2=permission)\n", si->si_code); if (write(2, b, n) < 0) {} aot_dump_crash_context(); crash_host_frames(uc); }
   _exit(139);
 }
 void aot_sys_init(void) {
