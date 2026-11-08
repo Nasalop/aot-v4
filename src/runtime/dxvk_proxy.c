@@ -109,19 +109,82 @@ static void *hostof(uint32_t g) {
 typedef uint64_t (*GF)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, float, float, float, float,
                        uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
-static uint64_t hcall(void *o, int slot, const uint64_t *iv, int ni, const float *fv) {   /* iv[0] is the object */
-  uint64_t a[32] = { 0 }; memcpy(a, iv, ni * 8); (void)o;
-  void **hvt = *(void ***)iv[0];
-  if (!hvt) { fprintf(stderr, "[dxvk] host object %#llx has no vtable (slot %d)\n", (unsigned long long)iv[0], slot); return 0x80004005u; }
-  GF f = (GF)hvt[slot];
-  
-  // FIX 3: Protect against NULL function pointers in the host vtable
-  if (!f) {
-      fprintf(stderr, "[dxvk] FATAL: host vtable slot %d is NULL!\n", slot);
-      return E_NOTIMPL_;
+typedef uint32_t (*COM_QI)(void *self, const uint8_t *iid, void **out);
+typedef uint32_t (*COM_REF)(void *self);
+
+/*
+ * FIX 5: The guest interface index is NOT necessarily the host interface index.
+ * DXVK's D3D10 implementation sits on top of D3D11, so the host pointer stored
+ * by this proxy may be an ID3D11 interface even though the guest object is an
+ * ID3D10 interface.  Calling host_vtable[guest_slot] directly is therefore
+ * invalid (the crash was observed at guest D3D10 slots 83 and 84).
+ *
+ * Query the exact COM interface described by PI before dispatching the method.
+ * This keeps the generated D3D10 method table unchanged and fixes the dispatch
+ * at the boundary instead of hard-coding DXVK-specific slot translations.
+ */
+static uint64_t hcall(const PI *pi, void *o, int slot, const uint64_t *iv, int ni, const float *fv) {
+  uint64_t a[32] = { 0 };
+  memcpy(a, iv, ni * 8);
+
+  if (!o) {
+    fprintf(stderr, "[dxvk] NULL host object for %s::%s\n",
+            pi ? pi->name : "<unknown>",
+            (pi && slot >= 0 && slot < pi->nm) ? pi->m[slot].name : "<unknown>");
+    return 0x80004005u;
   }
-  
-  return f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], fv[0], fv[1], fv[2], fv[3], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23]);
+
+  void *iface = o;
+  int release_qi_ref = 0;
+
+  if (pi && pi->guid) {
+    void **ovt = *(void ***)o;
+    if (!ovt || !ovt[0]) {
+      fprintf(stderr, "[dxvk] host object %p has no QueryInterface (%s)\n", o, pi->name);
+      return 0x80004005u;
+    }
+
+    COM_QI qi = (COM_QI)ovt[0];
+    uint32_t qhr = qi(o, pi->guid, &iface);
+    if ((int32_t)qhr < 0 || !iface) {
+      fprintf(stderr, "[dxvk] QueryInterface(%s) failed for host %p: %#x\n",
+              pi->name, o, qhr);
+      return qhr;
+    }
+    release_qi_ref = 1;
+  }
+
+  void **hvt = *(void ***)iface;
+  if (!hvt) {
+    fprintf(stderr, "[dxvk] host interface %p has no vtable (%s::%s)\n", iface,
+            pi ? pi->name : "<unknown>",
+            (pi && slot >= 0 && slot < pi->nm) ? pi->m[slot].name : "<unknown>");
+    if (release_qi_ref) {
+      void **qvt = *(void ***)iface;
+      if (qvt && qvt[2]) ((COM_REF)qvt[2])(iface);
+    }
+    return 0x80004005u;
+  }
+
+  GF f = (GF)hvt[slot];
+  if (!f) {
+    fprintf(stderr, "[dxvk] FATAL: host interface %p (%s) vtable slot %d is NULL!\n",
+            iface, pi ? pi->name : "<unknown>", slot);
+    if (release_qi_ref && hvt[2]) ((COM_REF)hvt[2])(iface);
+    return E_NOTIMPL_;
+  }
+
+  /* The vtable belongs to the QI'd interface, so its this pointer must too. */
+  a[0] = (uint64_t)(uintptr_t)iface;
+
+  uint64_t r = f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+                 fv[0], fv[1], fv[2], fv[3], a[8], a[9], a[10], a[11],
+                 a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19],
+                 a[20], a[21], a[22], a[23]);
+
+  /* QI added one reference. Balance only that temporary reference. */
+  if (release_qi_ref && hvt[2]) ((COM_REF)hvt[2])(iface);
+  return r;
 }
 
 static void conv_scd_in(const uint8_t *g, uint8_t *h) { memset(h, 0, 72); memcpy(h, g, 44); uint64_t w = LD(uint32_t, g + 44); memcpy(h + 48, &w, 8); memcpy(h + 56, g + 48, 4); memcpy(h + 60, g + 52, 4); memcpy(h + 64, g + 56, 4); }
@@ -164,7 +227,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     default: fprintf(stderr, "[dxvk] %s::%s is not supported by the 32->64 proxy\n", pi->name, m->name); return m->ret ? E_NOTIMPL_ : 0;
     }
   }
-  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; int ok = !m->ret || (int32_t)hr >= 0 || m->name[0] != 'C';
+  uint64_t r = hcall(pi, o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; int ok = !m->ret || (int32_t)hr >= 0 || m->name[0] != 'C';
   for (int p = 0; p < np; p++) {
     Post *q = &post[p]; const uint8_t *h = q->tmp;
     switch (q->kind) {
@@ -181,7 +244,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     case 'M': case 'T': case 'U': {
       if ((int32_t)hr < 0) break;
       void *hp = *(void **)h; size_t sz = 0; uint8_t d[160] = { 0 }; int gd = slot_by_name(pi, "GetDesc"); uint64_t gi[2] = { (uint64_t)(uintptr_t)o->host, (uint64_t)(uintptr_t)d }; float z[4] = { 0 };
-      if (gd >= 0) hcall(o->host, gd, gi, 2, z);
+      if (gd >= 0) hcall(pi, o->host, gd, gi, 2, z);
       if (q->kind == 'M') sz = LD(uint32_t, d);
       else { uint32_t w = LD(uint32_t, d), ht = LD(uint32_t, d + 4), dp = q->kind == 'U' ? LD(uint32_t, d + 8) : 1, ml = LD(uint32_t, d + (q->kind == 'U' ? 12 : 8)), fmt = LD(uint32_t, d + 16), mip = ml ? q->sub % ml : 0; (void)w;
         ht = ht >> mip; if (!ht) ht = 1; if ((fmt >= 70 && fmt <= 84) || (fmt >= 94 && fmt <= 99)) ht = (ht + 3) / 4; dp = dp >> mip; if (!dp) dp = 1;
@@ -230,13 +293,13 @@ uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_de
   int tf = ti_by_name("IDXGIFactory1"), tdev = ti_by_name("ID3D10Device"), tsc = ti_by_name("IDXGISwapChain");
   void *fac = NULL, *ad = NULL, *dev = NULL, *sc = NULL; uint32_t hr;
   hr = cf(PIS[tf].guid, &fac); if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] CreateDXGIFactory1 failed %#x\n", hr); return hr; }
-  { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
+  { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(&PIS[tf], fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
   if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] EnumAdapters failed %#x\n", hr); return hr; }
   hr = cd(fac, ad, 0, 0xA000, &dev); if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] D3D10CoreCreateDevice failed %#x\n", hr); return hr; }
   if (sc_out) {
     uint8_t d[72]; conv_scd_in((const uint8_t *)(uintptr_t)sc_desc, d);
     uint64_t iv[4] = { (uint64_t)(uintptr_t)fac, (uint64_t)(uintptr_t)dev, (uint64_t)(uintptr_t)d, (uint64_t)(uintptr_t)&sc }; float z[4] = { 0 };
-    hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "CreateSwapChain"), iv, 4, z);
+    hr = (uint32_t)hcall(&PIS[tf], fac, slot_by_name(&PIS[tf], "CreateSwapChain"), iv, 4, z);
     if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] CreateSwapChain failed %#x\n", hr); return hr; }
     G32(sc_out, wrap(sc, tsc));
   }
