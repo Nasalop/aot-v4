@@ -99,7 +99,9 @@ void *aot_gmalloc(size_t n) {
   if (b) freel[k] = (void *)b[1];
   else {
     size_t sz = (size_t)1 << k;
-    if (!low_cur || low_cur + sz > low_end) { size_t chunk = sz > (64u << 20) ? sz : (64u << 20); uint8_t *m = aot_low_map(chunk, 0); if (!m) { pthread_mutex_unlock(&low_mu); return NULL; } low_cur = m; low_end = m + chunk; }
+    if (!low_cur || low_cur + sz > low_end) { size_t chunk = sz > (64u << 20) ? sz : (64u << 20); uint8_t *m = NULL;
+      for (; chunk >= sz; chunk = chunk > sz * 2 ? chunk / 4 > sz ? chunk / 4 : sz : sz / 2) { m = aot_low_map(chunk, 0); if (m || chunk == sz) break; }   /* a fragmented 4 GB space may have no 64 MB hole left: fall back to smaller heap chunks */
+      if (!m) { static int note; if (!note++) fprintf(stderr, "[aot] low (32-bit) address space exhausted: cannot map %zu bytes for the guest heap\n", sz); pthread_mutex_unlock(&low_mu); return NULL; } low_cur = m; low_end = m + chunk; }
     b = (uint64_t *)low_cur; low_cur += sz;
   }
   pthread_mutex_unlock(&low_mu); b[0] = (uint64_t)k; return b + 2;
