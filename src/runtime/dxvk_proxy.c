@@ -130,7 +130,12 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     default: fprintf(stderr, "[dxvk] %s::%s is not supported by the 32->64 proxy\n", pi->name, m->name); return m->ret ? E_NOTIMPL_ : 0;
     }
   }
-  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; if (m->ret && (int32_t)hr < 0) fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x\n", pi->name, m->name, hr); int ok = !m->ret || (int32_t)hr >= 0 || m->name[0] != 'C';
+  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; if (m->ret && (int32_t)hr < 0) {
+    fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x args:", pi->name, m->name, hr);
+    for (int i = 0; i < m->n && i < 6; i++) { uint32_t a = A(i + 1); fprintf(stderr, " %#x", a);
+      if (a > 0x10000 && a < 0x80000000u) { const uint32_t *w = (const uint32_t *)(uintptr_t)a; fprintf(stderr, "[%x %x %x %x %x %x]", w[0], w[1], w[2], w[3], w[4], w[5]); } }
+    fprintf(stderr, "\n");
+  } int ok = !m->ret || (int32_t)hr >= 0 || m->name[0] != 'C';
   for (int p = 0; p < np; p++) {
     Post *q = &post[p]; const uint8_t *h = q->tmp;
     switch (q->kind) {
