@@ -99,7 +99,8 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   static int ntr; PX *o = px_of(A(0));
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
   const PM *m = &pi->m[slot];
-  if (ntr < 400) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
+  static uint8_t seen[64][256]; int ti_ = (int)(pi - PIS); int first = ti_ < 64 && slot < 256 && !seen[ti_][slot]++;
+  if (first || ntr < 20) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
   if (!o) { const uint32_t *w = (const uint32_t *)(uintptr_t)A(0); fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x [%#x %#x %#x %#x]\n", pi->name, m->name, (unsigned)A(0), w?w[0]:0, w?w[1]:0, w?w[2]:0, w?w[3]:0); return E_NOTIMPL_; }
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
 #define ALLOC(sz) ({ size_t _s = ((sz) + 15) & ~15u; if (ap + _s > sizeof ar) { fprintf(stderr, "[dxvk] %s::%s: argument too large for marshalling arena\n", pi->name, m->name); return E_NOTIMPL_; } void *_p = ar + ap; ap += _s; memset(_p, 0, _s); _p; })
@@ -129,7 +130,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     default: fprintf(stderr, "[dxvk] %s::%s is not supported by the 32->64 proxy\n", pi->name, m->name); return m->ret ? E_NOTIMPL_ : 0;
     }
   }
-  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; int ok = !m->ret || (int32_t)hr >= 0 || m->name[0] != 'C';
+  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; if (m->ret && (int32_t)hr < 0) fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x\n", pi->name, m->name, hr); int ok = !m->ret || (int32_t)hr >= 0 || m->name[0] != 'C';
   for (int p = 0; p < np; p++) {
     Post *q = &post[p]; const uint8_t *h = q->tmp;
     switch (q->kind) {
