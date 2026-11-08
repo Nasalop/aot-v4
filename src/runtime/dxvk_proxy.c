@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-
 typedef uint64_t (*fn_t)(CPU *);
 #define ARGN(c, n) ((n) == 0 ? (c)->r[1] : (n) == 1 ? (c)->r[2] : (n) == 2 ? (c)->r[8] : (n) == 3 ? (c)->r[9] : LD(uint64_t, (c)->r[4] + 8 + 8 * (n)))
 #define A(n) ((uint32_t)ARGN(c, (n)))
@@ -17,197 +16,88 @@ typedef struct { const char *name; uint8_t n; char k[17]; uint8_t ci[16], ty[16]
 typedef struct { const char *name; int nm; const PM *m; const fn_t *wf; const uint8_t *guid; } PI;
 static uint64_t px_call(CPU *c, const PI *pi, int slot);
 #include "d3d10_proxy_gen.inc"
-
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
 #define E_NOTIMPL_ 0x80004001u
 #define E_NOINTF_ 0x80004002u
 #define MAGIC 0x50583130u
-
 typedef struct { void *g, *h; size_t sz; uint32_t sub, type; } Shadow;
-typedef struct PX { void **vt; void *host; const PI *pi; uint32_t magic; Shadow sh[4]; } PX;
-
+/* The guest-visible object is only {vtable, magic, id}; everything the host side relies on (host pointer, interface, map shadows) lives in host memory,
+   so guest code that scribbles on a COM object (intrusive refcounts at +4/+8, ...) cannot corrupt it. */
+typedef struct { void **vt; uint32_t magic, id; } GO;
+typedef struct PX { uint32_t gaddr; void *host; const PI *pi; Shadow sh[4]; } PX;
+#define NPX (1 << 16)
+static PX *pxs[NPX]; static uint32_t npx;
+static PX *px_of(uint32_t g) {
+  if (!g) return NULL; const GO *go = (const GO *)(uintptr_t)g;
+  if (go->magic != MAGIC || go->id >= npx || pxs[go->id]->gaddr != g) return NULL;
+  return pxs[go->id];
+}
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static void **vts[64];
-
-// FIX 1: Dummy function for unimplemented slots so we never jump to 0x0
-static uint64_t d3d10_unimplemented(CPU *c) {
-  (void)c;
-  return E_NOTIMPL_;
-}
-
 static void **px_vt(int ti) {
   pthread_mutex_lock(&mu);
   if (!vts[ti]) {
     const PI *pi = &PIS[ti]; uint32_t *v = aot_gcalloc(pi->nm + 64, 4); char nm[96];
     if (!v) { fprintf(stderr, "[dxvk] out of 32-bit guest memory building %s vtable\n", pi->name); pthread_mutex_unlock(&mu); return NULL; }
-    
     for (int i = 0; i < pi->nm + 64; i++) {
-      if (i < pi->nm) { 
-        snprintf(nm, sizeof nm, "%s::%s", pi->name, pi->m[i].name); 
-        uint64_t t = aot_register_thunk(pi->wf[i], nm); 
-        aot_thunk_set_pop(t, 4 * (pi->m[i].n + 1)); 
-        v[i] = (uint32_t)t; 
-      }
-      else { 
-        snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", pi->name, i); 
-        uint64_t t = aot_register_thunk(d3d10_unimplemented, nm); 
-        aot_thunk_set_pop(t, 16); 
-        v[i] = (uint32_t)t; 
-      }
+      if (i < pi->nm) { snprintf(nm, sizeof nm, "%s::%s", pi->name, pi->m[i].name); uint64_t t = aot_register_thunk(pi->wf[i], nm); aot_thunk_set_pop(t, 4 * (pi->m[i].n + 1)); v[i] = (uint32_t)t; }
+      else { snprintf(nm, sizeof nm, "%s::vtbl[%d] (not implemented)", pi->name, i); v[i] = (uint32_t)aot_register_thunk(NULL, nm); }
     }
-
-    // FIX 2: The Engine Wrapper Layout fix.
-    // AC1 does: mov edx, [ecx] -> mov edx, [edx+4] -> call edx
-    // It expects vtable[0] to point to a struct where offset 4 is AddRef.
-    uint32_t *wrapper = aot_gcalloc(4, 4);
-    wrapper[0] = v[0]; // QueryInterface
-    wrapper[1] = v[1]; // AddRef
-    wrapper[2] = v[2]; // Release
-    v[0] = (uint32_t)wrapper; // Point vtable[0] to the wrapper
-
     vts[ti] = (void **)v;
   }
   pthread_mutex_unlock(&mu); return vts[ti];
 }
-
 #define TN (1 << 15)
-static struct { void *h; int ti; PX *px; } tab[TN];
-
-static PX *wrap(void *h, int ti) {
+static struct { void *h; int ti; GO *px; } tab[TN];
+static GO *wrap(void *h, int ti) {
   if (!h) return NULL;
   if (ti < 0 || ti >= NPI) { fprintf(stderr, "[dxvk] cannot wrap host object %p: interface not in proxy table\n", h); return NULL; }
   void **vt = px_vt(ti); if (!vt) return NULL; pthread_mutex_lock(&mu);
   unsigned i = (unsigned)((((uintptr_t)h >> 4) ^ (unsigned)ti * 0x9E37u)) & (TN - 1), tomb = TN;
   for (unsigned n = 0; n < TN; n++, i = (i + 1) & (TN - 1)) {
-    if (tab[i].h == h && tab[i].ti == ti) { PX *p = tab[i].px; pthread_mutex_unlock(&mu); return p; }
+    if (tab[i].h == h && tab[i].ti == ti) { GO *p = tab[i].px; pthread_mutex_unlock(&mu); return p; }
     if (!tab[i].h) { if (tomb == TN) tomb = i; break; }
     if (tab[i].h == (void *)1 && tomb == TN) tomb = i;
   }
-  PX *p = aot_gcalloc(1, sizeof *p); if (!p) { pthread_mutex_unlock(&mu); fprintf(stderr, "[dxvk] out of 32-bit guest memory while wrapping a host object\n"); return NULL; }
-  p->vt = vt; p->host = h; p->pi = &PIS[ti]; p->magic = MAGIC;
+  GO *p = aot_gcalloc(1, sizeof *p); PX *x = calloc(1, sizeof *x);
+  if (!p || !x || npx >= NPX) { pthread_mutex_unlock(&mu); fprintf(stderr, "[dxvk] out of memory while wrapping a host object\n"); return NULL; }
+  x->gaddr = (uint32_t)(uintptr_t)p; x->host = h; x->pi = &PIS[ti]; p->vt = vt; p->magic = MAGIC; p->id = npx; pxs[npx++] = x;
   if (tomb == TN) { pthread_mutex_unlock(&mu); fprintf(stderr, "[dxvk] proxy table full\n"); return NULL; }
   tab[tomb].h = h; tab[tomb].ti = ti; tab[tomb].px = p; pthread_mutex_unlock(&mu); return p;
 }
-
 static void unwrap_dead(PX *p) {
   pthread_mutex_lock(&mu);
   unsigned i = (unsigned)((((uintptr_t)p->host >> 4) ^ (unsigned)(p->pi - PIS) * 0x9E37u)) & (TN - 1);
-  for (unsigned n = 0; n < TN && tab[i].h; n++, i = (i + 1) & (TN - 1)) if (tab[i].px == p) { tab[i].h = (void *)1; break; }
+  for (unsigned n = 0; n < TN && tab[i].h; n++, i = (i + 1) & (TN - 1)) if ((uint32_t)(uintptr_t)tab[i].px == p->gaddr) { tab[i].h = (void *)1; break; }
   pthread_mutex_unlock(&mu);
 }
-
 static int ti_by_guid(const uint8_t *g) { for (int i = 0; i < NPI; i++) if (!memcmp(PIS[i].guid, g, 16)) return i; return -1; }
 static int ti_by_name(const char *n) { for (int i = 0; i < NPI; i++) if (!strcmp(PIS[i].name, n)) return i; return -1; }
 static int slot_by_name(const PI *pi, const char *n) { for (int i = 0; i < pi->nm; i++) if (!strcmp(pi->m[i].name, n)) return i; return -1; }
-
 static void *hostof(uint32_t g) {
-  if (!g) return NULL; PX *p = (PX *)(uintptr_t)g;
-  if (p->magic != MAGIC) { fprintf(stderr, "[dxvk] guest passed %#x that is not a DXVK proxy object\n", g); return NULL; }
+  if (!g) return NULL; PX *p = px_of(g);
+  if (!p) { fprintf(stderr, "[dxvk] guest passed %#x that is not a DXVK proxy object\n", g); return NULL; }
   return p->host;
 }
-
 typedef uint64_t (*GF)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, float, float, float, float,
                        uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-
-typedef uint32_t (*COM_QI)(void *self, const uint8_t *iid, void **out);
-typedef uint32_t (*COM_REF)(void *self);
-
-/*
- * FIX 5: The guest interface index is NOT necessarily the host interface index.
- * DXVK's D3D10 implementation sits on top of D3D11, so the host pointer stored
- * by this proxy may be an ID3D11 interface even though the guest object is an
- * ID3D10 interface.  Calling host_vtable[guest_slot] directly is therefore
- * invalid (the crash was observed at guest D3D10 slots 83 and 84).
- *
- * Query the exact COM interface described by PI before dispatching the method.
- * This keeps the generated D3D10 method table unchanged and fixes the dispatch
- * at the boundary instead of hard-coding DXVK-specific slot translations.
- */
-static uint64_t hcall(const PI *pi, void *o, int slot, const uint64_t *iv, int ni, const float *fv) {
-  uint64_t a[32] = { 0 };
-  memcpy(a, iv, ni * 8);
-
-  if (!o) {
-    fprintf(stderr, "[dxvk] NULL host object for %s::%s\n",
-            pi ? pi->name : "<unknown>",
-            (pi && slot >= 0 && slot < pi->nm) ? pi->m[slot].name : "<unknown>");
-    return 0x80004005u;
-  }
-
-  void *iface = o;
-  int release_qi_ref = 0;
-
-  if (pi && pi->guid) {
-    void **ovt = *(void ***)o;
-    if (!ovt || !ovt[0]) {
-      fprintf(stderr, "[dxvk] host object %p has no QueryInterface (%s)\n", o, pi->name);
-      return 0x80004005u;
-    }
-
-    COM_QI qi = (COM_QI)ovt[0];
-    uint32_t qhr = qi(o, pi->guid, &iface);
-    if ((int32_t)qhr < 0 || !iface) {
-      fprintf(stderr, "[dxvk] QueryInterface(%s) failed for host %p: %#x\n",
-              pi->name, o, qhr);
-      return qhr;
-    }
-    release_qi_ref = 1;
-  }
-
-  void **hvt = *(void ***)iface;
-  if (!hvt) {
-    fprintf(stderr, "[dxvk] host interface %p has no vtable (%s::%s)\n", iface,
-            pi ? pi->name : "<unknown>",
-            (pi && slot >= 0 && slot < pi->nm) ? pi->m[slot].name : "<unknown>");
-    if (release_qi_ref) {
-      void **qvt = *(void ***)iface;
-      if (qvt && qvt[2]) ((COM_REF)qvt[2])(iface);
-    }
-    return 0x80004005u;
-  }
-
-  /* The guest-side bridge keeps the observed AC1 vtable numbering.
-     ID3D11Texture2D's real COM vtable has GetDesc at slot 10, while the
-     guest import observed in this binary is labelled vtbl[12]. Translate
-     only that known boundary mismatch; all other interfaces use their
-     normal COM slot. */
-  int host_slot = slot;
-  if (pi && !strcmp(pi->name, "ID3D11Texture2D") && slot == 12)
-    host_slot = 10;
-
-  GF f = (GF)hvt[host_slot];
-  if (!f) {
-    fprintf(stderr, "[dxvk] FATAL: host interface %p (%s) vtable slot %d (host slot %d) is NULL!\n",
-            iface, pi ? pi->name : "<unknown>", slot, host_slot);
-    if (release_qi_ref && hvt[2]) ((COM_REF)hvt[2])(iface);
-    return E_NOTIMPL_;
-  }
-
-  /* The vtable belongs to the QI'd interface, so its this pointer must too. */
-  a[0] = (uint64_t)(uintptr_t)iface;
-
-  uint64_t r = f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-                 fv[0], fv[1], fv[2], fv[3], a[8], a[9], a[10], a[11],
-                 a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19],
-                 a[20], a[21], a[22], a[23]);
-
-  /* QI added one reference. Balance only that temporary reference. */
-  if (release_qi_ref && hvt[2]) ((COM_REF)hvt[2])(iface);
-  return r;
+static uint64_t hcall(void *o, int slot, const uint64_t *iv, int ni, const float *fv) {   /* iv[0] is the object */
+  uint64_t a[32] = { 0 }; memcpy(a, iv, ni * 8); (void)o;
+  void **hvt = *(void ***)iv[0];
+  if (!hvt) { fprintf(stderr, "[dxvk] host object %#llx has no vtable (slot %d)\n", (unsigned long long)iv[0], slot); return 0x80004005u; }
+  GF f = (GF)hvt[slot];
+  return f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], fv[0], fv[1], fv[2], fv[3], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23]);
 }
-
 static void conv_scd_in(const uint8_t *g, uint8_t *h) { memset(h, 0, 72); memcpy(h, g, 44); uint64_t w = LD(uint32_t, g + 44); memcpy(h + 48, &w, 8); memcpy(h + 56, g + 48, 4); memcpy(h + 60, g + 52, 4); memcpy(h + 64, g + 56, 4); }
 static void conv_wstr(uint8_t *g, const uint8_t *h, int n) { for (int i = 0; i < n; i++) ST(uint16_t, g + 2 * i, LD(uint32_t, h + 4 * i)); }
 static uint32_t sat(uint64_t v) { return v > 0x7fffffffu ? 0x7fffffffu : (uint32_t)v; }
-
 typedef struct { uint8_t kind; uint8_t ti; uint32_t g; void *tmp; uint32_t n, sub, type; } Post;
-
 static uint64_t px_call(CPU *c, const PI *pi, int slot) {
-  static int ntr; PX *o = (PX *)(uintptr_t)A(0);
+  static int ntr; PX *o = px_of(A(0));
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
   const PM *m = &pi->m[slot];
-  if (ntr < 400) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)(uintptr_t)o, (o && o->magic == MAGIC) ? o->host : NULL); }
-  if (!o || o->magic != MAGIC) { fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %p\n", pi->name, m->name, o); return E_NOTIMPL_; }
+  if (ntr < 400) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
+  if (!o) { fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x\n", pi->name, m->name, (unsigned)A(0)); return E_NOTIMPL_; }
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
 #define ALLOC(sz) ({ size_t _s = ((sz) + 15) & ~15u; if (ap + _s > sizeof ar) { fprintf(stderr, "[dxvk] %s::%s: argument too large for marshalling arena\n", pi->name, m->name); return E_NOTIMPL_; } void *_p = ar + ap; ap += _s; memset(_p, 0, _s); _p; })
   if (m->name[0] == 'U' && !strcmp(m->name, "Unmap")) {   /* flush a low-memory shadow back into the host mapping */
@@ -236,11 +126,11 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     default: fprintf(stderr, "[dxvk] %s::%s is not supported by the 32->64 proxy\n", pi->name, m->name); return m->ret ? E_NOTIMPL_ : 0;
     }
   }
-  uint64_t r = hcall(pi, o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; int ok = !m->ret || (int32_t)hr >= 0 || m->name[0] != 'C';
+  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; int ok = !m->ret || (int32_t)hr >= 0 || m->name[0] != 'C';
   for (int p = 0; p < np; p++) {
     Post *q = &post[p]; const uint8_t *h = q->tmp;
     switch (q->kind) {
-    case 'O': { void *hp = *(void **)q->tmp; if (hp) { PX *x = wrap(hp, q->ti); G32(q->g, x); } else G32(q->g, 0); break; }
+    case 'O': { void *hp = *(void **)q->tmp; if (hp) { GO *x = wrap(hp, q->ti); G32(q->g, x); } else G32(q->g, 0); break; }
     case 'R': { void *hp = *(void **)q->tmp; uint8_t id[16]; memcpy(id, (void *)(uintptr_t)q->n, 16); static const uint8_t unk[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46 };
       int ti = !memcmp(id, unk, 16) ? (int)(pi - PIS) : ti_by_guid(id);
       if (!hp) { G32(q->g, 0); break; }
@@ -253,7 +143,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     case 'M': case 'T': case 'U': {
       if ((int32_t)hr < 0) break;
       void *hp = *(void **)h; size_t sz = 0; uint8_t d[160] = { 0 }; int gd = slot_by_name(pi, "GetDesc"); uint64_t gi[2] = { (uint64_t)(uintptr_t)o->host, (uint64_t)(uintptr_t)d }; float z[4] = { 0 };
-      if (gd >= 0) hcall(pi, o->host, gd, gi, 2, z);
+      if (gd >= 0) hcall(o->host, gd, gi, 2, z);
       if (q->kind == 'M') sz = LD(uint32_t, d);
       else { uint32_t w = LD(uint32_t, d), ht = LD(uint32_t, d + 4), dp = q->kind == 'U' ? LD(uint32_t, d + 8) : 1, ml = LD(uint32_t, d + (q->kind == 'U' ? 12 : 8)), fmt = LD(uint32_t, d + 16), mip = ml ? q->sub % ml : 0; (void)w;
         ht = ht >> mip; if (!ht) ht = 1; if ((fmt >= 70 && fmt <= 84) || (fmt >= 94 && fmt <= 99)) ht = (ht + 3) / 4; dp = dp >> mip; if (!dp) dp = 1;
@@ -269,16 +159,9 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     }
   }
   (void)ok;
-  
-  // FIX 4: Free the guest wrapper when the host refcount hits zero
-  if (m->name[0] == 'R' && !strcmp(m->name, "Release") && (uint32_t)r == 0) { 
-      unwrap_dead(o); 
-      aot_gfree(o); 
-  }
-  
+  if (m->name[0] == 'R' && !strcmp(m->name, "Release") && (uint32_t)r == 0) unwrap_dead(o);
   return m->ret ? (uint32_t)r : 0;
 }
-
 /* ---- creation: D3D10CreateDeviceAndSwapChain -> real DXVK ---- */
 static void *hd[3]; static int inited;
 extern void *aot_present_window(void);
@@ -293,7 +176,6 @@ static int init_dxvk(void) {
   for (int i = 0; i < 3; i++) { void (*sw)(void *) = dlsym(hd[i], "dxvk_android_set_window"); if (sw) sw(w); }
   inited = 1; return 0;
 }
-
 uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_desc) {
   if (init_dxvk() != 0) return (uint64_t)-1;
   typedef uint32_t (*CF)(const void *, void **); typedef uint32_t (*CD)(void *, void *, uint32_t, uint32_t, void **);
@@ -302,15 +184,16 @@ uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_de
   int tf = ti_by_name("IDXGIFactory1"), tdev = ti_by_name("ID3D10Device"), tsc = ti_by_name("IDXGISwapChain");
   void *fac = NULL, *ad = NULL, *dev = NULL, *sc = NULL; uint32_t hr;
   hr = cf(PIS[tf].guid, &fac); if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] CreateDXGIFactory1 failed %#x\n", hr); return hr; }
-  { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(&PIS[tf], fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
+  { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
   if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] EnumAdapters failed %#x\n", hr); return hr; }
   hr = cd(fac, ad, 0, 0xA000, &dev); if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] D3D10CoreCreateDevice failed %#x\n", hr); return hr; }
   if (sc_out) {
     uint8_t d[72]; conv_scd_in((const uint8_t *)(uintptr_t)sc_desc, d);
     uint64_t iv[4] = { (uint64_t)(uintptr_t)fac, (uint64_t)(uintptr_t)dev, (uint64_t)(uintptr_t)d, (uint64_t)(uintptr_t)&sc }; float z[4] = { 0 };
-    hr = (uint32_t)hcall(&PIS[tf], fac, slot_by_name(&PIS[tf], "CreateSwapChain"), iv, 4, z);
+    hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "CreateSwapChain"), iv, 4, z);
     if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] CreateSwapChain failed %#x\n", hr); return hr; }
     G32(sc_out, wrap(sc, tsc));
   }
+  fprintf(stderr, "[dxvk] host ID3D10Device=%p vtbl=%p\n", dev, dev ? *(void **)dev : NULL);
   G32(dev_out, wrap(dev, tdev)); fprintf(stderr, "[dxvk] D3D10 device + swapchain created through DXVK\n"); return 0;
 }
