@@ -178,6 +178,7 @@ static int init_dxvk(void) {
   for (int i = 0; i < 3; i++) { hd[i] = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL); if (!hd[i]) { fprintf(stderr, "[dxvk] %s unavailable: %s (using the built-in D3D10 emulation)\n", names[i], dlerror()); return -1; } }
   void *w = aot_present_window(); if (!w) { fprintf(stderr, "[dxvk] no Android window yet\n"); return -1; }
   for (int i = 0; i < 3; i++) { void (*sw)(void *) = dlsym(hd[i], "dxvk_android_set_window"); if (sw) sw(w); }
+  { char b[32]; snprintf(b, sizeof b, "%llx", (unsigned long long)(uintptr_t)w); setenv("AOT_ANDROID_WINDOW", b, 1); }
   inited = 1; return 0;
 }
 static void *g_fac;
