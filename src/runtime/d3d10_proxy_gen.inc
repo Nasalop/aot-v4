@@ -853,33 +853,6 @@ static const PM PM_ID3D10Device1[] = {
 W_ID3D10Device1(0)W_ID3D10Device1(1)W_ID3D10Device1(2)W_ID3D10Device1(3)W_ID3D10Device1(4)W_ID3D10Device1(5)W_ID3D10Device1(6)W_ID3D10Device1(7)W_ID3D10Device1(8)W_ID3D10Device1(9)W_ID3D10Device1(10)W_ID3D10Device1(11)W_ID3D10Device1(12)W_ID3D10Device1(13)W_ID3D10Device1(14)W_ID3D10Device1(15)W_ID3D10Device1(16)W_ID3D10Device1(17)W_ID3D10Device1(18)W_ID3D10Device1(19)W_ID3D10Device1(20)W_ID3D10Device1(21)W_ID3D10Device1(22)W_ID3D10Device1(23)W_ID3D10Device1(24)W_ID3D10Device1(25)W_ID3D10Device1(26)W_ID3D10Device1(27)W_ID3D10Device1(28)W_ID3D10Device1(29)W_ID3D10Device1(30)W_ID3D10Device1(31)W_ID3D10Device1(32)W_ID3D10Device1(33)W_ID3D10Device1(34)W_ID3D10Device1(35)W_ID3D10Device1(36)W_ID3D10Device1(37)W_ID3D10Device1(38)W_ID3D10Device1(39)W_ID3D10Device1(40)W_ID3D10Device1(41)W_ID3D10Device1(42)W_ID3D10Device1(43)W_ID3D10Device1(44)W_ID3D10Device1(45)W_ID3D10Device1(46)W_ID3D10Device1(47)W_ID3D10Device1(48)W_ID3D10Device1(49)W_ID3D10Device1(50)W_ID3D10Device1(51)W_ID3D10Device1(52)W_ID3D10Device1(53)W_ID3D10Device1(54)W_ID3D10Device1(55)W_ID3D10Device1(56)W_ID3D10Device1(57)W_ID3D10Device1(58)W_ID3D10Device1(59)W_ID3D10Device1(60)W_ID3D10Device1(61)W_ID3D10Device1(62)W_ID3D10Device1(63)W_ID3D10Device1(64)W_ID3D10Device1(65)W_ID3D10Device1(66)W_ID3D10Device1(67)W_ID3D10Device1(68)W_ID3D10Device1(69)W_ID3D10Device1(70)W_ID3D10Device1(71)W_ID3D10Device1(72)W_ID3D10Device1(73)W_ID3D10Device1(74)W_ID3D10Device1(75)W_ID3D10Device1(76)W_ID3D10Device1(77)W_ID3D10Device1(78)W_ID3D10Device1(79)W_ID3D10Device1(80)W_ID3D10Device1(81)W_ID3D10Device1(82)W_ID3D10Device1(83)W_ID3D10Device1(84)W_ID3D10Device1(85)W_ID3D10Device1(86)W_ID3D10Device1(87)W_ID3D10Device1(88)W_ID3D10Device1(89)W_ID3D10Device1(90)W_ID3D10Device1(91)W_ID3D10Device1(92)W_ID3D10Device1(93)W_ID3D10Device1(94)W_ID3D10Device1(95)W_ID3D10Device1(96)W_ID3D10Device1(97)W_ID3D10Device1(98)W_ID3D10Device1(99)W_ID3D10Device1(100)
 static const fn_t WF_ID3D10Device1[] = { W_ID3D10Device1_0, W_ID3D10Device1_1, W_ID3D10Device1_2, W_ID3D10Device1_3, W_ID3D10Device1_4, W_ID3D10Device1_5, W_ID3D10Device1_6, W_ID3D10Device1_7, W_ID3D10Device1_8, W_ID3D10Device1_9, W_ID3D10Device1_10, W_ID3D10Device1_11, W_ID3D10Device1_12, W_ID3D10Device1_13, W_ID3D10Device1_14, W_ID3D10Device1_15, W_ID3D10Device1_16, W_ID3D10Device1_17, W_ID3D10Device1_18, W_ID3D10Device1_19, W_ID3D10Device1_20, W_ID3D10Device1_21, W_ID3D10Device1_22, W_ID3D10Device1_23, W_ID3D10Device1_24, W_ID3D10Device1_25, W_ID3D10Device1_26, W_ID3D10Device1_27, W_ID3D10Device1_28, W_ID3D10Device1_29, W_ID3D10Device1_30, W_ID3D10Device1_31, W_ID3D10Device1_32, W_ID3D10Device1_33, W_ID3D10Device1_34, W_ID3D10Device1_35, W_ID3D10Device1_36, W_ID3D10Device1_37, W_ID3D10Device1_38, W_ID3D10Device1_39, W_ID3D10Device1_40, W_ID3D10Device1_41, W_ID3D10Device1_42, W_ID3D10Device1_43, W_ID3D10Device1_44, W_ID3D10Device1_45, W_ID3D10Device1_46, W_ID3D10Device1_47, W_ID3D10Device1_48, W_ID3D10Device1_49, W_ID3D10Device1_50, W_ID3D10Device1_51, W_ID3D10Device1_52, W_ID3D10Device1_53, W_ID3D10Device1_54, W_ID3D10Device1_55, W_ID3D10Device1_56, W_ID3D10Device1_57, W_ID3D10Device1_58, W_ID3D10Device1_59, W_ID3D10Device1_60, W_ID3D10Device1_61, W_ID3D10Device1_62, W_ID3D10Device1_63, W_ID3D10Device1_64, W_ID3D10Device1_65, W_ID3D10Device1_66, W_ID3D10Device1_67, W_ID3D10Device1_68, W_ID3D10Device1_69, W_ID3D10Device1_70, W_ID3D10Device1_71, W_ID3D10Device1_72, W_ID3D10Device1_73, W_ID3D10Device1_74, W_ID3D10Device1_75, W_ID3D10Device1_76, W_ID3D10Device1_77, W_ID3D10Device1_78, W_ID3D10Device1_79, W_ID3D10Device1_80, W_ID3D10Device1_81, W_ID3D10Device1_82, W_ID3D10Device1_83, W_ID3D10Device1_84, W_ID3D10Device1_85, W_ID3D10Device1_86, W_ID3D10Device1_87, W_ID3D10Device1_88, W_ID3D10Device1_89, W_ID3D10Device1_90, W_ID3D10Device1_91, W_ID3D10Device1_92, W_ID3D10Device1_93, W_ID3D10Device1_94, W_ID3D10Device1_95, W_ID3D10Device1_96, W_ID3D10Device1_97, W_ID3D10Device1_98, W_ID3D10Device1_99, W_ID3D10Device1_100 };
 static const uint8_t GUID_ID3D10Device1[16] = { 0x8f, 0x4c, 0x7e, 0x9b, 0x2c, 0x34, 0x06, 0x41, 0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0 };
-
-/* ---- D3D11 bridge interface required by DXVK D3D10 GetBuffer ----
-   DXVK's D3D10 implementation is layered over D3D11. GetBuffer may therefore
-   return an ID3D11Texture2D even though the guest requested it through the
-   D3D10-era swap chain. Keep this interface in the proxy table so a guest
-   QueryInterface for IID_ID3D11Texture2D can be wrapped instead of becoming
-   an unimplemented import. */
-static const PM PM_ID3D11Texture2D[] = {
-  { "QueryInterface", 2, "vR", {255,0}, {255,255}, 1 },
-  { "AddRef", 0, "", {0}, {0}, 1 },
-  { "Release", 0, "", {0}, {0}, 1 },
-  { "GetDevice", 1, "O", {255}, {36}, 0 },
-  { "GetPrivateData", 3, "vvv", {255,255,255}, {255,255,255}, 1 },
-  { "SetPrivateData", 3, "vuv", {255,255,255}, {255,255,255}, 1 },
-  { "SetPrivateDataInterface", 2, "vo", {255,255}, {255,255}, 1 },
-  { "GetType", 1, "v", {255}, {255}, 0 },
-  { "SetEvictionPriority", 1, "u", {255}, {255}, 0 },
-  { "GetEvictionPriority", 0, "", {0}, {0}, 1 },
-  { "_unused10", 0, "", {0}, {0}, 0 },
-  { "_unused11", 0, "", {0}, {0}, 0 },
-  { "GetDesc", 1, "v", {255}, {255}, 0 },
-};
-#define W_ID3D11Texture2D(S) static uint64_t W_ID3D11Texture2D_##S(CPU *c) { return px_call(c, &PIS[41], S); }
-W_ID3D11Texture2D(0)W_ID3D11Texture2D(1)W_ID3D11Texture2D(2)W_ID3D11Texture2D(3)W_ID3D11Texture2D(4)W_ID3D11Texture2D(5)W_ID3D11Texture2D(6)W_ID3D11Texture2D(7)W_ID3D11Texture2D(8)W_ID3D11Texture2D(9)W_ID3D11Texture2D(10)
-static const fn_t WF_ID3D11Texture2D[] = { W_ID3D11Texture2D_0, W_ID3D11Texture2D_1, W_ID3D11Texture2D_2, W_ID3D11Texture2D_3, W_ID3D11Texture2D_4, W_ID3D11Texture2D_5, W_ID3D11Texture2D_6, W_ID3D11Texture2D_7, W_ID3D11Texture2D_8, W_ID3D11Texture2D_9, W_ID3D11Texture2D_10 };
-static const uint8_t GUID_ID3D11Texture2D[16] = { 0xf2, 0xaa, 0x15, 0x6f, 0x08, 0xd2, 0x89, 0x4e, 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c };
-
 static const PI PIS[] = {
   { "IDXGIObject", sizeof PM_IDXGIObject / sizeof PM_IDXGIObject[0], PM_IDXGIObject, WF_IDXGIObject, GUID_IDXGIObject },
   { "IDXGIDeviceSubObject", sizeof PM_IDXGIDeviceSubObject / sizeof PM_IDXGIDeviceSubObject[0], PM_IDXGIDeviceSubObject, WF_IDXGIDeviceSubObject, GUID_IDXGIDeviceSubObject },
@@ -922,5 +895,4 @@ static const PI PIS[] = {
   { "ID3D10BlendState1", sizeof PM_ID3D10BlendState1 / sizeof PM_ID3D10BlendState1[0], PM_ID3D10BlendState1, WF_ID3D10BlendState1, GUID_ID3D10BlendState1 },
   { "ID3D10ShaderResourceView1", sizeof PM_ID3D10ShaderResourceView1 / sizeof PM_ID3D10ShaderResourceView1[0], PM_ID3D10ShaderResourceView1, WF_ID3D10ShaderResourceView1, GUID_ID3D10ShaderResourceView1 },
   { "ID3D10Device1", sizeof PM_ID3D10Device1 / sizeof PM_ID3D10Device1[0], PM_ID3D10Device1, WF_ID3D10Device1, GUID_ID3D10Device1 },
-  { "ID3D11Texture2D", sizeof PM_ID3D11Texture2D / sizeof PM_ID3D11Texture2D[0], PM_ID3D11Texture2D, WF_ID3D11Texture2D, GUID_ID3D11Texture2D },
 };
