@@ -108,6 +108,11 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     uint32_t sub = m->n ? A(1) : 0;
     for (int i = 0; i < 4; i++) if (o->sh[i].g && o->sh[i].sub == sub) { Shadow *s = &o->sh[i]; if (s->type != 1) memcpy(s->h, s->g, s->sz); aot_gfree(s->g); s->g = NULL; break; }
   }
+  if (m->name[0] == 'C' && !strcmp(m->name, "CreateBuffer") && A(1) && LD(uint32_t, A(1)) == 0) {
+    /* The game asks for a zero-size buffer (a shader without constant buffers); native D3D10 drivers tolerated this, DXVK rejects it. Give it the smallest valid buffer instead of a NULL the game does not check. */
+    static int warned; if (!warned++) fprintf(stderr, "[dxvk] CreateBuffer with ByteWidth 0 (usage=%u bind=%#x): substituting a 16-byte buffer\n", LD(uint32_t, A(1) + 4), LD(uint32_t, A(1) + 8));
+    ST(uint32_t, A(1), 16);
+  }
   iv[ni++] = (uint64_t)(uintptr_t)o->host;
   for (int i = 0; i < m->n; i++) {
     uint32_t v = A(i + 1); char k = m->k[i];
