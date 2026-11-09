@@ -94,7 +94,6 @@ S(InternetSetCookieW) { aot_last_error = 5; return 0; }
 S(waveOutGetDevCapsA) { return 6; }                                   /* MMSYSERR_NODRIVER */
 
 /* ---- DirectInput / DirectSound / EAX / XInput / D3DX10 / Bink: explicit "unavailable" results ---- */
-S(DirectInput8Create) { static int n; note_once(&n, "dinput8: DirectInput unavailable (DIERR_DEVICENOTREG); game must fall back to window messages"); if (P(3)) ST(uint32_t, A(3), 0); return 0x80040154u; }
 /* DirectSound (PE32): a complete software device. Buffers hold real memory (Lock/Unlock work), play cursors advance with wall-clock time at the buffer's
  * frequency, looping/stop semantics follow the API, so a game's streaming code runs normally. The mixed audio is NOT sent anywhere yet (no Android audio
  * backend): that is announced once on stderr. 3D buffers / IKsPropertySet (EAX) are not offered: QueryInterface answers E_NOINTERFACE. */
@@ -222,6 +221,33 @@ S(dsound_create) {   /* DirectSoundCreate8 / EAXDirectSoundCreate (guid, IDirect
   uint32_t *out = P(1); if (!out) return DS_E_PARAM; ds_init_tables(); DSObj *d = aot_gcalloc(1, sizeof *d); if (!d || !ds_vt_dev) return 0x8007000E;
   d->vt = ds_vt_dev; d->ref = 1; *out = (uint32_t)(uintptr_t)d; return 0;
 }
+
+/* ---- DirectInput8: objects open successfully (the game requires keyboard+mouse devices to finish creating its render device) but
+ * report NO input: GetDeviceState returns zeroes, GetDeviceData returns 0 events. Android touch/key input is not wired to them yet. ---- */
+static uint32_t di_vt, di_vt_dev;
+#define DIO(n) S(di_##n)
+DIO(QI) { uint32_t *o = P(2); if (!o) return 0x80004003u; *o = (uint32_t)A(0); ((DSObj *)P(0))->ref++; return 0; }
+DIO(AddRef) { return (uint32_t)++((DSObj *)P(0))->ref; }
+DIO(Release) { DSObj *o = P(0); return (uint32_t)(o->ref > 0 ? --o->ref : 0); }
+DIO(Ok) { return 0; }
+DIO(State) { static int n; note_once(&n, "dinput8: devices created; they report no input (touch/keys not mapped to DirectInput yet)"); if (P(2)) memset(P(2), 0, (uint32_t)A(1)); return 0; }
+DIO(Data) { if (P(3)) *(uint32_t *)P(3) = 0; return 0; }
+DIO(CreateDevice) {
+  uint32_t *out = P(2); if (!out) return 0x80070057u; DSObj *d = aot_gcalloc(1, sizeof *d); if (!d) return 0x8007000Eu;
+  d->vt = di_vt_dev; d->ref = 1; *out = (uint32_t)(uintptr_t)d; return 0; }
+static void di_init(void) {
+  if (di_vt) return;
+  static const DSSlot dev[] = { {0,"QueryInterface",u_di_QI,3}, {1,"AddRef",u_di_AddRef,1}, {2,"Release",u_di_Release,1}, {3,"GetCapabilities",u_di_Ok,2}, {4,"EnumObjects",u_di_Ok,4},
+    {5,"GetProperty",u_di_Ok,3}, {6,"SetProperty",u_di_Ok,3}, {7,"Acquire",u_di_Ok,1}, {8,"Unacquire",u_di_Ok,1}, {9,"GetDeviceState",u_di_State,3}, {10,"GetDeviceData",u_di_Data,5},
+    {11,"SetDataFormat",u_di_Ok,2}, {12,"SetEventNotification",u_di_Ok,2}, {13,"SetCooperativeLevel",u_di_Ok,3}, {14,"GetObjectInfo",u_di_Ok,4}, {15,"GetDeviceInfo",u_di_Ok,2},
+    {16,"RunControlPanel",u_di_Ok,3}, {17,"Initialize",u_di_Ok,4}, {25,"Poll",u_di_Ok,1}, {26,"SendDeviceData",u_di_Ok,5}, {0,0,0,0} };
+  static const DSSlot idi[] = { {0,"QueryInterface",u_di_QI,3}, {1,"AddRef",u_di_AddRef,1}, {2,"Release",u_di_Release,1}, {3,"CreateDevice",u_di_CreateDevice,4},
+    {4,"EnumDevices",u_di_Ok,5}, {5,"GetDeviceStatus",u_di_Ok,2}, {6,"RunControlPanel",u_di_Ok,3}, {7,"Initialize",u_di_Ok,3}, {0,0,0,0} };
+  di_vt_dev = ds_build("IDirectInputDevice8", 32, dev); di_vt = ds_build("IDirectInput8", 11, idi);
+}
+S(DirectInput8Create) {   /* (hinst, version, riid, void** ppv, outer) */
+  uint32_t *out = P(3); if (!out) return 0x80070057u; di_init(); DSObj *d = aot_gcalloc(1, sizeof *d); if (!d || !di_vt) return 0x8007000Eu;
+  d->vt = di_vt; d->ref = 1; *out = (uint32_t)(uintptr_t)d; return 0; }
 S(xinput_none) { return 1167; }                                       /* ERROR_DEVICE_NOT_CONNECTED */
 S(D3DX10UnsetAllDeviceObjects) { return 0; }                          /* teardown helper: nothing is cached on our side */
 S(bink_unavail) { static int n; note_once(&n, "binkw32: Bink video is not available; BinkOpen fails so videos are skipped"); return 0; }
