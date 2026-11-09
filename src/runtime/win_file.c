@@ -1680,7 +1680,7 @@ list_done:
   if (key && def) { snprintf((char *)(uintptr_t)out, cap, "%s", def); return (uint32_t)strlen((char *)(uintptr_t)out); } return 0;
 }
 SH(GetPrivateProfileStringA) { return profile_get(A(0) ? STR(A(0)) : NULL, A(1) ? STR(A(1)) : NULL, A(2) ? STR(A(2)) : "", A(3), (uint32_t)A(4), A(5), 0); }
-SH(GetPrivateProfileIntA) { char tmp[128], def[32]; snprintf(def, sizeof def, "%d", (int)A(1)); profile_get(STR(A(0)), STR(A(2)), def, (uint64_t)(uintptr_t)tmp, sizeof tmp, A(3), 0); return (uint32_t)strtol(tmp, NULL, 0); }
+SH(GetPrivateProfileIntA) { char tmp[128], def[32]; snprintf(def, sizeof def, "%d", (int)A(2)); profile_get(STR(A(0)), STR(A(1)), def, (uint64_t)(uintptr_t)tmp, sizeof tmp, A(3), 0); return (uint32_t)strtol(tmp, NULL, 0); }
 SH(GetPrivateProfileSectionA) { return profile_get(STR(A(0)), NULL, NULL, A(1), (uint32_t)A(2), A(3), 1); }
 SH(GetPrivateProfileSectionNamesA) { return profile_get(NULL, NULL, NULL, A(0), (uint32_t)A(1), A(2), 0); }
 SH(WritePrivateProfileStringA) {
