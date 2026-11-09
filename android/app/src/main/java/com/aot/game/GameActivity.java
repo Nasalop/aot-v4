@@ -70,9 +70,13 @@ public final class GameActivity extends NativeActivity {
     }
 
 
-    private static native void nativeKey(int vk, int down);
-    private static native void nativeMouse(int kind, float x, float y);
-    private static native void nativeView(int w, int h);
+    private static native void nativeKey0(int vk, int down);
+    private static native void nativeMouse0(int kind, float x, float y);
+    private static native void nativeView0(int w, int h);
+    private static boolean nativesOk = true;
+    private static void nativeKey(int vk, int down) { if (nativesOk) try { nativeKey0(vk, down); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
+    private static void nativeMouse(int kind, float x, float y) { if (nativesOk) try { nativeMouse0(kind, x, y); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
+    private static void nativeView(int w, int h) { if (nativesOk) try { nativeView0(w, h); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
 
     /** Generic on-screen controller: left stick = W/A/S/D, round buttons = keys, any other touch = mouse (1st finger left click, 2nd right click). */
     private static final class ControlsView extends View {
@@ -133,8 +137,13 @@ public final class GameActivity extends NativeActivity {
 
     @Override
     protected void onCreate(Bundle state) {
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
+            try { File d = getExternalFilesDir(null); if (d != null) { java.io.PrintWriter w = new java.io.PrintWriter(new File(d, "java_crash.txt")); ex.printStackTrace(w); w.close(); } } catch (Throwable ignored) { }
+            if (prev != null) prev.uncaughtException(th, ex);
+        });
         super.onCreate(state);
-        addControls();
+        try { getWindow().getDecorView().post(this::addControls); } catch (Throwable t) { android.util.Log.w("aotgame", "controls overlay skipped: " + t); }
         boolean bundled = false;
         try (InputStream in = getAssets().open("game.exe")) { bundled = true; } catch (Exception ignored) { }
         bundledMode = bundled;
