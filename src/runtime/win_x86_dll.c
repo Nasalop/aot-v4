@@ -225,7 +225,7 @@ S(dsound_create) {   /* DirectSoundCreate8 / EAXDirectSoundCreate (guid, IDirect
 
 /* ---- DirectInput8: objects open successfully (the game requires keyboard+mouse devices to finish creating its render device) but
  * report NO input: GetDeviceState returns zeroes, GetDeviceData returns 0 events. Android touch/key input is not wired to them yet. ---- */
-typedef struct { uint32_t vt; int ref; int kind; } DIDev;   /* kind 1 = keyboard, 2 = mouse */
+typedef struct { uint32_t vt; int ref; int kind; uint32_t seq; uint8_t prev[256]; } DIDev;   /* kind 1 = keyboard, 2 = mouse */
 static uint32_t di_vt, di_vt_dev;
 #define DIO(n) S(di_##n)
 DIO(QI) { uint32_t *o = P(2); if (!o) return 0x80004003u; *o = (uint32_t)A(0); ((DSObj *)P(0))->ref++; return 0; }
@@ -238,7 +238,18 @@ DIO(State) {   /* (this, cb, void *data): keyboard = 256 DIK bytes; mouse = DIMO
   if (dv->kind == 1) { uint8_t k[256]; aot_input_dik(k); memcpy(o, k, cb < 256 ? cb : 256); }
   else if (dv->kind == 2 && cb >= 16) { int32_t dx, dy; uint8_t b[3]; aot_input_dimouse(&dx, &dy, b); ((int32_t *)o)[0] = dx; ((int32_t *)o)[1] = dy; o[12] = b[0]; o[13] = b[1]; o[14] = b[2]; }
   return 0; }
-DIO(Data) { if (P(3)) *(uint32_t *)P(3) = 0; return 0; }
+DIO(Data) {   /* (this, cbObjectData, DIDEVICEOBJECTDATA*, DWORD *inout, flags): buffered events = changes since the last read */
+  DIDev *dv = P(0); uint32_t cbo = (uint32_t)A(1), *cnt = P(3), cap = cnt ? *cnt : 0, flags = (uint32_t)A(4), n = 0; uint8_t *out = P(2);
+  if (!cnt) return 0x80070057u; if (cbo < 16) cbo = 20;
+  uint8_t cur[256] = {0}; uint32_t ofs[256], nofs = 0; int32_t dx = 0, dy = 0;
+  if (dv->kind == 1) { aot_input_dik(cur); for (uint32_t i = 0; i < 256; i++) ofs[nofs++] = i; }
+  else if (dv->kind == 2) { uint8_t b[3]; aot_input_dimouse(&dx, &dy, b); for (int i = 0; i < 3; i++) { cur[i] = b[i]; ofs[nofs++] = 12 + i; } }
+  uint8_t nxt[256]; memcpy(nxt, dv->prev, 256); struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint32_t tick = (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+  #define EV(o, v) do { if (n < cap && out) { uint32_t *e = (uint32_t *)(out + n * cbo); memset(e, 0, cbo); e[0] = (o); e[1] = (uint32_t)(v); e[2] = tick; e[3] = ++dv->seq; } n++; } while (0)
+  if (dv->kind == 2) { if (dx) EV(0, dx); if (dy) EV(4, dy); }
+  for (uint32_t k = 0; k < nofs; k++) { uint32_t idx = k; if (cur[idx] == dv->prev[idx]) continue; if (!out) { nxt[idx] = cur[idx]; continue; } if (n >= cap) break; EV(ofs[k], cur[idx]); nxt[idx] = cur[idx]; }
+  if (!(flags & 1)) memcpy(dv->prev, nxt, 256);   /* DIGDD_PEEK leaves the buffer intact */
+  *cnt = out ? (n < cap ? n : cap) : 0; return 0; }
 DIO(CreateDevice) {
   uint32_t *out = P(2); if (!out) return 0x80070057u; DIDev *d = aot_gcalloc(1, sizeof *d); if (!d) return 0x8007000Eu; { const uint32_t *g = P(1); d->kind = g && g[0] == 0x6F1D2B61u ? 1 : g && g[0] == 0x6F1D2B60u ? 2 : 0; }
   d->vt = di_vt_dev; d->ref = 1; *out = (uint32_t)(uintptr_t)d; return 0; }
