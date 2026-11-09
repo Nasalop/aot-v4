@@ -151,6 +151,26 @@ void aot_input_mouse(int kind, float x, float y) {   /* kind: 0 move, 1 left dow
 void aot_input_key(int vk, int down) { if (vk < 0 || vk > 255) return; keys[vk] = (uint8_t)down; post(HWND_BASE, down ? WM_KEYDOWN : WM_KEYUP, (uint64_t)vk, down ? 1 : 0xC0000001u); }
 void aot_input_quit(void) { quit_posted = 1; post(HWND_BASE, WM_QUIT, 0, 0); }
 
+
+/* ---- DirectInput feed (keyboard scancodes, relative mouse) for the dinput8 shim in win_x86_dll.c ---- */
+static uint8_t vk2dik[256];
+static void dik_init(void) {
+  if (vk2dik['A']) return;
+  const char *r1 = "QWERTYUIOP", *r2 = "ASDFGHJKL", *r3 = "ZXCVBNM";
+  for (int i = 0; r1[i]; i++) vk2dik[(int)r1[i]] = (uint8_t)(16 + i);
+  for (int i = 0; r2[i]; i++) vk2dik[(int)r2[i]] = (uint8_t)(30 + i);
+  for (int i = 0; r3[i]; i++) vk2dik[(int)r3[i]] = (uint8_t)(44 + i);
+  for (int i = 0; i < 9; i++) vk2dik['1' + i] = (uint8_t)(2 + i);
+  vk2dik['0'] = 11; vk2dik[0x1B] = 1; vk2dik[0x08] = 14; vk2dik[0x09] = 15; vk2dik[0x0D] = 28; vk2dik[0x11] = 29; vk2dik[0x10] = 42; vk2dik[0x12] = 56; vk2dik[0x20] = 57;
+  for (int i = 0; i < 10; i++) vk2dik[0x70 + i] = (uint8_t)(59 + i);
+  vk2dik[0x7A] = 87; vk2dik[0x7B] = 88; vk2dik[0x26] = 200; vk2dik[0x25] = 203; vk2dik[0x27] = 205; vk2dik[0x28] = 208; vk2dik[0x24] = 199; vk2dik[0x23] = 207;
+  vk2dik[0x21] = 201; vk2dik[0x22] = 209; vk2dik[0x2D] = 210; vk2dik[0x2E] = 211;
+}
+void aot_input_dik(uint8_t out[256]) { dik_init(); memset(out, 0, 256); for (int v = 3; v < 256; v++) if (keys[v] && vk2dik[v]) out[vk2dik[v]] = 0x80; }
+void aot_input_dimouse(int32_t *dx, int32_t *dy, uint8_t b[3]) {
+  static int32_t lx, ly; static int have; int32_t x = mx, y = my;
+  *dx = have ? x - lx : 0; *dy = have ? y - ly : 0; lx = x; ly = y; have = 1; b[0] = keys[1] ? 0x80 : 0; b[1] = keys[2] ? 0x80 : 0; b[2] = keys[4] ? 0x80 : 0;
+}
 /* ---- XInput ---- */
 static AotPad pad; static int pad_on; static uint32_t pad_packet;
 void aot_input_pad(const AotPad *p) { if (!p) { pad_on = 0; return; } if (!pad_on || memcmp(&pad, p, sizeof pad)) pad_packet++; pad = *p; pad_on = 1; }
