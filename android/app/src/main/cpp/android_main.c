@@ -1,11 +1,9 @@
 /* NativeActivity host. Game modes (AOT_ANDROID_APP): extract game.exe, redirect stdout/stderr to <ext>/log.txt, run the
  * recompiled game on a thread and feed touch/keyboard/gamepad input to the Win32 layer. Otherwise: idle host for the Java UI. */
-#include <jni.h>
-#include <android/native_window.h>
-#include <android/asset_manager.h>
 #include <android_native_app_glue.h>
 #ifdef AOT_ANDROID_APP
 #include <android/log.h>
+#include <jni.h>
 #include <android/input.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -112,6 +110,10 @@ static int32_t on_input(struct android_app *app, AInputEvent *e) {
   }
   return 0;
 }
+/* Called by the Java on-screen controller overlay (GameActivity.ControlsView). */
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeKey(JNIEnv *env, jclass cls, jint vk, jint down) { (void)env; (void)cls; aot_input_key(vk, down); }
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeMouse(JNIEnv *env, jclass cls, jint kind, jfloat x, jfloat y) { (void)env; (void)cls; aot_input_mouse(kind, x, y); }
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeView(JNIEnv *env, jclass cls, jint w, jint h) { (void)env; (void)cls; aot_input_view((uint32_t)w, (uint32_t)h); }
 static void on_cmd(struct android_app *app, int32_t cmd) {
   if (cmd == APP_CMD_INIT_WINDOW) aot_android_set_window(app->window);
   else if (cmd == APP_CMD_TERM_WINDOW) aot_android_set_window(NULL);
@@ -119,7 +121,7 @@ static void on_cmd(struct android_app *app, int32_t cmd) {
 }
 void android_main(struct android_app *app) {
   g_app = app; app->onAppCmd = on_cmd; app->onInputEvent = on_input;
-  //android_app_set_motion_event_filter(app, NULL);   /* deliver joystick axes as well as touch */
+  android_app_set_motion_event_filter(app, NULL);   /* deliver joystick axes as well as touch */
   pthread_t th; pthread_create(&th, NULL, game_thread, NULL);
   for (;;) { int ev; struct android_poll_source *src;
     while (ALooper_pollAll(100, NULL, &ev, (void **)&src) >= 0) { if (src) src->process(app, src); if (app->destroyRequested) return; } }
