@@ -19,7 +19,7 @@ typedef struct { uint64_t hwnd, wparam, lparam; uint32_t msg, time; int32_t x, y
 #define QN 512
 static Msg q[QN]; static int qh, qt;
 static pthread_mutex_t M = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t QC = PTHREAD_COND_INITIALIZER;
-static uint8_t keys[256]; static int32_t mx, my; static uint32_t view_w = 1, view_h = 1; static int quit_posted; static uint32_t shown;
+static uint8_t keys[256]; static int32_t mx, my; static uint32_t view_w = 1, view_h = 1; static int view_known; static int quit_posted; static uint32_t shown;
 static uint32_t now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000); }
 static void post(uint64_t hwnd, uint32_t msg, uint64_t w, uint64_t l) {
   pthread_mutex_lock(&M); int n = (qt + 1) % QN;
@@ -139,16 +139,29 @@ SYS(RegisterWindowMessage) { return 0xC100; }
 SYS(GetMessageTime) { return now_ms(); }
 SYS(BeginPaint) { if (A(1)) memset((void *)(uintptr_t)A(1), 0, 72); return 1; }
 
-void aot_input_view(uint32_t w, uint32_t h) { view_w = w ? w : 1; view_h = h ? h : 1; }
+void aot_input_view(uint32_t w, uint32_t h) {
+  static int logged; view_w = w ? w : 1; view_h = h ? h : 1; view_known = (w && h) != 0;
+  if (view_known && !logged++) fprintf(stderr, "[in] surface size %ux%u (touch coordinates are scaled into the client area)\n", w, h);
+}
 void aot_input_mouse(int kind, float x, float y) {   /* kind: 0 move, 1 left down, 2 left up, 3 right down, 4 right up */
+  if (kind < 0 || kind > 4) { fprintf(stderr, "[in] mouse: rejected event kind %d\n", kind); return; }
   uint32_t cw, ch; aot_win_client_size(&cw, &ch);
-  mx = (int32_t)(x * (float)cw / (float)view_w); my = (int32_t)(y * (float)ch / (float)view_h);
+  /* Without a reported surface size the incoming coordinates are already surface pixels; scaling them
+     by client/1 put every tap thousands of pixels off-screen, so a press that should hit a button missed. */
+  if (view_known) { mx = (int32_t)(x * (float)cw / (float)view_w); my = (int32_t)(y * (float)ch / (float)view_h); }
+  else { mx = (int32_t)x; my = (int32_t)y; }
   uint64_t lp = (uint64_t)(uint16_t)mx | ((uint64_t)(uint16_t)my << 16), wp = (keys[1] ? 1 : 0) | (keys[2] ? 2 : 0);
   static const uint32_t mm[] = { WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP };
   if (kind == 1) { keys[1] = 1; wp |= 1; } else if (kind == 2) { keys[1] = 0; wp &= ~1ull; } else if (kind == 3) { keys[2] = 1; wp |= 2; } else if (kind == 4) { keys[2] = 0; wp &= ~2ull; }
   post(HWND_BASE, mm[kind], wp, lp);
+  { static int n; if (n++ < 300) fprintf(stderr, "[in] mouse kind=%d raw=(%.1f,%.1f) -> (%d,%d) view=%ux%u known=%d client=%ux%u msg=%#x\n",
+      kind, x, y, mx, my, view_w, view_h, view_known, cw, ch, mm[kind]); }
 }
-void aot_input_key(int vk, int down) { if (vk < 0 || vk > 255) return; keys[vk] = (uint8_t)down; post(HWND_BASE, down ? WM_KEYDOWN : WM_KEYUP, (uint64_t)vk, down ? 1 : 0xC0000001u); }
+void aot_input_key(int vk, int down) {
+  if (vk < 0 || vk > 255) { fprintf(stderr, "[in] key: rejected vk=%d\n", vk); return; }
+  keys[vk] = (uint8_t)down; post(HWND_BASE, down ? WM_KEYDOWN : WM_KEYUP, (uint64_t)vk, down ? 1 : 0xC0000001u);
+  { static int n; if (n++ < 300) fprintf(stderr, "[in] key vk=%d (%#x) down=%d\n", vk, (unsigned)vk, down); }
+}
 void aot_input_quit(void) { quit_posted = 1; post(HWND_BASE, WM_QUIT, 0, 0); }
 
 
@@ -166,10 +179,16 @@ static void dik_init(void) {
   vk2dik[0x7A] = 87; vk2dik[0x7B] = 88; vk2dik[0x26] = 200; vk2dik[0x25] = 203; vk2dik[0x27] = 205; vk2dik[0x28] = 208; vk2dik[0x24] = 199; vk2dik[0x23] = 207;
   vk2dik[0x21] = 201; vk2dik[0x22] = 209; vk2dik[0x2D] = 210; vk2dik[0x2E] = 211;
 }
-void aot_input_dik(uint8_t out[256]) { dik_init(); memset(out, 0, 256); for (int v = 3; v < 256; v++) if (keys[v] && vk2dik[v]) out[vk2dik[v]] = 0x80; }
+void aot_input_dik(uint8_t out[256]) {
+  dik_init(); memset(out, 0, 256); for (int v = 3; v < 256; v++) if (keys[v] && vk2dik[v]) out[vk2dik[v]] = 0x80;
+  { static int n; if (n++ < 150) { int down = 0; for (int i = 0; i < 256; i++) if (out[i]) down++;
+      fprintf(stderr, "[in] GetDeviceState(keyboard): %d key(s) reported down\n", down); } }
+}
 void aot_input_dimouse(int32_t *dx, int32_t *dy, uint8_t b[3]) {
   static int32_t lx, ly; static int have; int32_t x = mx, y = my;
   *dx = have ? x - lx : 0; *dy = have ? y - ly : 0; lx = x; ly = y; have = 1; b[0] = keys[1] ? 0x80 : 0; b[1] = keys[2] ? 0x80 : 0; b[2] = keys[4] ? 0x80 : 0;
+  { static int n; if (n++ < 150) fprintf(stderr, "[in] GetDeviceState/GetDeviceData(mouse): pos=(%d,%d) delta=(%d,%d) buttons=%02x%02x%02x\n",
+      x, y, *dx, *dy, b[0], b[1], b[2]); }
 }
 /* ---- XInput ---- */
 static AotPad pad; static int pad_on; static uint32_t pad_packet;

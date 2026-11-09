@@ -291,16 +291,22 @@ F(d_createblendstate) {
   const uint8_t *target = desc + 8;
   uint32_t blend_enable = LD(uint32_t, target);
   uint32_t write_mask = target[28];
-  if (alpha_to_coverage || independent_blend || write_mask != 0x0f)
+  if (alpha_to_coverage || independent_blend || write_mask != 0x0f) {
+    fprintf(stderr, "[d3d10] CreateBlendState rejected: alphaToCoverage=%u independentBlend=%u renderTargetWriteMask=%#x\n", alpha_to_coverage, independent_blend, write_mask);
     return E_NOTIMPL;
+  }
   if (blend_enable &&
       (LD(uint32_t, target + 4) != 5u ||
        LD(uint32_t, target + 8) != 6u ||
        LD(uint32_t, target + 12) != 1u ||
        LD(uint32_t, target + 16) != 2u ||
        LD(uint32_t, target + 20) != 6u ||
-       LD(uint32_t, target + 24) != 1u))
+       LD(uint32_t, target + 24) != 1u)) {
+    fprintf(stderr, "[d3d10] CreateBlendState rejected: src=%u dst=%u op=%u alphaSrc=%u alphaDst=%u alphaOp=%u (this darkens anything drawn with a non-standard blend)\n",
+        LD(uint32_t, target + 4), LD(uint32_t, target + 8), LD(uint32_t, target + 12),
+        LD(uint32_t, target + 16), LD(uint32_t, target + 20), LD(uint32_t, target + 24));
     return E_NOTIMPL;
+  }
   Obj *state = mkv(K_BLEND, (Obj *)A(0));
   if (!state) return E_FAIL;
   memcpy(state->blend_desc, desc, sizeof state->blend_desc);
@@ -325,8 +331,13 @@ F(d_createrasterizerstate) {
   if (fill_mode != 3u || cull_mode < 1u || cull_mode > 3u ||
       LD(int32_t, desc + 12) != 0 || LD(float, desc + 16) != 0.0f ||
       LD(float, desc + 20) != 0.0f || !depth_clip || multisample ||
-      antialiased_line)
+      antialiased_line) {
+    fprintf(stderr, "[d3d10] CreateRasterizerState rejected: fill=%u cull=%u frontCCW=%u depthBias=%d slope=%.3f clamp=%.3f depthClip=%u scissor=%u msaa=%u aaLine=%u\n",
+        fill_mode, cull_mode, front_counter_clockwise, LD(int32_t, desc + 12),
+        (double)LD(float, desc + 16), (double)LD(float, desc + 20),
+        depth_clip, scissor_enable, multisample, antialiased_line);
     return E_NOTIMPL;
+  }
   Obj *state = mkv(K_RASTERIZER, (Obj *)A(0));
   if (!state) return E_FAIL;
   memcpy(state->rasterizer_desc, desc, sizeof state->rasterizer_desc);
@@ -359,6 +370,8 @@ F(d_createinputlayout) {
     if (!LDP(element) || !format ||
         slot >= AOT_GFX_MAX_VERTEX_STREAMS || slot_class != 0 ||
         step_rate != 0 || offset > 4096 || size > 4096 - offset) {
+      fprintf(stderr, "[d3d10] CreateInputLayout rejected: element %u semantic=%p format=%u slot=%u slotClass=%u stepRate=%u offset=%u vertexSize=%u\n",
+          i, (void *)(uintptr_t)LDP(element), LD(uint32_t, element + 12 + eo), slot, slot_class, step_rate, offset, size);
       release_obj(layout);
       return E_NOTIMPL;
     }
@@ -376,7 +389,7 @@ F(d_checkmsaa) { ST(uint32_t, A(3), (uint32_t)A(2) == 1 ? 1 : 0); return S_OK; }
 
 /* ---- context ---- */
 F(x_setrts) { Obj *x = (Obj *)A(0); x->cur_rtv = ((uint32_t)A(1) && A(2)) ? LD(Obj *, A(2)) : NULL; return 0; }
-F(x_clearrtv) { Obj *v = (Obj *)A(1); memcpy(v->res->clear, (void *)A(2), 16); return 0; }
+F(x_clearrtv) { Obj *v = (Obj *)A(1); memcpy(v->res->clear, (void *)A(2), 16); { static int n; if (n++ < 60) { const float *f = (const float *)A(2); fprintf(stderr, "[d3d10] ClearRenderTargetView colour=(%.3f,%.3f,%.3f,%.3f)\n", f[0], f[1], f[2], f[3]); } } return 0; }
 F(x_nop) { return 0; }
 static int set_binding(Obj **slot, Obj *value, Kind expected) {
   if (value && value->kind != expected) {

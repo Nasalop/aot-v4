@@ -73,10 +73,31 @@ public final class GameActivity extends NativeActivity {
     private static native void nativeKey0(int vk, int down);
     private static native void nativeMouse0(int kind, float x, float y);
     private static native void nativeView0(int w, int h);
-    private static boolean nativesOk = true;
-    private static void nativeKey(int vk, int down) { if (nativesOk) try { nativeKey0(vk, down); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
-    private static void nativeMouse(int kind, float x, float y) { if (nativesOk) try { nativeMouse0(kind, x, y); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
-    private static void nativeView(int w, int h) { if (nativesOk) try { nativeView0(w, h); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
+    /** Diagnostics: logcat plus aot_java_log.txt in the same folder as aot_log.txt, so overlay and input
+     *  failures are in the captured log instead of only in logcat. */
+    private static volatile String jlogPath;
+    private static final java.util.concurrent.atomic.AtomicInteger jlogCount = new java.util.concurrent.atomic.AtomicInteger();
+    private static void jlog(String msg) {
+        android.util.Log.w("aotgame", msg);
+        if (jlogCount.incrementAndGet() > 600) return;
+        String path = jlogPath; if (path == null) return;
+        try (FileOutputStream out = new FileOutputStream(path, true)) { out.write((msg + "\n").getBytes("UTF-8")); } catch (Throwable ignored) { }
+    }
+    private void prepareLog() {
+        try {
+            File ext = getExternalFilesDir(null);
+            String dir = null;
+            File pointer = ext == null ? null : new File(ext, "game_dir.txt");
+            if (pointer != null && pointer.isFile()) { try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(pointer))) { dir = br.readLine(); } }
+            if (dir == null || dir.isEmpty()) dir = ext == null ? null : ext.getAbsolutePath();
+            if (dir != null) jlogPath = dir + "/aot_java_log.txt";
+        } catch (Throwable ignored) { }
+    }
+    /* One failing native call used to latch a shared flag and permanently disable keyboard, mouse and
+       view forwarding (the game then looks like it "reverted to no controls").  Report every failure. */
+    private static void nativeKey(int vk, int down) { try { nativeKey0(vk, down); } catch (Throwable t) { jlog("input: nativeKey vk=" + vk + " down=" + down + " failed: " + t); } }
+    private static void nativeMouse(int kind, float x, float y) { try { nativeMouse0(kind, x, y); } catch (Throwable t) { jlog("input: nativeMouse kind=" + kind + " failed: " + t); } }
+    private static void nativeView(int w, int h) { try { nativeView0(w, h); } catch (Throwable t) { jlog("input: nativeView failed: " + t); } }
 
     /** Text-only on-screen controller. Left stick = W/A/S/D; labelled round buttons = keys; "KB" opens a typing keyboard; any other touch = mouse
      *  (1st finger left click/drag, 2nd finger right click). Everything is drawn with plain text and circles/rectangles, nothing is loaded. */
@@ -107,7 +128,7 @@ public final class GameActivity extends NativeActivity {
             kb.add(new Btn("ESC", 0x1B, 0.5f - 5.2f * 0.075f, 0.52f, 0.04f, 0.05f, false));
         }
         private float radius() { return Math.min(getWidth(), getHeight()) * 0.065f; }
-        @Override protected void onSizeChanged(int w, int h, int ow, int oh) { nativeView(w, h); }
+        @Override protected void onSizeChanged(int w, int h, int ow, int oh) { nativeView(w, h); jlog("controls view size " + w + "x" + h); }
         private boolean inside(Btn b, float x, float y) { return Math.abs(x - b.cx * getWidth()) <= b.hw * getWidth() && Math.abs(y - b.cy * getHeight()) <= b.hh * getHeight(); }
         private java.util.List<Btn> active() { return kbToggle.on ? kb : game; }
         private Btn hit(float x, float y) {
@@ -125,6 +146,7 @@ public final class GameActivity extends NativeActivity {
                 int a = e.getActionMasked(), i = e.getActionIndex(), id = e.getPointerId(i);
                 if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
                     float x = e.getX(i), y = e.getY(i); Btn b = hit(x, y);
+                    jlog("touch down " + (int) x + "," + (int) y + " -> " + (b == null ? "mouse" : b.label.replace('\n', ' ')));
                     if (b == kbToggle) { releaseAll(); kbToggle.on = !kbToggle.on; }
                     else if (b != null) { b.ptr = id; if (b.sticky) { b.on = !b.on; nativeKey(b.vk, b.on ? 1 : 0); } else nativeKey(b.vk, 1); }
                     else if (!kbToggle.on && x < getWidth() * 0.30f && y > getHeight() * 0.35f && stickPtr < 0) { stickPtr = id; sx = x; sy = y; stick(x, y); }
@@ -141,7 +163,7 @@ public final class GameActivity extends NativeActivity {
                     if (id == rightPtr || cancel) { if (rightPtr >= 0) nativeMouse(4, x, y); rightPtr = -1; }
                 }
                 invalidate();
-            } catch (Throwable t) { android.util.Log.w("aotgame", "controls: " + t); }
+            } catch (Throwable t) { jlog("controls touch: " + t); }
             return true;
         }
         private void drawBtn(Canvas c, Btn b, float w, float h, boolean pressed) {
@@ -163,13 +185,13 @@ public final class GameActivity extends NativeActivity {
                     p.setColor(0xFFFFFFFF); p.setTextAlign(Paint.Align.CENTER); p.setTextSize(r * 0.42f); c.drawText("STICK = W A S D", bx, by + r * 2.4f, p);
                     c.drawText("touch anywhere else = mouse (2nd finger = right click)", w * 0.5f, h * 0.97f, p);
                 }
-            } catch (Throwable t) { android.util.Log.w("aotgame", "controls draw: " + t); }
+            } catch (Throwable t) { jlog("controls draw: " + t); }
         }
     }
 
     private void addControls() {
-        try { addContentView(new ControlsView(this), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)); }
-        catch (Throwable t) { android.util.Log.w("aotgame", "controls overlay unavailable: " + t); }
+        try { addContentView(new ControlsView(this), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)); jlog("controls overlay attached"); }
+        catch (Throwable t) { jlog("controls overlay unavailable: " + t); }
     }
 
     @Override
@@ -181,7 +203,8 @@ public final class GameActivity extends NativeActivity {
             if (prev != null) prev.uncaughtException(th, ex);
         });
         super.onCreate(state);
-        try { getWindow().getDecorView().post(this::addControls); } catch (Throwable t) { android.util.Log.w("aotgame", "controls overlay skipped: " + t); }
+        prepareLog();
+        try { getWindow().getDecorView().post(this::addControls); } catch (Throwable t) { jlog("controls overlay skipped: " + t); }
         boolean bundled = false;
         try (InputStream in = getAssets().open("game.exe")) { bundled = true; } catch (Exception ignored) { }
         bundledMode = bundled;

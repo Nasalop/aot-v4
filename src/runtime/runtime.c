@@ -81,9 +81,11 @@ static void bind_thunks(uint8_t *img, const char *dll, uint32_t oft,
     t->pop = t->fp = 0;
     t->fn = aot_is_pe32 ? aot_x86_resolve(dll, nm, &t->pop, &t->fp) : aot_resolve_import(dll, nm);
     snprintf(t->name, sizeof t->name, "%.72s!%.80s", dll, nm);
-    if (!t->fn && verbose)
+    /* Always reported: a missing import or a placeholder shim is exactly the kind of silent stub that
+       makes the game misbehave with no error in the log, so it must not need AOT_VERBOSE to be seen. */
+    if (!t->fn)
       fprintf(stderr, "[aot] missing import %s\n", t->name);
-    else if (t->fn && verbose && aot_import_is_placeholder(dll, nm))
+    else if (aot_import_is_placeholder(dll, nm))
       fprintf(stderr, "[aot] import uses placeholder shim %s\n", t->name);
     uint64_t address = THUNK_BASE + (uint64_t)nthunks * THUNK_SZ;
     nthunks++;

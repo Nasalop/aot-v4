@@ -167,12 +167,33 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
       if (si < 0) { fprintf(stderr, "[dxvk] too many concurrent maps on one resource\n"); break; }
       void *g = aot_gmalloc(sz); if (!g) { fprintf(stderr, "[dxvk] Map: out of low memory for %zu bytes\n", sz); break; }
       if (q->type != 4) memcpy(g, hp, sz); else memset(g, 0, sz);
+      { static int mn; if (mn++ < 150) fprintf(stderr, "[dxvk] %s::%s mapped %zu bytes subresource=%#x map_type=%d pitfall=none\n", pi->name, m->name, sz, q->sub, q->type); }
       o->sh[si] = (Shadow){ g, hp, sz, q->sub, q->type };
       uint32_t *gs = (uint32_t *)(uintptr_t)q->g; if (q->kind == 'M') gs[0] = (uint32_t)(uintptr_t)g; else { gs[0] = (uint32_t)(uintptr_t)g; gs[1] = LD(uint32_t, h + 8); if (q->kind == 'U') gs[2] = LD(uint32_t, h + 12); }
       break; }
     }
   }
   (void)ok;
+  /* Colour tracing: a surface that should be white coming out grey has to be a clear value, a blend term
+     or a texture with the wrong contents, and none of those appear in DXVK's own log.  Record them here
+     (bounded, and only for addresses in guest range, like the FAILED-hr log above). */
+  if (!strcmp(m->name, "ClearRenderTargetView")) {
+    static int cn; uint32_t p = (uint32_t)A(2);
+    if (cn++ < 80 && p > 0x10000 && p < 0x80000000u) { const float *f = (const float *)(uintptr_t)p;
+      fprintf(stderr, "[dxvk] ClearRenderTargetView rt=%#x colour=(%.3f,%.3f,%.3f,%.3f)\n", (unsigned)A(1), f[0], f[1], f[2], f[3]); }
+  } else if (!strcmp(m->name, "ClearDepthStencilView")) {
+    static int dn; uint32_t dp = (uint32_t)A(4);
+    if (dn++ < 40 && dp > 0x10000 && dp < 0x80000000u)
+      fprintf(stderr, "[dxvk] ClearDepthStencilView flags=%#x depth=%.3f stencil=%u\n", (unsigned)A(3), (double)((const float *)(uintptr_t)dp)[0], (unsigned)A(5));
+  } else if (!strcmp(m->name, "CreateBlendState")) {
+    static int bn; uint32_t p = (uint32_t)A(1);
+    if (bn++ < 40 && p > 0x10000 && p < 0x80000000u) { const uint8_t *d = (const uint8_t *)(uintptr_t)p;
+      fprintf(stderr, "[dxvk] CreateBlendState enable=%u src=%u dst=%u op=%u alphaSrc=%u alphaDst=%u alphaOp=%u writeMask=%#x independent=%u alphaToCoverage=%u\n",
+          LD(uint32_t, d + 8), LD(uint32_t, d + 12), LD(uint32_t, d + 16), LD(uint32_t, d + 20),
+          LD(uint32_t, d + 24), LD(uint32_t, d + 28), LD(uint32_t, d + 32), d[36], LD(uint32_t, d + 4), LD(uint32_t, d)); }
+  } else if (!strcmp(m->name, "OMSetBlendState")) {
+    static int sn; if (sn++ < 80) fprintf(stderr, "[dxvk] OMSetBlendState state=%#x sampleMask=%#x\n", (unsigned)A(1), (unsigned)A(3));
+  }
   if (m->name[0] == 'R' && !strcmp(m->name, "Release") && (uint32_t)r == 0) unwrap_dead(o);
   return m->ret ? (uint32_t)r : 0;
 }

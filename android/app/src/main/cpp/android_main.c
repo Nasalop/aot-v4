@@ -111,9 +111,9 @@ static int32_t on_input(struct android_app *app, AInputEvent *e) {
   return 0;
 }
 /* Called by the Java on-screen controller overlay (GameActivity.ControlsView). */
-JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeKey0(JNIEnv *env, jclass cls, jint vk, jint down) { (void)env; (void)cls; aot_input_key(vk, down); }
-JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeMouse0(JNIEnv *env, jclass cls, jint kind, jfloat x, jfloat y) { (void)env; (void)cls; aot_input_mouse(kind, x, y); }
-JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeView0(JNIEnv *env, jclass cls, jint w, jint h) { (void)env; (void)cls; aot_input_view((uint32_t)w, (uint32_t)h); }
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeKey0(JNIEnv *env, jclass cls, jint vk, jint down) { (void)env; (void)cls; { static int n; if (n++ < 200) LOG("overlay key vk=%d down=%d", vk, down); } aot_input_key(vk, down); }
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeMouse0(JNIEnv *env, jclass cls, jint kind, jfloat x, jfloat y) { (void)env; (void)cls; { static int n; if (n++ < 200) LOG("overlay mouse kind=%d at (%d,%d)", kind, (int)x, (int)y); } aot_input_mouse(kind, x, y); }
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeView0(JNIEnv *env, jclass cls, jint w, jint h) { (void)env; (void)cls; LOG("overlay view size %dx%d", w, h); aot_input_view((uint32_t)w, (uint32_t)h); }
 static void on_cmd(struct android_app *app, int32_t cmd) {
   if (cmd == APP_CMD_INIT_WINDOW) aot_android_set_window(app->window);
   else if (cmd == APP_CMD_TERM_WINDOW) aot_android_set_window(NULL);

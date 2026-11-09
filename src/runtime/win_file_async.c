@@ -35,6 +35,17 @@
 static int ev_tr(void) { static int t = -1; if (t < 0) t = getenv("AOT_TRACE_EV") != NULL; return t; }
 #include <sys/syscall.h>
 #define EVT(op, h) do { if (ev_tr()) fprintf(stderr, "[ev] t%ld %s %llx\n", (long)syscall(SYS_gettid), op, (unsigned long long)(h)); } while (0)
+/* Always-on, rate-limited event log: a stall has to be visible without AOT_TRACE_EV, because the
+   handle a guest thread is parked on is the only thing that identifies why it never woke. */
+static int ev_seen[8];
+static void ev_log(int slot, const char *op, uint64_t h, const char *extra) {
+  if (ev_seen[slot]++ < 200) fprintf(stderr, "[ev] %s %llx%s%s\n", op, (unsigned long long)h,
+      (extra && *extra) ? " " : "", extra ? extra : "");
+}
+static long ev_elapsed_ms(const struct timespec *t0) {
+  struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+  return (long)((t1.tv_sec - t0->tv_sec) * 1000 + (t1.tv_nsec - t0->tv_nsec) / 1000000);
+}
 #define OPERATION_CAPACITY 128
 
 typedef struct {
@@ -141,6 +152,7 @@ int aot_win_async_close_handle(uint64_t value) {
     aot_last_error = ERROR_INVALID_HANDLE;
     return -1;
   }
+  ev_log(4, "close", value, NULL);
   event->open = 0;
   pthread_cond_broadcast(&async_condition);
   pthread_mutex_unlock(&async_mutex);
@@ -172,6 +184,9 @@ static void *run_operation(void *argument) {
       operation->error ? operation->error : 0, operation->bytes);
   EventHandle *event = get_event(operation->event_value);
   if (event) event->signaled = 1;
+  { char b[96]; snprintf(b, sizeof b, "bytes=%u error=%u event=%s%s", operation->bytes, operation->error,
+      event ? "signalled" : "none", operation->event_value ? "" : " (no overlapped event)");
+    ev_log(7, "complete", operation->event_value, b); }
   pthread_cond_broadcast(&async_condition);
   int fd = operation->fd;
   operation->fd = -1;
@@ -245,7 +260,10 @@ static uint64_t start_operation(CPU *c, int writing) {
     .active = 1
   };
   set_overlapped_status(overlapped, STATUS_PENDING, 0);
-  if (event_value) get_event(event_value)->signaled = 0;
+  /* The event in OVERLAPPED belongs to the guest.  Win32 keeps a manual-reset event signalled until
+     ResetEvent, and even an auto-reset event only clears when a wait consumes it, so clearing it here
+     let a second outstanding request destroy the completion of the first: the waiter then blocked in
+     WaitForSingleObject(INFINITE) on an event that would never be set again.  Never clear it for the guest. */
   pthread_mutex_unlock(&async_mutex);
 
   pthread_t thread;
@@ -285,6 +303,7 @@ uint64_t aot_file_async_CreateEventA(CPU *c) {
   uint64_t value = install_event((int)ARG(1), (int)ARG(2));
   pthread_mutex_unlock(&async_mutex); if (ev_tr()) fprintf(stderr, "[ev] create %llx manual=%d init=%d\n", (unsigned long long)value, (int)ARG(1), (int)ARG(2));
   if (value) aot_last_error = 0;
+  { char b[64]; snprintf(b, sizeof b, "manual=%d init=%d", (int)ARG(1), (int)ARG(2)); ev_log(0, "create", value, b); }
   return value;
 }
 
@@ -294,7 +313,7 @@ uint64_t aot_file_async_CreateEventW(CPU *c) {
 
 void aot_wd_set(uint64_t h);
 uint64_t aot_file_async_SetEvent(CPU *c) {
-  aot_wd_set(ARG(0)); EVT("set", ARG(0));
+  aot_wd_set(ARG(0)); EVT("set", ARG(0)); ev_log(1, "set", ARG(0), NULL);
   pthread_mutex_lock(&async_mutex);
   EventHandle *event = get_event(ARG(0));
   if (!event) {
@@ -310,7 +329,7 @@ uint64_t aot_file_async_SetEvent(CPU *c) {
 }
 
 uint64_t aot_file_async_ResetEvent(CPU *c) {
-  EVT("reset", ARG(0));
+  EVT("reset", ARG(0)); ev_log(2, "reset", ARG(0), NULL);
   pthread_mutex_lock(&async_mutex);
   EventHandle *event = get_event(ARG(0));
   if (!event) {
@@ -334,6 +353,7 @@ uint64_t aot_file_async_PulseEvent(CPU *c) {
   }
   /* A pulse is observed only by threads already waiting.  The generation
      change remains visible to those waiters after the signaled bit resets. */
+  ev_log(3, "pulse", ARG(0), NULL);
   event->pulse_generation++;
   event->signaled = 1;
   pthread_cond_broadcast(&async_condition);
@@ -346,6 +366,7 @@ uint64_t aot_file_async_PulseEvent(CPU *c) {
 uint64_t aot_file_async_WaitForSingleObject(CPU *c) {
   uint64_t value = ARG(0);
   uint32_t timeout = (uint32_t)ARG(1);
+  struct timespec wbeg; clock_gettime(CLOCK_MONOTONIC, &wbeg);
   if (timeout) EVT("wait", value);
   uint32_t pulse_generation = 0;
   int pulse_ready = 0;
@@ -364,6 +385,7 @@ uint64_t aot_file_async_WaitForSingleObject(CPU *c) {
     EventHandle *event = get_event(value);
     if (!event) {
       pthread_mutex_unlock(&async_mutex);
+      fprintf(stderr, "[ev] wait on invalid/closed event handle %llx -> WAIT_FAILED\n", (unsigned long long)value);
       aot_last_error = ERROR_INVALID_HANDLE;
       return WAIT_FAILED;
     }
@@ -378,6 +400,8 @@ uint64_t aot_file_async_WaitForSingleObject(CPU *c) {
     if (event->signaled) {
       if (!event->manual_reset) event->signaled = 0;
       pthread_mutex_unlock(&async_mutex);
+      { long ms = ev_elapsed_ms(&wbeg);
+        if (ms >= 2000) { char b[64]; snprintf(b, sizeof b, "satisfied after %ld ms (timeout=%#x)", ms, timeout); ev_log(6, "wait-long", value, b); } }
       aot_last_error = 0;
       return WAIT_OBJECT_0;
     }
