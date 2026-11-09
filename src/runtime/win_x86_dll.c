@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <time.h>
 #include "shims.h"
+#include "win_input.h"
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -224,16 +225,22 @@ S(dsound_create) {   /* DirectSoundCreate8 / EAXDirectSoundCreate (guid, IDirect
 
 /* ---- DirectInput8: objects open successfully (the game requires keyboard+mouse devices to finish creating its render device) but
  * report NO input: GetDeviceState returns zeroes, GetDeviceData returns 0 events. Android touch/key input is not wired to them yet. ---- */
+typedef struct { uint32_t vt; int ref; int kind; } DIDev;   /* kind 1 = keyboard, 2 = mouse */
 static uint32_t di_vt, di_vt_dev;
 #define DIO(n) S(di_##n)
 DIO(QI) { uint32_t *o = P(2); if (!o) return 0x80004003u; *o = (uint32_t)A(0); ((DSObj *)P(0))->ref++; return 0; }
 DIO(AddRef) { return (uint32_t)++((DSObj *)P(0))->ref; }
 DIO(Release) { DSObj *o = P(0); return (uint32_t)(o->ref > 0 ? --o->ref : 0); }
 DIO(Ok) { return 0; }
-DIO(State) { static int n; note_once(&n, "dinput8: devices created; they report no input (touch/keys not mapped to DirectInput yet)"); if (P(2)) memset(P(2), 0, (uint32_t)A(1)); return 0; }
+DIO(State) {   /* (this, cb, void *data): keyboard = 256 DIK bytes; mouse = DIMOUSESTATE(2): lX,lY,lZ + buttons */
+  DIDev *dv = P(0); uint8_t *o = P(2); uint32_t cb = (uint32_t)A(1); if (!o) return 0x80070057u;
+  memset(o, 0, cb);
+  if (dv->kind == 1) { uint8_t k[256]; aot_input_dik(k); memcpy(o, k, cb < 256 ? cb : 256); }
+  else if (dv->kind == 2 && cb >= 16) { int32_t dx, dy; uint8_t b[3]; aot_input_dimouse(&dx, &dy, b); ((int32_t *)o)[0] = dx; ((int32_t *)o)[1] = dy; o[12] = b[0]; o[13] = b[1]; o[14] = b[2]; }
+  return 0; }
 DIO(Data) { if (P(3)) *(uint32_t *)P(3) = 0; return 0; }
 DIO(CreateDevice) {
-  uint32_t *out = P(2); if (!out) return 0x80070057u; DSObj *d = aot_gcalloc(1, sizeof *d); if (!d) return 0x8007000Eu;
+  uint32_t *out = P(2); if (!out) return 0x80070057u; DIDev *d = aot_gcalloc(1, sizeof *d); if (!d) return 0x8007000Eu; { const uint32_t *g = P(1); d->kind = g && g[0] == 0x6F1D2B61u ? 1 : g && g[0] == 0x6F1D2B60u ? 2 : 0; }
   d->vt = di_vt_dev; d->ref = 1; *out = (uint32_t)(uintptr_t)d; return 0; }
 static void di_init(void) {
   if (di_vt) return;
