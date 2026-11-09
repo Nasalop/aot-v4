@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 typedef uint64_t (*fn_t)(CPU *);
 #define ARGN(c, n) ((n) == 0 ? (c)->r[1] : (n) == 1 ? (c)->r[2] : (n) == 2 ? (c)->r[8] : (n) == 3 ? (c)->r[9] : LD(uint64_t, (c)->r[4] + 8 + 8 * (n)))
 #define A(n) ((uint32_t)ARGN(c, (n)))
@@ -138,16 +139,42 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     default: fprintf(stderr, "[dxvk] %s::%s is not supported by the 32->64 proxy\n", pi->name, m->name); return m->ret ? E_NOTIMPL_ : 0;
     }
   }
-  /* A D3D10 asynchronous GetData with DONOTFLUSH can only succeed once the queued work has reached the
-     GPU, and DXVK submits it on Present/Flush only.  The guest polls one query tens of thousands of times
-     per frame, so honouring the flag leaves it waiting for commands still sitting in the queue: drop the
-     bit and let DXVK make progress. */
+  /* AC1 spin-waits on a D3D10 query between frames: it polls GetData tens of thousands of times for one
+     result, and every poll with the queue not drained costs a host round trip and a queue submission, so
+     the wait costs far more than the frame it waits for.  After a short burst of polls, honour the wait
+     properly - ask again with a 1 ms sleep between asks - so the guest stops burning the CPU and the
+     queue stops being re-submitted thousands of times.
+     The guest's own flags are honoured for the polls it makes; only our wait flushes, at 60 Hz.  Forcing a
+     flush on every poll is what turned this into a submission storm that starved file reads (8 s per
+     512 KiB read). */
   int query_poll = !strcmp(m->name, "GetData") && m->n >= 3 && strstr(pi->name, "D3D10") != NULL;
-  if (query_poll) iv[3] &= ~1ull;
+  static struct { uint32_t guest; unsigned streak, waits, ready; } qw[8];
+  uint32_t poll_flags = query_poll ? (uint32_t)iv[3] : 0;
   uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
-  if (query_poll) { static unsigned polls, stalled;
+  if (query_poll) {
+    static unsigned polls, stalled;
     polls++; if (hr == 1u) stalled++;   /* S_FALSE: the result is not ready yet */
-    if (!(polls % 10000)) fprintf(stderr, "[dxvk] query polls: %u GetData calls, %u still S_FALSE\n", polls, stalled); }
+    int qi = -1;
+    for (int i = 0; i < 8; i++) if (qw[i].guest == A(0)) { qi = i; break; }
+    if (qi < 0) for (int i = 0; i < 8; i++) if (!qw[i].guest) { qi = i; qw[i].guest = A(0); break; }
+    if (qi >= 0) {
+      if (hr != 1u) { qw[qi].streak = 0; qw[qi].ready++; }
+      else if (++qw[qi].streak > 32) {   /* spin far enough that this is a real wait, not a poll */
+        for (int i = 0; i < 250 && hr == 1u; i++) {
+          usleep(1000);
+          iv[3] = (i & 15) ? 1ull : 0ull;   /* let the queue drain at most every 16 ms */
+          r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r;
+        }
+        iv[3] = poll_flags; qw[qi].waits++;
+        if (hr != 1u) { qw[qi].ready++; qw[qi].streak = 0; }
+        else qw[qi].streak = 32;   /* still not ready: wait again instead of re-spinning */
+        if (qw[qi].waits <= 8 || !(qw[qi].waits % 100))
+          fprintf(stderr, "[dxvk] query %#x: waited %u time(s) (%u polls, %u ready, last %s)\n",
+                  (unsigned)qw[qi].guest, qw[qi].waits, polls, qw[qi].ready, hr != 1u ? "ready" : "timed out");
+      }
+    }
+    if (!(polls % 10000)) fprintf(stderr, "[dxvk] query polls: %u GetData calls, %u still S_FALSE\n", polls, stalled);
+  }
   if (m->ret && (int32_t)hr < 0) {
     fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x args:", pi->name, m->name, hr);
     for (int i = 0; i < m->n && i < 6; i++) { uint32_t a = A(i + 1); fprintf(stderr, " %#x", a);
