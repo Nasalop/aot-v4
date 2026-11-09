@@ -254,10 +254,23 @@ S(bink_unavail) { static int n; note_once(&n, "binkw32: Bink video is not availa
 /* Bink videos are NOT decoded. The game's video player does not cope with BinkOpen failing (it still uploads a frame into textures
  * that only exist after a successful open), so BinkOpen returns a stub 64x64 clip that is already at its last frame: the player
  * sees "finished", no pixels are produced and intro/cut-scene movies are effectively skipped. */
-S(bink_open) { static int n; note_once(&n, "binkw32: Bink video is NOT decoded; movies open as an empty finished 64x64 clip (skipped)");
+static int bk_n;
+static void bk_trace(const char *n) { int k = __atomic_add_fetch(&bk_n, 1, __ATOMIC_RELAXED); if (k <= 60) { fflush(stdout); fprintf(stderr, "[aot] bink call #%d %s\n", k, n); } }
+S(bk_Close) { bk_trace("Close"); return 0; }
+S(bk_CopyToBuffer) { bk_trace("CopyToBuffer"); return 0; }
+S(bk_DoFrame) { bk_trace("DoFrame"); return 0; }
+S(bk_OpenDirectSound) { bk_trace("OpenDirectSound"); return 0; }
+S(bk_Pause) { bk_trace("Pause"); return 0; }
+S(bk_SetMemory) { bk_trace("SetMemory"); return 0; }
+S(bk_SetSoundSystem) { bk_trace("SetSoundSystem"); return 0; }
+S(bk_SetSoundTrack) { bk_trace("SetSoundTrack"); return 0; }
+S(bk_SetVolume) { bk_trace("SetVolume"); return 0; }
+S(bk_ShouldSkip) { bk_trace("ShouldSkip"); return 0; }
+S(bk_Wait) { bk_trace("Wait"); return 0; }
+S(bink_open) { bk_trace("Open"); static int n; note_once(&n, "binkw32: Bink video is NOT decoded; movies open as an empty finished 64x64 clip (skipped)");
   uint32_t *h = aot_gcalloc(1, 256); if (!h) return 0; h[0] = 64; h[1] = 64; h[2] = 1; h[3] = 1; h[4] = 1; h[5] = 30; h[6] = 1; return (uint32_t)(uintptr_t)h; }
-S(bink_fbinfo) { uint32_t *f = P(1); if (!f) return 0; memset(f, 0, 0x60); f[0] = 1; f[1] = 64; f[2] = 64; f[3] = 32; f[4] = 32; return 0; }   /* BINKFRAMEBUFFERS: 1 frame, YA 64x64, cRcB 32x32, no plane memory */
-S(bink_next) { uint32_t *h = P(0); if (h && h[3] < h[2]) h[3]++; return 0; }
+S(bink_fbinfo) { bk_trace("GetFrameBuffersInfo"); uint32_t *f = P(1); if (!f) return 0; memset(f, 0, 0x60); f[0] = 1; f[1] = 64; f[2] = 64; f[3] = 32; f[4] = 32; return 0; }   /* BINKFRAMEBUFFERS: 1 frame, YA 64x64, cRcB 32x32, no plane memory */
+S(bink_next) { bk_trace("NextFrame"); uint32_t *h = P(0); if (h && h[3] < h[2]) h[3]++; return 0; }
 
 /* ---- ws2_32 (BSD sockets underneath; Winsock constants/layouts translated) ---- */
 static __thread int wsa_err;
@@ -343,10 +356,10 @@ static const DllApi tab[] = {
   U("dinput8.dll", DirectInput8Create, 20), U("d3dx10_36.dll", D3DX10UnsetAllDeviceObjects, 4),
   UO("dsound.dll", "#2", 8, dsound_enum), UO("dsound.dll", "#11", 12, dsound_create), UO("eax.dll", "#6", 12, dsound_create),
   UO("xinput1_3.dll", "#2", 8, xinput_none), UO("xinput1_3.dll", "#3", 8, xinput_none), UO("xinput1_3.dll", "#4", 12, xinput_none),
-  UO("binkw32.dll", "_BinkOpen", 8, bink_open), UO("binkw32.dll", "_BinkClose", 4, bink_unavail), UO("binkw32.dll", "_BinkCopyToBuffer", 28, bink_unavail), UO("binkw32.dll", "_BinkDoFrame", 4, bink_unavail),
-  UO("binkw32.dll", "_BinkGetFrameBuffersInfo", 8, bink_fbinfo), UO("binkw32.dll", "_BinkNextFrame", 4, bink_next), UO("binkw32.dll", "_BinkOpenDirectSound", 4, bink_unavail), UO("binkw32.dll", "_BinkPause", 8, bink_unavail),
-  UO("binkw32.dll", "_BinkSetMemory", 8, bink_unavail), UO("binkw32.dll", "_BinkSetSoundSystem", 8, bink_unavail), UO("binkw32.dll", "_BinkSetSoundTrack", 8, bink_unavail), UO("binkw32.dll", "_BinkSetVolume", 12, bink_unavail),
-  UO("binkw32.dll", "_BinkShouldSkip", 4, bink_unavail), UO("binkw32.dll", "_BinkWait", 4, bink_unavail),
+  UO("binkw32.dll", "_BinkOpen", 8, bink_open), UO("binkw32.dll", "_BinkClose", 4, bk_Close), UO("binkw32.dll", "_BinkCopyToBuffer", 28, bk_CopyToBuffer), UO("binkw32.dll", "_BinkDoFrame", 4, bk_DoFrame),
+  UO("binkw32.dll", "_BinkGetFrameBuffersInfo", 8, bink_fbinfo), UO("binkw32.dll", "_BinkNextFrame", 4, bink_next), UO("binkw32.dll", "_BinkOpenDirectSound", 4, bk_OpenDirectSound), UO("binkw32.dll", "_BinkPause", 8, bk_Pause),
+  UO("binkw32.dll", "_BinkSetMemory", 8, bk_SetMemory), UO("binkw32.dll", "_BinkSetSoundSystem", 8, bk_SetSoundSystem), UO("binkw32.dll", "_BinkSetSoundTrack", 8, bk_SetSoundTrack), UO("binkw32.dll", "_BinkSetVolume", 12, bk_SetVolume),
+  UO("binkw32.dll", "_BinkShouldSkip", 4, bk_ShouldSkip), UO("binkw32.dll", "_BinkWait", 4, bk_Wait),
   U("ws2_32.dll", WSAAsyncSelect, 16), U("ws2_32.dll", WSACleanup, 0), U("ws2_32.dll", WSAGetLastError, 0), U("ws2_32.dll", WSAStartup, 8), U("ws2_32.dll", __WSAFDIsSet, 8),
   U("ws2_32.dll", accept, 12), U("ws2_32.dll", bind, 12), U("ws2_32.dll", closesocket, 4), U("ws2_32.dll", connect, 12), U("ws2_32.dll", gethostbyaddr, 12), U("ws2_32.dll", gethostbyname, 4),
   U("ws2_32.dll", gethostname, 8), U("ws2_32.dll", getpeername, 12), U("ws2_32.dll", getsockname, 12), U("ws2_32.dll", getsockopt, 20), U("ws2_32.dll", htonl, 4), U("ws2_32.dll", htons, 4),
