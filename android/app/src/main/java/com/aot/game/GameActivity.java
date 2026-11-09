@@ -8,7 +8,13 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.provider.DocumentsContract;
 import android.text.TextUtils;
+import android.content.Context;
+import android.graphics.Canvas;
+import android.graphics.Paint;
 import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewGroup;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
@@ -63,9 +69,72 @@ public final class GameActivity extends NativeActivity {
                 && !"unreadable".equals(architecture);
     }
 
+
+    private static native void nativeKey(int vk, int down);
+    private static native void nativeMouse(int kind, float x, float y);
+    private static native void nativeView(int w, int h);
+
+    /** Generic on-screen controller: left stick = W/A/S/D, round buttons = keys, any other touch = mouse (1st finger left click, 2nd right click). */
+    private static final class ControlsView extends View {
+        private static final class Btn { final String label; final int vk; final float cx, cy; int ptr = -1; Btn(String l, int v, float x, float y) { label = l; vk = v; cx = x; cy = y; } }
+        private final Btn[] btns = {
+            new Btn("SPACE", 0x20, 0.93f, 0.80f), new Btn("E", 0x45, 0.85f, 0.66f), new Btn("SHIFT", 0x10, 0.77f, 0.82f), new Btn("CTRL", 0x11, 0.69f, 0.68f),
+            new Btn("ENTER", 0x0D, 0.93f, 0.54f), new Btn("Q", 0x51, 0.61f, 0.82f), new Btn("TAB", 0x09, 0.50f, 0.90f), new Btn("ESC", 0x1B, 0.06f, 0.08f),
+            new Btn("F", 0x46, 0.85f, 0.45f), new Btn("R", 0x52, 0.77f, 0.56f) };
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private int stickPtr = -1, mousePtr = -1, rightPtr = -1; private float sx, sy, kx, ky; private final boolean[] dir = new boolean[4];   // W A S D
+        private static final int[] DIRVK = { 0x57, 0x41, 0x53, 0x44 };
+        ControlsView(Context c) { super(c); }
+        private float radius() { return Math.min(getWidth(), getHeight()) * 0.065f; }
+        @Override protected void onSizeChanged(int w, int h, int ow, int oh) { nativeView(w, h); }
+        private Btn hit(float x, float y) { float r = radius() * 1.2f; for (Btn b : btns) { float dx = x - b.cx * getWidth(), dy = y - b.cy * getHeight(); if (dx * dx + dy * dy <= r * r) return b; } return null; }
+        private void setDir(int i, boolean on) { if (dir[i] != on) { dir[i] = on; nativeKey(DIRVK[i], on ? 1 : 0); } }
+        private void stick(float x, float y) {
+            kx = x; ky = y; float dx = x - sx, dy = y - sy, dz = radius() * 0.6f;
+            setDir(0, dy < -dz); setDir(2, dy > dz); setDir(1, dx < -dz); setDir(3, dx > dz);
+        }
+        @Override public boolean onTouchEvent(MotionEvent e) {
+            int a = e.getActionMasked(), i = e.getActionIndex(), id = e.getPointerId(i);
+            if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
+                float x = e.getX(i), y = e.getY(i); Btn b = hit(x, y);
+                if (b != null) { b.ptr = id; nativeKey(b.vk, 1); }
+                else if (x < getWidth() * 0.30f && y > getHeight() * 0.35f && stickPtr < 0) { stickPtr = id; sx = x; sy = y; stick(x, y); }
+                else if (mousePtr < 0) { mousePtr = id; nativeMouse(0, x, y); nativeMouse(1, x, y); }
+                else if (rightPtr < 0) { rightPtr = id; nativeMouse(3, x, y); }
+            } else if (a == MotionEvent.ACTION_MOVE) {
+                for (int k = 0; k < e.getPointerCount(); k++) { int pid = e.getPointerId(k); float x = e.getX(k), y = e.getY(k);
+                    if (pid == stickPtr) stick(x, y); else if (pid == mousePtr) nativeMouse(0, x, y); }
+            } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_POINTER_UP || a == MotionEvent.ACTION_CANCEL) {
+                float x = e.getX(i), y = e.getY(i);
+                for (Btn b : btns) if (b.ptr == id || a == MotionEvent.ACTION_CANCEL) { if (b.ptr >= 0) nativeKey(b.vk, 0); b.ptr = -1; }
+                if (id == stickPtr || a == MotionEvent.ACTION_CANCEL) { stickPtr = -1; for (int k = 0; k < 4; k++) setDir(k, false); }
+                if (id == mousePtr || a == MotionEvent.ACTION_CANCEL) { if (mousePtr >= 0) nativeMouse(2, x, y); mousePtr = -1; }
+                if (id == rightPtr || a == MotionEvent.ACTION_CANCEL) { if (rightPtr >= 0) nativeMouse(4, x, y); rightPtr = -1; }
+            }
+            invalidate(); return true;
+        }
+        @Override protected void onDraw(Canvas c) {
+            float r = radius(), w = getWidth(), h = getHeight();
+            p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(3); p.setColor(0x66FFFFFF);
+            float bx = stickPtr >= 0 ? sx : w * 0.14f, by = stickPtr >= 0 ? sy : h * 0.72f; c.drawCircle(bx, by, r * 1.8f, p);
+            p.setStyle(Paint.Style.FILL); p.setColor(0x44FFFFFF); c.drawCircle(stickPtr >= 0 ? kx : bx, stickPtr >= 0 ? ky : by, r * 0.8f, p);
+            p.setTextAlign(Paint.Align.CENTER); p.setTextSize(r * 0.5f);
+            for (Btn b : btns) {
+                p.setStyle(Paint.Style.FILL); p.setColor(b.ptr >= 0 ? 0x88FFFFFF : 0x33FFFFFF); c.drawCircle(b.cx * w, b.cy * h, r, p);
+                p.setColor(0xCCFFFFFF); c.drawText(b.label, b.cx * w, b.cy * h + r * 0.18f, p);
+            }
+        }
+    }
+
+    private void addControls() {
+        try { addContentView(new ControlsView(this), new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)); }
+        catch (Throwable t) { android.util.Log.w("aotgame", "controls overlay unavailable: " + t); }
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        addControls();
         boolean bundled = false;
         try (InputStream in = getAssets().open("game.exe")) { bundled = true; } catch (Exception ignored) { }
         bundledMode = bundled;
