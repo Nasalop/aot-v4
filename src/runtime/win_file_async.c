@@ -38,9 +38,19 @@ static int ev_tr(void) { static int t = -1; if (t < 0) t = getenv("AOT_TRACE_EV"
 /* Always-on, rate-limited event log: a stall has to be visible without AOT_TRACE_EV, because the
    handle a guest thread is parked on is the only thing that identifies why it never woke. */
 static int ev_seen[8];
+/* Per-kind caps: create/close are rare, set/reset/complete happen per request, so they need headroom or
+   the trace goes blind within seconds of start-up - which is exactly where the stall is invisible. */
+static const int ev_cap[8] = { 300, 20000, 20000, 2000, 300, 300, 1000, 5000 };
 static void ev_log(int slot, const char *op, uint64_t h, const char *extra) {
-  if (ev_seen[slot]++ < 200) fprintf(stderr, "[ev] %s %llx%s%s\n", op, (unsigned long long)h,
+  if (ev_seen[slot]++ < ev_cap[slot]) fprintf(stderr, "[ev] %s %llx%s%s\n", op, (unsigned long long)h,
       (extra && *extra) ? " " : "", extra ? extra : "");
+}
+/* A request that is never queued leaves its OVERLAPPED event unsignalled forever, so the guest park on
+   WaitForSingleObject(INFINITE) is silent.  Every rejection has to say so and name the event. */
+static void start_fail(const char *call, const char *why, uint64_t overlapped, uint64_t event_value) {
+  static int n; if (n++ < 100)
+    fprintf(stderr, "[ev] %s was NOT queued: %s (overlapped %llx event %llx) -> a waiter on that event can never be woken\n",
+        call, why, (unsigned long long)overlapped, (unsigned long long)event_value);
 }
 static long ev_elapsed_ms(const struct timespec *t0) {
   struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -76,6 +86,27 @@ static EventHandle events[EVENT_CAPACITY];
 static AsyncOperation operations[OPERATION_CAPACITY];
 static pthread_mutex_t async_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t async_condition = PTHREAD_COND_INITIALIZER;
+/* I/O dispatch is a bounded pool, not one detached pthread per request.  A streaming game issues hundreds
+   of reads per second; spawning a thread for each starved the storage path, and single 512 KiB reads then
+   measured 2.7-10.6 s ([ev] wait-long), which is what made every thread waiting on one look hung. */
+static pthread_cond_t work_condition = PTHREAD_COND_INITIALIZER;
+static pthread_once_t workers_once = PTHREAD_ONCE_INIT;
+#define WORK_QUEUE_CAPACITY (OPERATION_CAPACITY + 1)   /* one spare slot so full is distinguishable from empty */
+static int work_queue[WORK_QUEUE_CAPACITY];
+static int wq_head, wq_tail;
+static int io_worker_count;
+#define IO_WORKERS 4
+/* Table occupancy for the watchdog: a jammed table explains both a hang and 10-second read latency. */
+void aot_async_stats(unsigned *in_flight, unsigned *unclaimed, unsigned *used) {
+  unsigned a = 0, p = 0, u = 0;
+  pthread_mutex_lock(&async_mutex);
+  for (size_t i = 0; i < OPERATION_CAPACITY; i++) {
+    if (!operations[i].used) continue;
+    u++; if (operations[i].active) a++; else if (operations[i].complete) p++;
+  }
+  pthread_mutex_unlock(&async_mutex);
+  if (in_flight) *in_flight = a; if (unclaimed) *unclaimed = p; if (used) *used = u;
+}
 
 static uint32_t error_from_errno(int error) {
   switch (error) {
@@ -160,8 +191,7 @@ int aot_win_async_close_handle(uint64_t value) {
   return 1;
 }
 
-static void *run_operation(void *argument) {
-  AsyncOperation *operation = argument;
+static void run_one(AsyncOperation *operation) {
   ssize_t result;
   do {
     if (operation->write) {
@@ -192,7 +222,27 @@ static void *run_operation(void *argument) {
   operation->fd = -1;
   pthread_mutex_unlock(&async_mutex);
   close(fd);
+}
+static void *io_worker(void *arg) {
+  (void)arg;
+  for (;;) {
+    pthread_mutex_lock(&async_mutex);
+    while (wq_head == wq_tail) pthread_cond_wait(&work_condition, &async_mutex);
+    int index = work_queue[wq_head]; wq_head = (wq_head + 1) % WORK_QUEUE_CAPACITY;
+    pthread_mutex_unlock(&async_mutex);
+    run_one(&operations[index]);
+  }
   return NULL;
+}
+static void io_workers_start(void) {
+  for (int i = 0; i < IO_WORKERS; i++) {
+    pthread_t thread;
+    int error = pthread_create(&thread, NULL, io_worker, NULL);
+    if (error) { fprintf(stderr, "[ev] I/O worker %d could not start: %s\n", i, strerror(error)); continue; }
+    __atomic_add_fetch(&io_worker_count, 1, __ATOMIC_RELAXED);
+    pthread_detach(thread);
+  }
+  fprintf(stderr, "[ev] async I/O pool: %d worker(s) started (previously one detached thread per request)\n", io_worker_count);
 }
 
 static uint64_t start_operation(CPU *c, int writing) {
@@ -204,6 +254,7 @@ static uint64_t start_operation(CPU *c, int writing) {
   if (bytes_address) ST(uint32_t, bytes_address, 0);
   if (!overlapped || (length && !buffer) ||
       length > (uint64_t)SSIZE_MAX) {
+    start_fail(writing ? "WriteFile" : "ReadFile", !overlapped ? "no OVERLAPPED" : "length/buffer inconsistent", overlapped, 0);
     aot_last_error = ERROR_INVALID_PARAMETER;
     return 0;
   }
@@ -211,26 +262,30 @@ static uint64_t start_operation(CPU *c, int writing) {
   uint32_t offset_low = LD(uint32_t, overlapped + offset_offset);
   uint32_t offset_high = LD(uint32_t, overlapped + offset_offset + 4);
   uint64_t offset = ((uint64_t)offset_high << 32) | offset_low;
+  uint64_t event_value = overlapped_event(overlapped);
+  const char *call = writing ? "WriteFile" : "ReadFile";
   if (offset > (uint64_t)INT64_MAX) {
+    start_fail(call, "offset beyond INT64_MAX", overlapped, event_value);
     aot_last_error = ERROR_INVALID_PARAMETER;
     return 0;
   }
-  uint64_t event_value = overlapped_event(overlapped);
   int fd = aot_win_file_duplicate(file, writing, 1);
-  if (fd < 0) return 0;
+  if (fd < 0) { char b[64]; snprintf(b, sizeof b, "file handle %#x is not open for %s", (unsigned)file, writing ? "write" : "read");
+    start_fail(call, b, overlapped, event_value); return 0; }
   pthread_mutex_lock(&async_mutex);
   if (event_value && !get_event(event_value)) {
     pthread_mutex_unlock(&async_mutex);
     close(fd);
+    start_fail(call, "the OVERLAPPED event handle is closed", overlapped, event_value);
     aot_last_error = ERROR_INVALID_HANDLE;
     return 0;
   }
   AsyncOperation *operation = NULL;
-  for (size_t i = 0; i < OPERATION_CAPACITY; i++) {
-    if (operations[i].used && operations[i].active &&
+  for (size_t i = 0; i < OPERATION_CAPACITY; i++) {      if (operations[i].used && operations[i].active &&
         operations[i].overlapped == overlapped) {
       pthread_mutex_unlock(&async_mutex);
       close(fd);
+      start_fail(call, "that OVERLAPPED is already in flight", overlapped, event_value);
       aot_last_error = ERROR_INVALID_PARAMETER;
       return 0;
     }
@@ -245,6 +300,7 @@ static uint64_t start_operation(CPU *c, int writing) {
   if (!operation) {
     pthread_mutex_unlock(&async_mutex);
     close(fd);
+    start_fail(call, "all 128 async operation slots are busy", overlapped, event_value);
     aot_last_error = ERROR_NOT_ENOUGH_MEMORY;
     return 0;
   }
@@ -266,22 +322,19 @@ static uint64_t start_operation(CPU *c, int writing) {
      WaitForSingleObject(INFINITE) on an event that would never be set again.  Never clear it for the guest. */
   pthread_mutex_unlock(&async_mutex);
 
-  pthread_t thread;
-  int error = pthread_create(&thread, NULL, run_operation, operation);
-  if (error) {
-    pthread_mutex_lock(&async_mutex);
-    operation->active = 0;
-    operation->complete = 0;
-    operation->used = 0;
-    operation->fd = -1;
-    set_overlapped_status(overlapped, error_from_errno(error), 0);
-    pthread_cond_broadcast(&async_condition);
-    pthread_mutex_unlock(&async_mutex);
-    close(fd);
-    aot_last_error = error_from_errno(error);
+  pthread_once(&workers_once, io_workers_start);
+  if (!__atomic_load_n(&io_worker_count, __ATOMIC_RELAXED)) {
+    static int warned;   /* no worker at all: complete it here rather than queueing work nobody will ever run */
+    if (!warned++) fprintf(stderr, "[ev] no async I/O worker could be started; requests are completed inline\n");
+    run_one(operation);
+    aot_last_error = ERROR_IO_PENDING;
     return 0;
   }
-  pthread_detach(thread);
+  pthread_mutex_lock(&async_mutex);
+  work_queue[wq_tail] = (int)(operation - operations);   /* the slot stays active while queued, so it cannot be reused */
+  wq_tail = (wq_tail + 1) % WORK_QUEUE_CAPACITY;
+  pthread_cond_signal(&work_condition);
+  pthread_mutex_unlock(&async_mutex);
   aot_last_error = ERROR_IO_PENDING;
   return 0;
 }
@@ -318,6 +371,7 @@ uint64_t aot_file_async_SetEvent(CPU *c) {
   EventHandle *event = get_event(ARG(0));
   if (!event) {
     pthread_mutex_unlock(&async_mutex);
+    fprintf(stderr, "[ev] SetEvent on invalid/closed handle %llx -> ignored; any thread waiting on it stays blocked\n", (unsigned long long)ARG(0));
     aot_last_error = ERROR_INVALID_HANDLE;
     return 0;
   }
