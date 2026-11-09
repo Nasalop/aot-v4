@@ -78,55 +78,92 @@ public final class GameActivity extends NativeActivity {
     private static void nativeMouse(int kind, float x, float y) { if (nativesOk) try { nativeMouse0(kind, x, y); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
     private static void nativeView(int w, int h) { if (nativesOk) try { nativeView0(w, h); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
 
-    /** Generic on-screen controller: left stick = W/A/S/D, round buttons = keys, any other touch = mouse (1st finger left click, 2nd right click). */
+    /** Text-only on-screen controller. Left stick = W/A/S/D; labelled round buttons = keys; "KB" opens a typing keyboard; any other touch = mouse
+     *  (1st finger left click/drag, 2nd finger right click). Everything is drawn with plain text and circles/rectangles, nothing is loaded. */
     private static final class ControlsView extends View {
-        private static final class Btn { final String label; final int vk; final float cx, cy; int ptr = -1; Btn(String l, int v, float x, float y) { label = l; vk = v; cx = x; cy = y; } }
-        private final Btn[] btns = {
-            new Btn("SPACE", 0x20, 0.93f, 0.80f), new Btn("E", 0x45, 0.85f, 0.66f), new Btn("SHIFT", 0x10, 0.77f, 0.82f), new Btn("CTRL", 0x11, 0.69f, 0.68f),
-            new Btn("ENTER", 0x0D, 0.93f, 0.54f), new Btn("Q", 0x51, 0.61f, 0.82f), new Btn("TAB", 0x09, 0.50f, 0.90f), new Btn("ESC", 0x1B, 0.06f, 0.08f),
-            new Btn("F", 0x46, 0.85f, 0.45f), new Btn("R", 0x52, 0.77f, 0.56f) };
+        private static final class Btn {
+            final String label; final int vk; final float cx, cy, hw, hh; final boolean sticky; int ptr = -1; boolean on;
+            Btn(String l, int v, float x, float y, float w, float h, boolean s) { label = l; vk = v; cx = x; cy = y; hw = w; hh = h; sticky = s; }
+        }
+        private final java.util.ArrayList<Btn> game = new java.util.ArrayList<>(), kb = new java.util.ArrayList<>();
+        private final Btn kbToggle = new Btn("KB", -1, 0.93f, 0.08f, 0.05f, 0.07f, true);
         private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         private int stickPtr = -1, mousePtr = -1, rightPtr = -1; private float sx, sy, kx, ky; private final boolean[] dir = new boolean[4];   // W A S D
         private static final int[] DIRVK = { 0x57, 0x41, 0x53, 0x44 };
-        ControlsView(Context c) { super(c); }
+
+        ControlsView(Context c) {
+            super(c);
+            Object[][] g = { {"SPACE\njump/act", 0x20, 0.93f, 0.80f}, {"E\naction", 0x45, 0.85f, 0.64f}, {"SHIFT\nhigh prof.", 0x10, 0.76f, 0.84f}, {"CTRL\nlow prof.", 0x11, 0.68f, 0.66f},
+                {"ENTER", 0x0D, 0.93f, 0.55f}, {"Q", 0x51, 0.58f, 0.84f}, {"TAB\nmap", 0x09, 0.50f, 0.68f}, {"ESC\nmenu", 0x1B, 0.06f, 0.08f}, {"F", 0x46, 0.85f, 0.43f}, {"R", 0x52, 0.76f, 0.50f} };
+            for (Object[] o : g) game.add(new Btn((String) o[0], (Integer) o[1], (Float) o[2], (Float) o[3], 0.045f, 0.075f, false));
+            String[] rows = { "1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM" };
+            for (int r = 0; r < rows.length; r++) for (int i = 0; i < rows[r].length(); i++) {
+                char ch = rows[r].charAt(i); float x = 0.5f + (i - (rows[r].length() - 1) / 2f) * 0.075f;
+                kb.add(new Btn(String.valueOf(ch), ch, x, 0.52f + r * 0.115f, 0.034f, 0.05f, false)); }
+            kb.add(new Btn("BKSP", 0x08, 0.5f + 5.5f * 0.075f, 0.52f, 0.04f, 0.05f, false));
+            kb.add(new Btn("ENTER", 0x0D, 0.5f + 5.2f * 0.075f, 0.52f + 2 * 0.115f, 0.05f, 0.05f, false));
+            kb.add(new Btn("SHIFT", 0x10, 0.5f - 5.2f * 0.075f, 0.52f + 3 * 0.115f, 0.05f, 0.05f, true));
+            kb.add(new Btn("SPACE", 0x20, 0.5f, 0.52f + 4 * 0.115f, 0.20f, 0.05f, false));
+            kb.add(new Btn("ESC", 0x1B, 0.5f - 5.2f * 0.075f, 0.52f, 0.04f, 0.05f, false));
+        }
         private float radius() { return Math.min(getWidth(), getHeight()) * 0.065f; }
         @Override protected void onSizeChanged(int w, int h, int ow, int oh) { nativeView(w, h); }
-        private Btn hit(float x, float y) { float r = radius() * 1.2f; for (Btn b : btns) { float dx = x - b.cx * getWidth(), dy = y - b.cy * getHeight(); if (dx * dx + dy * dy <= r * r) return b; } return null; }
+        private boolean inside(Btn b, float x, float y) { return Math.abs(x - b.cx * getWidth()) <= b.hw * getWidth() && Math.abs(y - b.cy * getHeight()) <= b.hh * getHeight(); }
+        private java.util.List<Btn> active() { return kbToggle.on ? kb : game; }
+        private Btn hit(float x, float y) {
+            if (inside(kbToggle, x, y)) return kbToggle;
+            for (Btn b : active()) if (inside(b, x, y)) return b; return null; }
         private void setDir(int i, boolean on) { if (dir[i] != on) { dir[i] = on; nativeKey(DIRVK[i], on ? 1 : 0); } }
         private void stick(float x, float y) {
             kx = x; ky = y; float dx = x - sx, dy = y - sy, dz = radius() * 0.6f;
-            setDir(0, dy < -dz); setDir(2, dy > dz); setDir(1, dx < -dz); setDir(3, dx > dz);
-        }
+            setDir(0, dy < -dz); setDir(2, dy > dz); setDir(1, dx < -dz); setDir(3, dx > dz); }
+        private void releaseAll() {
+            for (java.util.List<Btn> l : java.util.Arrays.asList(game, kb)) for (Btn b : l) { if (b.ptr >= 0 || b.on) nativeKey(b.vk, 0); b.ptr = -1; b.on = false; }
+            for (int k = 0; k < 4; k++) setDir(k, false); stickPtr = -1; }
         @Override public boolean onTouchEvent(MotionEvent e) {
-            int a = e.getActionMasked(), i = e.getActionIndex(), id = e.getPointerId(i);
-            if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
-                float x = e.getX(i), y = e.getY(i); Btn b = hit(x, y);
-                if (b != null) { b.ptr = id; nativeKey(b.vk, 1); }
-                else if (x < getWidth() * 0.30f && y > getHeight() * 0.35f && stickPtr < 0) { stickPtr = id; sx = x; sy = y; stick(x, y); }
-                else if (mousePtr < 0) { mousePtr = id; nativeMouse(0, x, y); nativeMouse(1, x, y); }
-                else if (rightPtr < 0) { rightPtr = id; nativeMouse(3, x, y); }
-            } else if (a == MotionEvent.ACTION_MOVE) {
-                for (int k = 0; k < e.getPointerCount(); k++) { int pid = e.getPointerId(k); float x = e.getX(k), y = e.getY(k);
-                    if (pid == stickPtr) stick(x, y); else if (pid == mousePtr) nativeMouse(0, x, y); }
-            } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_POINTER_UP || a == MotionEvent.ACTION_CANCEL) {
-                float x = e.getX(i), y = e.getY(i);
-                for (Btn b : btns) if (b.ptr == id || a == MotionEvent.ACTION_CANCEL) { if (b.ptr >= 0) nativeKey(b.vk, 0); b.ptr = -1; }
-                if (id == stickPtr || a == MotionEvent.ACTION_CANCEL) { stickPtr = -1; for (int k = 0; k < 4; k++) setDir(k, false); }
-                if (id == mousePtr || a == MotionEvent.ACTION_CANCEL) { if (mousePtr >= 0) nativeMouse(2, x, y); mousePtr = -1; }
-                if (id == rightPtr || a == MotionEvent.ACTION_CANCEL) { if (rightPtr >= 0) nativeMouse(4, x, y); rightPtr = -1; }
-            }
-            invalidate(); return true;
+            try {
+                int a = e.getActionMasked(), i = e.getActionIndex(), id = e.getPointerId(i);
+                if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
+                    float x = e.getX(i), y = e.getY(i); Btn b = hit(x, y);
+                    if (b == kbToggle) { releaseAll(); kbToggle.on = !kbToggle.on; }
+                    else if (b != null) { b.ptr = id; if (b.sticky) { b.on = !b.on; nativeKey(b.vk, b.on ? 1 : 0); } else nativeKey(b.vk, 1); }
+                    else if (!kbToggle.on && x < getWidth() * 0.30f && y > getHeight() * 0.35f && stickPtr < 0) { stickPtr = id; sx = x; sy = y; stick(x, y); }
+                    else if (mousePtr < 0) { mousePtr = id; nativeMouse(0, x, y); nativeMouse(1, x, y); }
+                    else if (rightPtr < 0) { rightPtr = id; nativeMouse(3, x, y); }
+                } else if (a == MotionEvent.ACTION_MOVE) {
+                    for (int k = 0; k < e.getPointerCount(); k++) { int pid = e.getPointerId(k);
+                        if (pid == stickPtr) stick(e.getX(k), e.getY(k)); else if (pid == mousePtr) nativeMouse(0, e.getX(k), e.getY(k)); }
+                } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_POINTER_UP || a == MotionEvent.ACTION_CANCEL) {
+                    float x = e.getX(i), y = e.getY(i); boolean cancel = a == MotionEvent.ACTION_CANCEL;
+                    for (java.util.List<Btn> l : java.util.Arrays.asList(game, kb)) for (Btn b : l) if (b.ptr == id || cancel) { if (b.ptr >= 0 && !b.sticky) nativeKey(b.vk, 0); b.ptr = -1; }
+                    if (id == stickPtr || cancel) { stickPtr = -1; for (int k = 0; k < 4; k++) setDir(k, false); }
+                    if (id == mousePtr || cancel) { if (mousePtr >= 0) nativeMouse(2, x, y); mousePtr = -1; }
+                    if (id == rightPtr || cancel) { if (rightPtr >= 0) nativeMouse(4, x, y); rightPtr = -1; }
+                }
+                invalidate();
+            } catch (Throwable t) { android.util.Log.w("aotgame", "controls: " + t); }
+            return true;
+        }
+        private void drawBtn(Canvas c, Btn b, float w, float h, boolean pressed) {
+            p.setStyle(Paint.Style.FILL); p.setColor(pressed ? 0x99FFFFFF : 0x40FFFFFF);
+            c.drawRect((b.cx - b.hw) * w, (b.cy - b.hh) * h, (b.cx + b.hw) * w, (b.cy + b.hh) * h, p);
+            p.setColor(0xFFFFFFFF); p.setTextAlign(Paint.Align.CENTER);
+            String[] ln = b.label.split("\n"); float ts = Math.min(b.hh * h * (ln.length > 1 ? 0.55f : 0.9f), b.hw * w * 0.6f * (b.label.length() > 3 ? 0.8f : 1.2f)); p.setTextSize(ts);
+            float y0 = b.cy * h - (ln.length - 1) * ts * 0.5f + ts * 0.35f; for (int k = 0; k < ln.length; k++) c.drawText(ln[k], b.cx * w, y0 + k * ts, p);
         }
         @Override protected void onDraw(Canvas c) {
-            float r = radius(), w = getWidth(), h = getHeight();
-            p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(3); p.setColor(0x66FFFFFF);
-            float bx = stickPtr >= 0 ? sx : w * 0.14f, by = stickPtr >= 0 ? sy : h * 0.72f; c.drawCircle(bx, by, r * 1.8f, p);
-            p.setStyle(Paint.Style.FILL); p.setColor(0x44FFFFFF); c.drawCircle(stickPtr >= 0 ? kx : bx, stickPtr >= 0 ? ky : by, r * 0.8f, p);
-            p.setTextAlign(Paint.Align.CENTER); p.setTextSize(r * 0.5f);
-            for (Btn b : btns) {
-                p.setStyle(Paint.Style.FILL); p.setColor(b.ptr >= 0 ? 0x88FFFFFF : 0x33FFFFFF); c.drawCircle(b.cx * w, b.cy * h, r, p);
-                p.setColor(0xCCFFFFFF); c.drawText(b.label, b.cx * w, b.cy * h + r * 0.18f, p);
-            }
+            try {
+                float r = radius(), w = getWidth(), h = getHeight();
+                for (Btn b : active()) drawBtn(c, b, w, h, b.ptr >= 0 || b.on);
+                drawBtn(c, kbToggle, w, h, kbToggle.on);
+                if (!kbToggle.on) {
+                    p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(3); p.setColor(0x66FFFFFF);
+                    float bx = stickPtr >= 0 ? sx : w * 0.14f, by = stickPtr >= 0 ? sy : h * 0.72f; c.drawCircle(bx, by, r * 1.8f, p);
+                    p.setStyle(Paint.Style.FILL); p.setColor(0x44FFFFFF); c.drawCircle(stickPtr >= 0 ? kx : bx, stickPtr >= 0 ? ky : by, r * 0.8f, p);
+                    p.setColor(0xFFFFFFFF); p.setTextAlign(Paint.Align.CENTER); p.setTextSize(r * 0.42f); c.drawText("STICK = W A S D", bx, by + r * 2.4f, p);
+                    c.drawText("touch anywhere else = mouse (2nd finger = right click)", w * 0.5f, h * 0.97f, p);
+                }
+            } catch (Throwable t) { android.util.Log.w("aotgame", "controls draw: " + t); }
         }
     }
 
@@ -139,7 +176,8 @@ public final class GameActivity extends NativeActivity {
     protected void onCreate(Bundle state) {
         final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((th, ex) -> {
-            try { File d = getExternalFilesDir(null); if (d != null) { java.io.PrintWriter w = new java.io.PrintWriter(new File(d, "java_crash.txt")); ex.printStackTrace(w); w.close(); } } catch (Throwable ignored) { }
+            try { File d = getExternalFilesDir(null); if (d != null) { java.io.PrintWriter w = new java.io.PrintWriter(new File(d, "java_crash.txt")); ex.printStackTrace(w); w.close();
+                    try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(new File(d, "game_dir.txt")))) { String gd = br.readLine(); if (gd != null && !gd.isEmpty()) { java.io.PrintWriter w2 = new java.io.PrintWriter(new File(gd, "aot_java_crash.txt")); ex.printStackTrace(w2); w2.close(); } } catch (Throwable ignored2) { } } } catch (Throwable ignored) { }
             if (prev != null) prev.uncaughtException(th, ex);
         });
         super.onCreate(state);
