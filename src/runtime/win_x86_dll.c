@@ -250,7 +250,14 @@ S(DirectInput8Create) {   /* (hinst, version, riid, void** ppv, outer) */
   d->vt = di_vt; d->ref = 1; *out = (uint32_t)(uintptr_t)d; return 0; }
 S(xinput_none) { return 1167; }                                       /* ERROR_DEVICE_NOT_CONNECTED */
 S(D3DX10UnsetAllDeviceObjects) { return 0; }                          /* teardown helper: nothing is cached on our side */
-S(bink_unavail) { static int n; note_once(&n, "binkw32: Bink video is not available; BinkOpen fails so videos are skipped"); return 0; }
+S(bink_unavail) { static int n; note_once(&n, "binkw32: Bink video is not available; "); return 0; }
+/* Bink videos are NOT decoded. The game's video player does not cope with BinkOpen failing (it still uploads a frame into textures
+ * that only exist after a successful open), so BinkOpen returns a stub 64x64 clip that is already at its last frame: the player
+ * sees "finished", no pixels are produced and intro/cut-scene movies are effectively skipped. */
+S(bink_open) { static int n; note_once(&n, "binkw32: Bink video is NOT decoded; movies open as an empty finished 64x64 clip (skipped)");
+  uint32_t *h = aot_gcalloc(1, 256); if (!h) return 0; h[0] = 64; h[1] = 64; h[2] = 1; h[3] = 1; h[4] = 1; h[5] = 30; h[6] = 1; return (uint32_t)(uintptr_t)h; }
+S(bink_fbinfo) { uint32_t *f = P(1); if (!f) return 0; memset(f, 0, 0x60); f[0] = 1; f[1] = 64; f[2] = 64; f[3] = 32; f[4] = 32; return 0; }   /* BINKFRAMEBUFFERS: 1 frame, YA 64x64, cRcB 32x32, no plane memory */
+S(bink_next) { uint32_t *h = P(0); if (h && h[3] < h[2]) h[3]++; return 0; }
 
 /* ---- ws2_32 (BSD sockets underneath; Winsock constants/layouts translated) ---- */
 static __thread int wsa_err;
@@ -336,8 +343,8 @@ static const DllApi tab[] = {
   U("dinput8.dll", DirectInput8Create, 20), U("d3dx10_36.dll", D3DX10UnsetAllDeviceObjects, 4),
   UO("dsound.dll", "#2", 8, dsound_enum), UO("dsound.dll", "#11", 12, dsound_create), UO("eax.dll", "#6", 12, dsound_create),
   UO("xinput1_3.dll", "#2", 8, xinput_none), UO("xinput1_3.dll", "#3", 8, xinput_none), UO("xinput1_3.dll", "#4", 12, xinput_none),
-  UO("binkw32.dll", "_BinkOpen", 8, bink_unavail), UO("binkw32.dll", "_BinkClose", 4, bink_unavail), UO("binkw32.dll", "_BinkCopyToBuffer", 28, bink_unavail), UO("binkw32.dll", "_BinkDoFrame", 4, bink_unavail),
-  UO("binkw32.dll", "_BinkGetFrameBuffersInfo", 8, bink_unavail), UO("binkw32.dll", "_BinkNextFrame", 4, bink_unavail), UO("binkw32.dll", "_BinkOpenDirectSound", 4, bink_unavail), UO("binkw32.dll", "_BinkPause", 8, bink_unavail),
+  UO("binkw32.dll", "_BinkOpen", 8, bink_open), UO("binkw32.dll", "_BinkClose", 4, bink_unavail), UO("binkw32.dll", "_BinkCopyToBuffer", 28, bink_unavail), UO("binkw32.dll", "_BinkDoFrame", 4, bink_unavail),
+  UO("binkw32.dll", "_BinkGetFrameBuffersInfo", 8, bink_fbinfo), UO("binkw32.dll", "_BinkNextFrame", 4, bink_next), UO("binkw32.dll", "_BinkOpenDirectSound", 4, bink_unavail), UO("binkw32.dll", "_BinkPause", 8, bink_unavail),
   UO("binkw32.dll", "_BinkSetMemory", 8, bink_unavail), UO("binkw32.dll", "_BinkSetSoundSystem", 8, bink_unavail), UO("binkw32.dll", "_BinkSetSoundTrack", 8, bink_unavail), UO("binkw32.dll", "_BinkSetVolume", 12, bink_unavail),
   UO("binkw32.dll", "_BinkShouldSkip", 4, bink_unavail), UO("binkw32.dll", "_BinkWait", 4, bink_unavail),
   U("ws2_32.dll", WSAAsyncSelect, 16), U("ws2_32.dll", WSACleanup, 0), U("ws2_32.dll", WSAGetLastError, 0), U("ws2_32.dll", WSAStartup, 8), U("ws2_32.dll", __WSAFDIsSet, 8),
