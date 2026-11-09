@@ -99,7 +99,10 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   static int ntr; PX *o = px_of(A(0));
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
   const PM *m = &pi->m[slot];
-  static uint8_t seen[64][256]; int ti_ = (int)(pi - PIS); int first = ti_ < 64 && slot < 256 && !seen[ti_][slot]++;
+  /* Saturating, not counting: a uint8 counter wrapped every 256 calls, so the hottest methods (the query
+     polls below) printed a "first call" line thousands of times and buried the log. */
+  static uint8_t seen[64][256]; int ti_ = (int)(pi - PIS); int first = ti_ < 64 && slot < 256 && !seen[ti_][slot];
+  if (first) seen[ti_][slot] = 1;
   if (first || ntr < 20) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
   if (!o) { const uint32_t *w = (const uint32_t *)(uintptr_t)A(0); fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x [%#x %#x %#x %#x]\n", pi->name, m->name, (unsigned)A(0), w?w[0]:0, w?w[1]:0, w?w[2]:0, w?w[3]:0); return E_NOTIMPL_; }
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
@@ -135,7 +138,17 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     default: fprintf(stderr, "[dxvk] %s::%s is not supported by the 32->64 proxy\n", pi->name, m->name); return m->ret ? E_NOTIMPL_ : 0;
     }
   }
-  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r; if (m->ret && (int32_t)hr < 0) {
+  /* A D3D10 asynchronous GetData with DONOTFLUSH can only succeed once the queued work has reached the
+     GPU, and DXVK submits it on Present/Flush only.  The guest polls one query tens of thousands of times
+     per frame, so honouring the flag leaves it waiting for commands still sitting in the queue: drop the
+     bit and let DXVK make progress. */
+  int query_poll = !strcmp(m->name, "GetData") && m->n >= 3 && strstr(pi->name, "D3D10") != NULL;
+  if (query_poll) iv[3] &= ~1ull;
+  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
+  if (query_poll) { static unsigned polls, stalled;
+    polls++; if (hr == 1u) stalled++;   /* S_FALSE: the result is not ready yet */
+    if (!(polls % 10000)) fprintf(stderr, "[dxvk] query polls: %u GetData calls, %u still S_FALSE\n", polls, stalled); }
+  if (m->ret && (int32_t)hr < 0) {
     fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x args:", pi->name, m->name, hr);
     for (int i = 0; i < m->n && i < 6; i++) { uint32_t a = A(i + 1); fprintf(stderr, " %#x", a);
       if (a > 0x10000 && a < 0x80000000u) { const uint32_t *w = (const uint32_t *)(uintptr_t)a; fprintf(stderr, "[%x %x %x %x %x %x]", w[0], w[1], w[2], w[3], w[4], w[5]); } }

@@ -399,7 +399,7 @@ uint64_t aot_file_async_CreateEventW(CPU *c) {
 
 void aot_wd_set(uint64_t h);
 uint64_t aot_file_async_SetEvent(CPU *c) {
-  aot_wd_set(ARG(0)); EVT("set", ARG(0)); ev_log(1, "set", ARG(0), NULL);
+  aot_wd_set(ARG(0)); EVT("set", ARG(0));
   pthread_mutex_lock(&async_mutex);
   EventHandle *event = get_event(ARG(0));
   if (!event) {
