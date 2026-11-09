@@ -64,6 +64,8 @@ typedef struct {
   uint8_t open;
   uint8_t manual_reset;
   uint8_t signaled;
+  uint16_t waiting;      /* threads inside WaitForSingleObject on this event right now */
+  uint32_t hits[3];      /* set / reset / completions, so the hot path never touches stderr */
 } EventHandle;
 
 typedef struct {
@@ -106,6 +108,21 @@ void aot_async_stats(unsigned *in_flight, unsigned *unclaimed, unsigned *used) {
   }
   pthread_mutex_unlock(&async_mutex);
   if (in_flight) *in_flight = a; if (unclaimed) *unclaimed = p; if (used) *used = u;
+}
+/* Per-event activity for the watchdog.  SetEvent/ResetEvent/completion used to print a line each, which
+   in a paused game meant ~2500 stderr writes a second competing with asset streaming; the same numbers
+   are just as useful summarised once per watchdog tick. */
+void aot_async_event_dump(void) {
+  pthread_mutex_lock(&async_mutex);
+  for (size_t i = 0; i < EVENT_CAPACITY; i++) {
+    EventHandle *e = &events[i];
+    if (!e->open) continue;
+    if (!e->hits[0] && !e->hits[1] && !e->hits[2] && !e->waiting) continue;
+    fprintf(stderr, "  event %llx manual=%u signalled=%u waiting=%u set=%u reset=%u completed=%u\n",
+        (unsigned long long)(EVENT_HANDLE_BASE | ((uint64_t)e->generation << 32) | (uint64_t)(i + 1)),
+        e->manual_reset, e->signaled, e->waiting, e->hits[0], e->hits[1], e->hits[2]);
+  }
+  pthread_mutex_unlock(&async_mutex);
 }
 
 static uint32_t error_from_errno(int error) {
@@ -166,6 +183,8 @@ static uint64_t install_event(int manual_reset, int signaled) {
     if (++event->generation == 0) event->generation = 1;
     event->manual_reset = (uint8_t)manual_reset;
     event->signaled = (uint8_t)signaled;
+    event->waiting = 0;
+    memset(event->hits, 0, sizeof event->hits);
     event->open = 1;
     return EVENT_HANDLE_BASE | ((uint64_t)event->generation << 32) |
         (uint64_t)(i + 1);
@@ -185,7 +204,7 @@ int aot_win_async_close_handle(uint64_t value) {
   }
   ev_log(4, "close", value, NULL);
   event->open = 0;
-  pthread_cond_broadcast(&async_condition);
+  if (event->waiting) pthread_cond_broadcast(&async_condition);   /* they must wake and see WAIT_FAILED */
   pthread_mutex_unlock(&async_mutex);
   aot_last_error = 0;
   return 1;
@@ -193,6 +212,7 @@ int aot_win_async_close_handle(uint64_t value) {
 
 static void run_one(AsyncOperation *operation) {
   ssize_t result;
+  struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
   do {
     if (operation->write) {
       result = pwrite(operation->fd,
@@ -204,6 +224,13 @@ static void run_one(AsyncOperation *operation) {
     }
   } while (result < 0 && errno == EINTR);
   int saved_error = result < 0 ? errno : 0;
+  /* Time the syscall itself, separately from the completion: a slow pread is the storage, a fast one
+     followed by a long [ev] wait-long is our own wakeup path.  Without this the two look identical. */
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+  if (ms >= 250) { static int n;
+    if (n++ < 200) fprintf(stderr, "[ev] %s of %llu bytes at %llu took %ld ms\n", operation->write ? "write" : "read",
+        (unsigned long long)operation->length, (unsigned long long)operation->offset, ms); }
 
   pthread_mutex_lock(&async_mutex);
   operation->error = saved_error ? error_from_errno(saved_error) : 0;
@@ -213,11 +240,17 @@ static void run_one(AsyncOperation *operation) {
   set_overlapped_status(operation->overlapped,
       operation->error ? operation->error : 0, operation->bytes);
   EventHandle *event = get_event(operation->event_value);
-  if (event) event->signaled = 1;
-  { char b[96]; snprintf(b, sizeof b, "bytes=%u error=%u event=%s%s", operation->bytes, operation->error,
-      event ? "signalled" : "none", operation->event_value ? "" : " (no overlapped event)");
-    ev_log(7, "complete", operation->event_value, b); }
-  pthread_cond_broadcast(&async_condition);
+  if (event) { event->signaled = 1;
+    if (event->hits[2] != UINT32_MAX) event->hits[2]++; }
+  /* Waking everyone on every completed read was pure overhead when nobody was listening. */
+  int wake = operation->waiters > 0 || (event && event->waiting > 0);
+  if (wake) pthread_cond_broadcast(&async_condition);
+  if (operation->error) {
+    static int n; if (n++ < 100)
+      fprintf(stderr, "[ev] %s failed after %ld ms: error %u (event %llx%s)\n", operation->write ? "write" : "read",
+          ms, operation->error, (unsigned long long)operation->event_value,
+          operation->event_value ? "" : " (no overlapped event: a waiter on it can never be woken)");
+  }
   int fd = operation->fd;
   operation->fd = -1;
   pthread_mutex_unlock(&async_mutex);
@@ -376,14 +409,18 @@ uint64_t aot_file_async_SetEvent(CPU *c) {
     return 0;
   }
   event->signaled = 1;
-  pthread_cond_broadcast(&async_condition);
+  if (event->hits[0] != UINT32_MAX) event->hits[0]++;
+  /* Broadcast only when someone is actually waiting on this event.  The trace showed thousands of
+     sets per second on events with no waiter, and every broadcast woke all six guest threads plus the
+     four I/O workers to re-check an event that was not theirs. */
+  if (event->waiting) pthread_cond_broadcast(&async_condition);
   pthread_mutex_unlock(&async_mutex);
   aot_last_error = 0;
   return 1;
 }
 
 uint64_t aot_file_async_ResetEvent(CPU *c) {
-  EVT("reset", ARG(0)); ev_log(2, "reset", ARG(0), NULL);
+  EVT("reset", ARG(0));
   pthread_mutex_lock(&async_mutex);
   EventHandle *event = get_event(ARG(0));
   if (!event) {
@@ -392,6 +429,7 @@ uint64_t aot_file_async_ResetEvent(CPU *c) {
     return 0;
   }
   event->signaled = 0;
+  if (event->hits[1] != UINT32_MAX) event->hits[1]++;
   pthread_mutex_unlock(&async_mutex);
   aot_last_error = 0;
   return 1;
@@ -410,7 +448,7 @@ uint64_t aot_file_async_PulseEvent(CPU *c) {
   ev_log(3, "pulse", ARG(0), NULL);
   event->pulse_generation++;
   event->signaled = 1;
-  pthread_cond_broadcast(&async_condition);
+  if (event->waiting) pthread_cond_broadcast(&async_condition);
   event->signaled = 0;
   pthread_mutex_unlock(&async_mutex);
   aot_last_error = 0;
@@ -464,9 +502,12 @@ uint64_t aot_file_async_WaitForSingleObject(CPU *c) {
       aot_last_error = 0;
       return WAIT_TIMEOUT;
     }
+    uint16_t *waiting = &event->waiting;
+    (*waiting)++;
     int error = timeout == INFINITE ?
         pthread_cond_wait(&async_condition, &async_mutex) :
         pthread_cond_timedwait(&async_condition, &async_mutex, &deadline);
+    if (*waiting) (*waiting)--;
     if (error == ETIMEDOUT) {
       pthread_mutex_unlock(&async_mutex);
       aot_last_error = 0;

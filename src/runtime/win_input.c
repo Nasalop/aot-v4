@@ -21,9 +21,34 @@ static Msg q[QN]; static int qh, qt;
 static pthread_mutex_t M = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t QC = PTHREAD_COND_INITIALIZER;
 static uint8_t keys[256]; static int32_t mx, my; static uint32_t view_w = 1, view_h = 1; static int view_known; static int quit_posted; static uint32_t shown;
 static uint32_t now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint32_t)(t.tv_sec * 1000 + t.tv_nsec / 1000000); }
+static void remove_at(int i) {   /* M held: uncouple slot i, keeping the remaining order */
+  for (int j = i; j != qh; j = (j + QN - 1) % QN) q[j] = q[(j + QN - 1) % QN];
+  qh = (qh + 1) % QN;
+}
 static void post(uint64_t hwnd, uint32_t msg, uint64_t w, uint64_t l) {
-  pthread_mutex_lock(&M); int n = (qt + 1) % QN;
-  if (n != qh) { q[qt] = (Msg){ hwnd ? hwnd : HWND_BASE, w, l, msg, now_ms(), mx, my }; qt = n; }
+  pthread_mutex_lock(&M);
+  /* Windows keeps at most one pending WM_PAINT per window.  An idle message loop synthesises one every
+     16 ms, so without coalescing a screen that is waiting for a tap fills all 512 slots with paint and
+     the tap itself is dropped on a full ring - which is exactly "the touch controls silently stopped". */
+  if (msg == WM_PAINT) {
+    for (int i = qh; i != qt; i = (i + 1) % QN) if (q[i].msg == WM_PAINT) { pthread_mutex_unlock(&M); return; }
+  }
+  if ((qt + 1) % QN == qh) {
+    /* Full: a stale move or an already coalesced paint is worth less than the input that just arrived.
+       The cursor position lives in mx/my, so losing a WM_MOUSEMOVE loses nothing. */
+    int victim = -1;
+    for (int i = qh; i != qt; i = (i + 1) % QN) {
+      if (q[i].msg == WM_MOUSEMOVE) { victim = i; break; }
+      if (victim < 0 && q[i].msg == WM_PAINT) victim = i;
+    }
+    if (victim < 0) {
+      static int n; if (n++ < 20) fprintf(stderr, "[in] queue full (%d slots), nothing droppable; message %#x lost\n", QN, msg);
+      pthread_mutex_unlock(&M); return;
+    }
+    uint32_t vmsg = q[victim].msg; remove_at(victim);
+    { static int n; if (n++ < 20) fprintf(stderr, "[in] queue full: dropped queued %#x to keep %#x\n", vmsg, msg); }
+  }
+  q[qt] = (Msg){ hwnd ? hwnd : HWND_BASE, w, l, msg, now_ms(), mx, my }; qt = (qt + 1) % QN;
   pthread_cond_broadcast(&QC); pthread_mutex_unlock(&M);
 }
 

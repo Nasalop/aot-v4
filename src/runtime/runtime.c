@@ -166,11 +166,13 @@ void aot_wd_set(uint64_t h) { wd_self()->set = h; }
 static WdThread *wd_self(void) { if (!wd_me) { int k = __atomic_fetch_add(&wd_cnt, 1, __ATOMIC_RELAXED); wd_me = &wd_t[k % 16]; } return wd_me; }
 /* Watchdog: every 10 s report guest progress (region transitions, imports, recent entries) so a hang/spin is located without a debugger. */
 void aot_async_stats(unsigned *in_flight, unsigned *unclaimed, unsigned *used);
+void aot_async_event_dump(void);
 static void *watchdog(void *arg) {
   (void)arg; for (int k = 0; k < 6; k++) {
     sleep(10); fprintf(stderr, "[aot] watchdog %ds, per guest thread (pc, region entries, last non-sync imports):\n", 10 * (k + 1));
     { unsigned a = 0, p = 0, u = 0; aot_async_stats(&a, &p, &u);
-      fprintf(stderr, "[aot] async I/O: %u of 128 slot(s) used, %u in flight, %u completed but never claimed\n", u, a, p); }
+      fprintf(stderr, "[aot] async I/O: %u of 128 slot(s) used, %u in flight, %u completed but never claimed\n", u, a, p);
+      aot_async_event_dump(); }
     for (int t = 0; t < wd_cnt && t < 16; t++) {
       WdThread *w = &wd_t[t]; fprintf(stderr, "  T%d pc=%llx n=%u %s h=%llx ms=%x lastSet=%llx:", t, (unsigned long long)w->pc, w->n, w->waiting ? "WAITING" : "running", (unsigned long long)w->wh, w->wms, (unsigned long long)w->set); unsigned in = w->in; int shown = 0;
       for (unsigned i = 0; i < 12 && shown < 5; i++) { int idx = w->imp[(in + 11 - i) % 12]; if (idx > 0 && idx < nthunks) { const char *nm = thunks[idx].name; if (strstr(nm, "CriticalSection") || strstr(nm, "Tls") || strstr(nm, "Fls") || strstr(nm, "QueryPerf")) continue; fprintf(stderr, " %s", nm); shown++; } }
