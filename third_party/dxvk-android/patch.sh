@@ -17,4 +17,6 @@ sub('src/wsi/wsi_platform.cpp','        throw DxvkError("DXVK_WSI_DRIVER environ
 sub('meson.build',"""  if (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
     error('SDL3, SDL2, or GLFW are required to build dxvk-native')
   endif""","")
+sub('src/dxvk/dxvk_presenter.cpp',"    if (m_acquireStatus != VK_SUCCESS && m_swapchain)\n      Logger::info","    if (m_acquireStatus == VK_SUBOPTIMAL_KHR) m_acquireStatus = VK_SUCCESS;  /* Android: rotated display makes every present SUBOPTIMAL; rebuilding each frame is useless */\n\n    if (m_acquireStatus != VK_SUCCESS && m_swapchain)\n      Logger::info")
+sub('src/dxvk/dxvk_presenter.cpp',"    if (status != VK_SUCCESS) {\n      Logger::info","    if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR) {\n      Logger::info")
 P
