@@ -270,12 +270,12 @@ S(xinput_none) { return 1167; }                                       /* ERROR_D
 S(D3DX10UnsetAllDeviceObjects) { return 0; }                          /* teardown helper: nothing is cached on our side */
 S(bink_unavail) { static int n; note_once(&n, "binkw32: Bink video is not available; "); return 0; }
 /* Bink videos are NOT decoded. The game's video player does not cope with BinkOpen failing (it still uploads a frame into textures
- * that only exist after a successful open), so BinkOpen returns a stub 64x64 clip of 30 frames at 30 fps (the game derives the movie clock from FrameNum/fps, so it must advance
+ * that only exist after a successful open), so BinkOpen returns a stub 64x64 clip of 3 frames at 30 fps (the game derives the movie clock from FrameNum/fps, so it must advance
  * for the player to end it); no pixels are produced, so intro/cut-scene movies are effectively skipped after ~1 s. */
 static int bk_n;
 static void bk_trace(const char *n) { int k = __atomic_add_fetch(&bk_n, 1, __ATOMIC_RELAXED); if (k <= 60) { fflush(stdout); fprintf(stderr, "[aot] bink call #%d %s\n", k, n); } }
 S(bk_Close) { bk_trace("Close"); return 0; }
-S(bk_CopyToBuffer) { bk_trace("CopyToBuffer"); return 0; }
+S(bk_CopyToBuffer) { bk_trace("CopyToBuffer"); return 0; }   /* no decoder: the destination stays as the game left it (transparent black) */
 S(bk_DoFrame) { bk_trace("DoFrame"); return 0; }
 S(bk_OpenDirectSound) { bk_trace("OpenDirectSound"); return 0; }
 S(bk_Pause) { bk_trace("Pause"); return 0; }
@@ -285,8 +285,8 @@ S(bk_SetSoundTrack) { bk_trace("SetSoundTrack"); return 0; }
 S(bk_SetVolume) { bk_trace("SetVolume"); return 0; }
 S(bk_ShouldSkip) { bk_trace("ShouldSkip"); return 0; }
 S(bk_Wait) { bk_trace("Wait"); return 0; }
-S(bink_open) { bk_trace("Open"); static int n; note_once(&n, "binkw32: Bink video is NOT decoded; movies open as an empty 64x64, 30-frame (1 s) clip");
-  uint32_t *h = aot_gcalloc(1, 256); if (!h) return 0; h[0] = 64; h[1] = 64; h[2] = 30; h[3] = 1; h[4] = 1; h[5] = 30; h[6] = 1; return (uint32_t)(uintptr_t)h; }
+S(bink_open) { bk_trace("Open"); static int n; note_once(&n, "binkw32: Bink video is NOT decoded; movies open as an empty 64x64, 3-frame clip");
+  uint32_t *h = aot_gcalloc(1, 256); if (!h) return 0; h[0] = 64; h[1] = 64; h[2] = 3; h[3] = 1; h[4] = 1; h[5] = 30; h[6] = 1; return (uint32_t)(uintptr_t)h; }
 S(bink_fbinfo) { bk_trace("GetFrameBuffersInfo"); uint32_t *f = P(1); if (!f) return 0; memset(f, 0, 0x60); f[0] = 1; f[1] = 64; f[2] = 64; f[3] = 32; f[4] = 32; return 0; }   /* BINKFRAMEBUFFERS: 1 frame, YA 64x64, cRcB 32x32, no plane memory */
 S(bink_next) { bk_trace("NextFrame"); uint32_t *h = P(0); if (h && h[3] < h[2]) h[3]++; return 0; }
 
