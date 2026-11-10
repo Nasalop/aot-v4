@@ -205,8 +205,15 @@ static void cs_enter(uint64_t cs) {
   if (!got) {
     uint32_t *w = (uint32_t *)(uintptr_t)(cs + cs_owner_offset());
     __atomic_add_fetch(&cs_waiters, 1, __ATOMIC_SEQ_CST);
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     while (!(got = cs_owner_claim(cs, tid))) {
       uint32_t cur = __atomic_load_n(w, __ATOMIC_RELAXED); if (!cur) continue;
+      struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
+      if ((tn.tv_sec - t0.tv_sec) * 1000 + (tn.tv_nsec - t0.tv_nsec) / 1000000 > 3000) {
+        /* Deadlock breaker: a guest thread has owned this critical section for >3 s while we wait. The owner is almost certainly blocked on an event/query inside the
+         * lock (the game never expects that to stall), so let the waiter in; the owner's later Leave just clears the lock. Logged so the cause can be traced. */
+        fprintf(stderr, "[aot] critical section %#llx held by thread %u for >3 s while thread %u waits: breaking the lock (possible deadlock)\n", (unsigned long long)cs, cur, (unsigned)tid);
+        __atomic_store_n(w, (uint32_t)tid, __ATOMIC_SEQ_CST); got = 1; break; }
       struct timespec ts = { 0, 1000000 };   /* 1 ms safety timeout */
       syscall(SYS_futex, w, FUTEX_WAIT_PRIVATE, cur, &ts, NULL, 0);
     }
