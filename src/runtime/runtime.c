@@ -156,7 +156,7 @@ static void io_fail_note(const char *name, uint32_t eax) {
 done:
   if (hit && cnt[k % 16]++ < 10) fprintf(stderr, "[aot] %s failed (eax=%u, last error %u)\n", n, (unsigned)eax, (unsigned)aot_last_error);
 }
-typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; volatile uint64_t wh, set; volatile uint32_t wms; volatile int waiting; } __attribute__((aligned(128))) WdThread;
+typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; volatile uint64_t wh, set; volatile uint32_t wms; volatile int waiting; CPU *cpu; } __attribute__((aligned(128))) WdThread;
 static WdThread wd_t[16]; static int wd_cnt; static __thread WdThread *wd_me;
 static WdThread *wd_self(void);
 void aot_wd_wait(uint64_t h, uint32_t ms, int on) { WdThread *w = wd_self(); w->wh = h; w->wms = ms; w->waiting = on; }
@@ -173,7 +173,10 @@ static void *watchdog(void *arg) {
       WdThread *w = &wd_t[t]; fprintf(stderr, "  T%d pc=%llx n=%u %s h=%llx ms=%x lastSet=%llx:", t, (unsigned long long)w->pc, w->n, w->waiting ? "WAITING" : "running", (unsigned long long)w->wh, w->wms, (unsigned long long)w->set); unsigned in = w->in; int shown = 0;
       for (unsigned i = 0; i < 12 && shown < 5; i++) { int idx = w->imp[(in + 11 - i) % 12]; if (idx > 0 && idx < nthunks) { const char *nm = thunks[idx].name; if (strstr(nm, "CriticalSection") || strstr(nm, "Tls") || strstr(nm, "Fls") || strstr(nm, "QueryPerf")) continue; fprintf(stderr, " %s", nm); shown++; } }
       fprintf(stderr, "\n");
-      for (int top = 0; top < 6; top++) { int bi = -1; for (int h = 0; h < 512; h++) if (hc[t][h] && (bi < 0 || hc[t][h] > hc[t][bi])) bi = h; if (bi < 0 || hc[t][bi] < 25) break; fprintf(stderr, "    hot T%d pc=%llx samples=%u\n", t, (unsigned long long)hp[t][bi], hc[t][bi]); hc[t][bi] = 0; } }
+      for (int top = 0; top < 6; top++) { int bi = -1; for (int h = 0; h < 512; h++) if (hc[t][h] && (bi < 0 || hc[t][h] > hc[t][bi])) bi = h; if (bi < 0 || hc[t][bi] < 25) break; fprintf(stderr, "    hot T%d pc=%llx samples=%u\n", t, (unsigned long long)hp[t][bi], hc[t][bi]); hc[t][bi] = 0; }
+      if (!wd_t[t].waiting && wd_t[t].cpu) { CPU *cc = wd_t[t].cpu; fprintf(stderr, "    regs T%d eax=%llx ecx=%llx edx=%llx ebx=%llx esp=%llx ebp=%llx esi=%llx edi=%llx ftop=%d fsw=%04x st0=%g st1=%g st2=%g st3=%g\n", t,
+        (unsigned long long)cc->r[0], (unsigned long long)cc->r[1], (unsigned long long)cc->r[2], (unsigned long long)cc->r[3], (unsigned long long)cc->r[4], (unsigned long long)cc->r[5], (unsigned long long)cc->r[6], (unsigned long long)cc->r[7],
+        cc->ftop, cc->fsw, (double)cc->fst[cc->ftop & 7], (double)cc->fst[(cc->ftop + 1) & 7], (double)cc->fst[(cc->ftop + 2) & 7], (double)cc->fst[(cc->ftop + 3) & 7]); } }
   } return NULL;
 }
 void aot_dump_crash_context(void) {
@@ -255,7 +258,7 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
     while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
     if (k >= 0) { rcache[rh].pc = pc; rcache[rh].k = k + 1; }
     if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
-    aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc; { WdThread *w = wd_self(); w->pc = pc; w->n++; }
+    aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc; { WdThread *w = wd_self(); w->pc = pc; w->n++; w->cpu = c; }
     uint64_t np = aot_region_fn[k](c, pc);
     if (np == pc) {   /* regions overlap: the binary search may land on one that does not enter at pc, so try every region covering pc */
       for (int m = 0; m < aot_nregions && np == pc; m++) if (m != k && pc >= aot_region_lo[m] && pc < aot_region_hi[m]) np = aot_region_fn[m](c, pc);
