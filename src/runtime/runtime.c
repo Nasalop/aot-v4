@@ -140,7 +140,7 @@ static void bind_delay_imports(uint8_t *img, uint32_t rva, uint32_t size,
 }
 
 /* last imports the guest called (for crash reports) */
-static int recent[32]; static unsigned recent_n; static uint64_t recent_pc[16]; static unsigned recent_pc_n;   /* last guest region entries */
+static __thread int recent[32]; static __thread unsigned recent_n; static __thread uint64_t recent_pc[16]; static __thread unsigned recent_pc_n;   /* per thread: shared globals were written on every dispatch by all threads (cache-line ping-pong) */   /* last guest region entries */
 uint64_t g_image_size;
 /* crash report helper (called from the signal handler): recent imports + the original x86 bytes of the block being executed, so the faulting code can be disassembled offline */
 static __thread CPU *cur_cpu;   /* guest CPU of this thread, for crash reports */
@@ -156,7 +156,7 @@ static void io_fail_note(const char *name, uint32_t eax) {
 done:
   if (hit && cnt[k % 16]++ < 10) fprintf(stderr, "[aot] %s failed (eax=%u, last error %u)\n", n, (unsigned)eax, (unsigned)aot_last_error);
 }
-typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; volatile uint64_t wh, set; volatile uint32_t wms; volatile int waiting; } WdThread;
+typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; volatile uint64_t wh, set; volatile uint32_t wms; volatile int waiting; } __attribute__((aligned(128))) WdThread;
 static WdThread wd_t[16]; static int wd_cnt; static __thread WdThread *wd_me;
 static WdThread *wd_self(void);
 void aot_wd_wait(uint64_t h, uint32_t ms, int on) { WdThread *w = wd_self(); w->wh = h; w->wms = ms; w->waiting = on; }
@@ -246,12 +246,14 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
       if (idx == RET_IDX) { cur_cpu = prev_cpu; return c->r[0]; }
       Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx; { WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx; } { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
       if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
-      if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); io_fail_note(t->name, (uint32_t)c->r[0]); continue; }
+      if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); { static int8_t iocls[MAXTHUNK]; int8_t k_ = iocls[idx]; if (!k_) { const char *dt = strchr(t->name, '!'); const char *nn = dt ? dt + 1 : t->name; static const char *const io_names[] = { "ReadFile", "GetOverlappedResult", "LockFileEx", "UnlockFileEx", "GetFileSizeEx", "SetFilePointerEx", "WriteFile", "SetEndOfFile", "SetFilePointer", "GetFileSize", NULL }; k_ = 1; for (int q = 0; io_names[q]; q++) if (!strcmp(nn, io_names[q])) k_ = 2; iocls[idx] = k_; } if (k_ == 2) io_fail_note(t->name, (uint32_t)c->r[0]); } continue; }
       c->r[0] = t->fn(c);
       pc = LD(uint64_t, c->r[4]); c->r[4] += 8; continue;
     }
-    int lo = 0, hi = aot_nregions - 1, k = -1;
+    static __thread struct { uint64_t pc; int k; } rcache[4096]; unsigned rh = (unsigned)((pc * 0x9E3779B1u) >> 8) & 4095; int lo = 0, hi = aot_nregions - 1, k = -1;
+    if (rcache[rh].pc == pc && rcache[rh].k > 0) k = rcache[rh].k - 1; else
     while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
+    if (k >= 0) { rcache[rh].pc = pc; rcache[rh].k = k + 1; }
     if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
     aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc; { WdThread *w = wd_self(); w->pc = pc; w->n++; }
     uint64_t np = aot_region_fn[k](c, pc);
