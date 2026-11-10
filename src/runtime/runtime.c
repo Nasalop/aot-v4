@@ -81,11 +81,9 @@ static void bind_thunks(uint8_t *img, const char *dll, uint32_t oft,
     t->pop = t->fp = 0;
     t->fn = aot_is_pe32 ? aot_x86_resolve(dll, nm, &t->pop, &t->fp) : aot_resolve_import(dll, nm);
     snprintf(t->name, sizeof t->name, "%.72s!%.80s", dll, nm);
-    /* Always reported: a missing import or a placeholder shim is exactly the kind of silent stub that
-       makes the game misbehave with no error in the log, so it must not need AOT_VERBOSE to be seen. */
-    if (!t->fn)
+    if (!t->fn && verbose)
       fprintf(stderr, "[aot] missing import %s\n", t->name);
-    else if (aot_import_is_placeholder(dll, nm))
+    else if (t->fn && verbose && aot_import_is_placeholder(dll, nm))
       fprintf(stderr, "[aot] import uses placeholder shim %s\n", t->name);
     uint64_t address = THUNK_BASE + (uint64_t)nthunks * THUNK_SZ;
     nthunks++;
@@ -165,18 +163,17 @@ void aot_wd_wait(uint64_t h, uint32_t ms, int on) { WdThread *w = wd_self(); w->
 void aot_wd_set(uint64_t h) { wd_self()->set = h; }
 static WdThread *wd_self(void) { if (!wd_me) { int k = __atomic_fetch_add(&wd_cnt, 1, __ATOMIC_RELAXED); wd_me = &wd_t[k % 16]; } return wd_me; }
 /* Watchdog: every 10 s report guest progress (region transitions, imports, recent entries) so a hang/spin is located without a debugger. */
-void aot_async_stats(unsigned *in_flight, unsigned *unclaimed, unsigned *used);
-void aot_async_event_dump(void);
 static void *watchdog(void *arg) {
   (void)arg; for (int k = 0; k < 6; k++) {
-    sleep(10); fprintf(stderr, "[aot] watchdog %ds, per guest thread (pc, region entries, last non-sync imports):\n", 10 * (k + 1));
-    { unsigned a = 0, p = 0, u = 0; aot_async_stats(&a, &p, &u);
-      fprintf(stderr, "[aot] async I/O: %u of 128 slot(s) used, %u in flight, %u completed but never claimed\n", u, a, p);
-      aot_async_event_dump(); }
+    static uint64_t hp[16][512]; static uint32_t hc[16][512]; memset(hp, 0, sizeof hp); memset(hc, 0, sizeof hc);
+    for (int i = 0; i < 5000; i++) { usleep(2000);   /* 2 ms pc sampler: where do running guest threads spend their time? */
+      for (int t = 0; t < wd_cnt && t < 16; t++) { if (wd_t[t].waiting) continue; uint64_t pc = wd_t[t].pc; unsigned h = (unsigned)((pc * 2654435761u) >> 7) & 511; for (int pr = 0; pr < 8; pr++, h = (h + 1) & 511) if (hp[t][h] == pc || !hc[t][h]) { hp[t][h] = pc; hc[t][h]++; break; } } }
+    fprintf(stderr, "[aot] watchdog %ds, per guest thread (pc, region entries, last non-sync imports):\n", 10 * (k + 1));
     for (int t = 0; t < wd_cnt && t < 16; t++) {
       WdThread *w = &wd_t[t]; fprintf(stderr, "  T%d pc=%llx n=%u %s h=%llx ms=%x lastSet=%llx:", t, (unsigned long long)w->pc, w->n, w->waiting ? "WAITING" : "running", (unsigned long long)w->wh, w->wms, (unsigned long long)w->set); unsigned in = w->in; int shown = 0;
       for (unsigned i = 0; i < 12 && shown < 5; i++) { int idx = w->imp[(in + 11 - i) % 12]; if (idx > 0 && idx < nthunks) { const char *nm = thunks[idx].name; if (strstr(nm, "CriticalSection") || strstr(nm, "Tls") || strstr(nm, "Fls") || strstr(nm, "QueryPerf")) continue; fprintf(stderr, " %s", nm); shown++; } }
-      fprintf(stderr, "\n"); }
+      fprintf(stderr, "\n");
+      for (int top = 0; top < 6; top++) { int bi = -1; for (int h = 0; h < 512; h++) if (hc[t][h] && (bi < 0 || hc[t][h] > hc[t][bi])) bi = h; if (bi < 0 || hc[t][bi] < 25) break; fprintf(stderr, "    hot T%d pc=%llx samples=%u\n", t, (unsigned long long)hp[t][bi], hc[t][bi]); hc[t][bi] = 0; } }
   } return NULL;
 }
 void aot_dump_crash_context(void) {
@@ -230,7 +227,9 @@ static void dump_call_site(void) {
 static void dump_context(CPU *c) {
   fprintf(stderr, "[aot] last region entries (oldest first):");
   for (unsigned i = 0; i < 16; i++) { uint64_t v = recent_pc[(recent_pc_n + i) % 16]; if (v) fprintf(stderr, " %llx", (unsigned long long)v); }
-  fprintf(stderr, "\n"); dump_code(aot_last_pc, 64, 96);
+  fprintf(stderr, "\n");
+  if (aot_is_pe32) for (unsigned i = 2; i <= 4; i++) { uint64_t v = recent_pc[(recent_pc_n + 16 - i) % 16]; if (v && in_img(v - 16, 144)) dump_hex("caller code (entry-16)", (uint32_t)(v - 16), 144); }
+  dump_code(aot_last_pc, 64, 96);
   fprintf(stderr, "[aot] last guest region entry: 0x%llx\n[aot] last imports called (oldest first):\n", (unsigned long long)aot_last_pc);
   for (unsigned i = 0; i < 32; i++) { int idx = recent[(recent_n + i) % 32]; if (idx > 0 && idx < nthunks) fprintf(stderr, "  %s\n", thunks[idx].name); }
   dump_call_site();
