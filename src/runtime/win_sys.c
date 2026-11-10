@@ -208,6 +208,8 @@ static void cs_enter(uint64_t cs) {
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     while (!(got = cs_owner_claim(cs, tid))) {
       uint32_t cur = __atomic_load_n(w, __ATOMIC_RELAXED); if (!cur) continue;
+      if (cur > (uint32_t)__atomic_load_n(&next_tid, __ATOMIC_RELAXED)) {   /* not a thread id we ever handed out (e.g. 0xCCCCCCCC fill): stale owner, take the lock now */
+        if (__atomic_compare_exchange_n(w, &cur, (uint32_t)tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) { got = 1; break; } continue; }
       struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
       if ((tn.tv_sec - t0.tv_sec) * 1000 + (tn.tv_nsec - t0.tv_nsec) / 1000000 > 3000) {
         /* Deadlock breaker: a guest thread has owned this critical section for >3 s while we wait. The owner is almost certainly blocked on an event/query inside the
