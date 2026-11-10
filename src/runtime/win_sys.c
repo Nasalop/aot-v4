@@ -196,7 +196,8 @@ static void cs_owner_release(uint64_t cs) {
 #else
 #define CS_RELAX() __asm__ volatile("" ::: "memory")
 #endif
-static int cs_waiters;
+/* waiter count lives in the CS's own LockCount field (guest never reads it) so Leave only pays a futex syscall for a lock somebody is really waiting on */
+#define CS_WAITERS(cs) ((int32_t *)(uintptr_t)((cs) + (aot_is_pe32 ? 4 : 8)))
 static void cs_enter(uint64_t cs) {
   uint64_t tid = cur_tid(), rec = cs_recursion_offset();
   if (cs_owner_load(cs) == tid) { ST(int32_t, cs + rec, LD(int32_t, cs + rec) + 1); return; }
@@ -204,7 +205,7 @@ static void cs_enter(uint64_t cs) {
   for (int i = 0; !got && i < 400; i++) { CS_RELAX(); got = cs_owner_claim(cs, tid); }
   if (!got) {
     uint32_t *w = (uint32_t *)(uintptr_t)(cs + cs_owner_offset());
-    __atomic_add_fetch(&cs_waiters, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(CS_WAITERS(cs), 1, __ATOMIC_SEQ_CST);
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     while (!(got = cs_owner_claim(cs, tid))) {
       uint32_t cur = __atomic_load_n(w, __ATOMIC_RELAXED); if (!cur) continue;
@@ -219,13 +220,13 @@ static void cs_enter(uint64_t cs) {
       struct timespec ts = { 0, 1000000 };   /* 1 ms safety timeout */
       syscall(SYS_futex, w, FUTEX_WAIT_PRIVATE, cur, &ts, NULL, 0);
     }
-    __atomic_sub_fetch(&cs_waiters, 1, __ATOMIC_SEQ_CST);
+    __atomic_sub_fetch(CS_WAITERS(cs), 1, __ATOMIC_SEQ_CST);
   }
   ST(int32_t, cs + rec, 1);
 }
 static void cs_leave(uint64_t cs) {
   uint64_t rec = cs_recursion_offset(); int32_t r = LD(int32_t, cs + rec) - 1; ST(int32_t, cs + rec, r < 0 ? 0 : r);
-  if (r <= 0) { cs_owner_release(cs); if (__atomic_load_n(&cs_waiters, __ATOMIC_SEQ_CST)) syscall(SYS_futex, (uint32_t *)(uintptr_t)(cs + cs_owner_offset()), FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0); }
+  if (r <= 0) { cs_owner_release(cs); if (__atomic_load_n(CS_WAITERS(cs), __ATOMIC_SEQ_CST) > 0) syscall(SYS_futex, (uint32_t *)(uintptr_t)(cs + cs_owner_offset()), FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0); }
 }
 SYS(InitializeCriticalSection) { memset((void *)(uintptr_t)A(0), 0, aot_is_pe32 ? 24 : 40); return 0; }
 SYS(InitializeCriticalSectionAndSpinCount) { memset((void *)(uintptr_t)A(0), 0, aot_is_pe32 ? 24 : 40); return 1; }
