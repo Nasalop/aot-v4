@@ -187,13 +187,37 @@ static void cs_owner_release(uint64_t cs) {
   if (aot_is_pe32) __atomic_store_n((uint32_t *)(uintptr_t)p, 0, __ATOMIC_RELEASE);
   else __atomic_store_n((uint64_t *)(uintptr_t)p, 0, __ATOMIC_RELEASE);
 }
+/* Contended critical sections: the old sched_yield x100 + usleep(100) loop cost ~0.1-1 ms per hand-off on Android; the game's allocator hammers a few
+ * of them from several threads, which made every frame take seconds. Spin briefly, then sleep on a futex over the owner word and wake on release. */
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#if defined(__aarch64__)
+#define CS_RELAX() __asm__ volatile("yield" ::: "memory")
+#else
+#define CS_RELAX() __asm__ volatile("" ::: "memory")
+#endif
+static int cs_waiters;
 static void cs_enter(uint64_t cs) {
   uint64_t tid = cur_tid(), rec = cs_recursion_offset();
   if (cs_owner_load(cs) == tid) { ST(int32_t, cs + rec, LD(int32_t, cs + rec) + 1); return; }
-  for (int spin = 0; !cs_owner_claim(cs, tid); spin++) { if (spin < 100) sched_yield(); else usleep(100); }
+  int got = cs_owner_claim(cs, tid);
+  for (int i = 0; !got && i < 400; i++) { CS_RELAX(); got = cs_owner_claim(cs, tid); }
+  if (!got) {
+    uint32_t *w = (uint32_t *)(uintptr_t)(cs + cs_owner_offset());
+    __atomic_add_fetch(&cs_waiters, 1, __ATOMIC_SEQ_CST);
+    while (!(got = cs_owner_claim(cs, tid))) {
+      uint32_t cur = __atomic_load_n(w, __ATOMIC_RELAXED); if (!cur) continue;
+      struct timespec ts = { 0, 1000000 };   /* 1 ms safety timeout */
+      syscall(SYS_futex, w, FUTEX_WAIT_PRIVATE, cur, &ts, NULL, 0);
+    }
+    __atomic_sub_fetch(&cs_waiters, 1, __ATOMIC_SEQ_CST);
+  }
   ST(int32_t, cs + rec, 1);
 }
-static void cs_leave(uint64_t cs) { uint64_t rec = cs_recursion_offset(); int32_t r = LD(int32_t, cs + rec) - 1; ST(int32_t, cs + rec, r < 0 ? 0 : r); if (r <= 0) cs_owner_release(cs); }
+static void cs_leave(uint64_t cs) {
+  uint64_t rec = cs_recursion_offset(); int32_t r = LD(int32_t, cs + rec) - 1; ST(int32_t, cs + rec, r < 0 ? 0 : r);
+  if (r <= 0) { cs_owner_release(cs); if (__atomic_load_n(&cs_waiters, __ATOMIC_SEQ_CST)) syscall(SYS_futex, (uint32_t *)(uintptr_t)(cs + cs_owner_offset()), FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0); }
+}
 SYS(InitializeCriticalSection) { memset((void *)(uintptr_t)A(0), 0, aot_is_pe32 ? 24 : 40); return 0; }
 SYS(InitializeCriticalSectionAndSpinCount) { memset((void *)(uintptr_t)A(0), 0, aot_is_pe32 ? 24 : 40); return 1; }
 SYS(EnterCriticalSection) { cs_enter(A(0)); return 0; }
