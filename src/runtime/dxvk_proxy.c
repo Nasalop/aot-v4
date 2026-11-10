@@ -141,7 +141,15 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
   if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0) {   /* S_FALSE: the query's commands may not have been submitted yet */
     uint64_t fi[1] = { (uint64_t)(uintptr_t)g_hdev }; float z[4] = { 0 }; hcall(g_hdev, g_flush_slot, fi, 1, z);
-    r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r; } if (m->ret && (int32_t)hr < 0) {
+    r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r; }
+  if (is_gd) {   /* The game spins on "while (GetData() == S_FALSE) SwitchToThread();" for GPU queries (occlusion / event). On this stack some never complete in a useful
+                  * time, which stalls the whole frame. After 64 consecutive "not ready" answers for one query, report it finished: BOOL/UINT64 = 1 (event done / visible). */
+    static __thread void *lastq; static __thread int nfalse;
+    if (hr == 1) { if (lastq != (void *)o) { lastq = o; nfalse = 0; }
+      if (++nfalse >= 64) { uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; if (pd && sz >= 8) *(uint64_t *)(uintptr_t)pd = 1; else if (pd && sz >= 4) *(uint32_t *)(uintptr_t)pd = 1;
+        static int warned; if (!warned++) fprintf(stderr, "[dxvk] GPU query still not ready after 64 polls: reporting it as finished (result 1) so the game does not stall\n");
+        hr = 0; r = 0; nfalse = 0; lastq = NULL; } }
+    else { nfalse = 0; lastq = NULL; } } if (m->ret && (int32_t)hr < 0) {
     fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x args:", pi->name, m->name, hr);
     for (int i = 0; i < m->n && i < 6; i++) { uint32_t a = A(i + 1); fprintf(stderr, " %#x", a);
       if (a > 0x10000 && a < 0x80000000u) { const uint32_t *w = (const uint32_t *)(uintptr_t)a; fprintf(stderr, "[%x %x %x %x %x %x]", w[0], w[1], w[2], w[3], w[4], w[5]); } }
