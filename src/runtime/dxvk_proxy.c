@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
 typedef uint64_t (*fn_t)(CPU *);
 #define ARGN(c, n) ((n) == 0 ? (c)->r[1] : (n) == 1 ? (c)->r[2] : (n) == 2 ? (c)->r[8] : (n) == 3 ? (c)->r[9] : LD(uint64_t, (c)->r[4] + 8 + 8 * (n)))
 #define A(n) ((uint32_t)ARGN(c, (n)))
@@ -16,6 +15,7 @@ void aot_thunk_set_pop(uint64_t addr, int pop);
 typedef struct { const char *name; uint8_t n; char k[17]; uint8_t ci[16], ty[16]; uint8_t ret; } PM;
 typedef struct { const char *name; int nm; const PM *m; const fn_t *wf; const uint8_t *guid; } PI;
 static uint64_t px_call(CPU *c, const PI *pi, int slot);
+static void *g_hdev; static int g_flush_slot = -1;
 #include "d3d10_proxy_gen.inc"
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
 #define E_NOTIMPL_ 0x80004001u
@@ -100,10 +100,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   static int ntr; PX *o = px_of(A(0));
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
   const PM *m = &pi->m[slot];
-  /* Saturating, not counting: a uint8 counter wrapped every 256 calls, so the hottest methods (the query
-     polls below) printed a "first call" line thousands of times and buried the log. */
-  static uint8_t seen[64][256]; int ti_ = (int)(pi - PIS); int first = ti_ < 64 && slot < 256 && !seen[ti_][slot];
-  if (first) seen[ti_][slot] = 1;
+  static uint8_t seen[64][256]; int ti_ = (int)(pi - PIS); int first = ti_ < 64 && slot < 256 && !seen[ti_][slot]++;
   if (first || ntr < 20) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
   if (!o) { const uint32_t *w = (const uint32_t *)(uintptr_t)A(0); fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x [%#x %#x %#x %#x]\n", pi->name, m->name, (unsigned)A(0), w?w[0]:0, w?w[1]:0, w?w[2]:0, w?w[3]:0); return E_NOTIMPL_; }
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
@@ -139,43 +136,12 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     default: fprintf(stderr, "[dxvk] %s::%s is not supported by the 32->64 proxy\n", pi->name, m->name); return m->ret ? E_NOTIMPL_ : 0;
     }
   }
-  /* AC1 spin-waits on a D3D10 query between frames: it polls GetData tens of thousands of times for one
-     result, and every poll with the queue not drained costs a host round trip and a queue submission, so
-     the wait costs far more than the frame it waits for.  After a short burst of polls, honour the wait
-     properly - ask again with a 1 ms sleep between asks - so the guest stops burning the CPU and the
-     queue stops being re-submitted thousands of times.
-     The guest's own flags are honoured for the polls it makes; only our wait flushes, at 60 Hz.  Forcing a
-     flush on every poll is what turned this into a submission storm that starved file reads (8 s per
-     512 KiB read). */
-  int query_poll = !strcmp(m->name, "GetData") && m->n >= 3 && strstr(pi->name, "D3D10") != NULL;
-  static struct { uint32_t guest; unsigned streak, waits, ready; } qw[8];
-  uint32_t poll_flags = query_poll ? (uint32_t)iv[3] : 0;
+  int is_gd = m->name[0] == 'G' && !strcmp(m->name, "GetData") && ni >= 4;
+  if (is_gd) iv[3] &= ~1ull;   /* D3D10_ASYNC_GETDATA_DONOTFLUSH: native drivers still make progress on their own, DXVK only submits work on a flush, so the game polls forever */
   uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
-  if (query_poll) {
-    static unsigned polls, stalled;
-    polls++; if (hr == 1u) stalled++;   /* S_FALSE: the result is not ready yet */
-    int qi = -1;
-    for (int i = 0; i < 8; i++) if (qw[i].guest == A(0)) { qi = i; break; }
-    if (qi < 0) for (int i = 0; i < 8; i++) if (!qw[i].guest) { qi = i; qw[i].guest = A(0); break; }
-    if (qi >= 0) {
-      if (hr != 1u) { qw[qi].streak = 0; qw[qi].ready++; }
-      else if (++qw[qi].streak > 32) {   /* spin far enough that this is a real wait, not a poll */
-        for (int i = 0; i < 250 && hr == 1u; i++) {
-          usleep(1000);
-          iv[3] = (i & 15) ? 1ull : 0ull;   /* let the queue drain at most every 16 ms */
-          r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r;
-        }
-        iv[3] = poll_flags; qw[qi].waits++;
-        if (hr != 1u) { qw[qi].ready++; qw[qi].streak = 0; }
-        else qw[qi].streak = 32;   /* still not ready: wait again instead of re-spinning */
-        if (qw[qi].waits <= 8 || !(qw[qi].waits % 100))
-          fprintf(stderr, "[dxvk] query %#x: waited %u time(s) (%u polls, %u ready, last %s)\n",
-                  (unsigned)qw[qi].guest, qw[qi].waits, polls, qw[qi].ready, hr != 1u ? "ready" : "timed out");
-      }
-    }
-    if (!(polls % 10000)) fprintf(stderr, "[dxvk] query polls: %u GetData calls, %u still S_FALSE\n", polls, stalled);
-  }
-  if (m->ret && (int32_t)hr < 0) {
+  if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0) {   /* S_FALSE: the query's commands may not have been submitted yet */
+    uint64_t fi[1] = { (uint64_t)(uintptr_t)g_hdev }; float z[4] = { 0 }; hcall(g_hdev, g_flush_slot, fi, 1, z);
+    r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r; } if (m->ret && (int32_t)hr < 0) {
     fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x args:", pi->name, m->name, hr);
     for (int i = 0; i < m->n && i < 6; i++) { uint32_t a = A(i + 1); fprintf(stderr, " %#x", a);
       if (a > 0x10000 && a < 0x80000000u) { const uint32_t *w = (const uint32_t *)(uintptr_t)a; fprintf(stderr, "[%x %x %x %x %x %x]", w[0], w[1], w[2], w[3], w[4], w[5]); } }
@@ -207,33 +173,12 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
       if (si < 0) { fprintf(stderr, "[dxvk] too many concurrent maps on one resource\n"); break; }
       void *g = aot_gmalloc(sz); if (!g) { fprintf(stderr, "[dxvk] Map: out of low memory for %zu bytes\n", sz); break; }
       if (q->type != 4) memcpy(g, hp, sz); else memset(g, 0, sz);
-      { static int mn; if (mn++ < 150) fprintf(stderr, "[dxvk] %s::%s mapped %zu bytes subresource=%#x map_type=%d pitfall=none\n", pi->name, m->name, sz, q->sub, q->type); }
       o->sh[si] = (Shadow){ g, hp, sz, q->sub, q->type };
       uint32_t *gs = (uint32_t *)(uintptr_t)q->g; if (q->kind == 'M') gs[0] = (uint32_t)(uintptr_t)g; else { gs[0] = (uint32_t)(uintptr_t)g; gs[1] = LD(uint32_t, h + 8); if (q->kind == 'U') gs[2] = LD(uint32_t, h + 12); }
       break; }
     }
   }
   (void)ok;
-  /* Colour tracing: a surface that should be white coming out grey has to be a clear value, a blend term
-     or a texture with the wrong contents, and none of those appear in DXVK's own log.  Record them here
-     (bounded, and only for addresses in guest range, like the FAILED-hr log above). */
-  if (!strcmp(m->name, "ClearRenderTargetView")) {
-    static int cn; uint32_t p = (uint32_t)A(2);
-    if (cn++ < 80 && p > 0x10000 && p < 0x80000000u) { const float *f = (const float *)(uintptr_t)p;
-      fprintf(stderr, "[dxvk] ClearRenderTargetView rt=%#x colour=(%.3f,%.3f,%.3f,%.3f)\n", (unsigned)A(1), f[0], f[1], f[2], f[3]); }
-  } else if (!strcmp(m->name, "ClearDepthStencilView")) {
-    static int dn; uint32_t dp = (uint32_t)A(4);
-    if (dn++ < 40 && dp > 0x10000 && dp < 0x80000000u)
-      fprintf(stderr, "[dxvk] ClearDepthStencilView flags=%#x depth=%.3f stencil=%u\n", (unsigned)A(3), (double)((const float *)(uintptr_t)dp)[0], (unsigned)A(5));
-  } else if (!strcmp(m->name, "CreateBlendState")) {
-    static int bn; uint32_t p = (uint32_t)A(1);
-    if (bn++ < 40 && p > 0x10000 && p < 0x80000000u) { const uint8_t *d = (const uint8_t *)(uintptr_t)p;
-      fprintf(stderr, "[dxvk] CreateBlendState enable=%u src=%u dst=%u op=%u alphaSrc=%u alphaDst=%u alphaOp=%u writeMask=%#x independent=%u alphaToCoverage=%u\n",
-          LD(uint32_t, d + 8), LD(uint32_t, d + 12), LD(uint32_t, d + 16), LD(uint32_t, d + 20),
-          LD(uint32_t, d + 24), LD(uint32_t, d + 28), LD(uint32_t, d + 32), d[36], LD(uint32_t, d + 4), LD(uint32_t, d)); }
-  } else if (!strcmp(m->name, "OMSetBlendState")) {
-    static int sn; if (sn++ < 80) fprintf(stderr, "[dxvk] OMSetBlendState state=%#x sampleMask=%#x\n", (unsigned)A(1), (unsigned)A(3));
-  }
   if (m->name[0] == 'R' && !strcmp(m->name, "Release") && (uint32_t)r == 0) unwrap_dead(o);
   return m->ret ? (uint32_t)r : 0;
 }
@@ -284,5 +229,6 @@ uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_de
     G32(sc_out, wrap(sc, tsc));
   }
   fprintf(stderr, "[dxvk] host ID3D10Device=%p vtbl=%p\n", dev, dev ? *(void **)dev : NULL);
+  g_hdev = dev; g_flush_slot = slot_by_name(&PIS[tdev], "Flush");
   G32(dev_out, wrap(dev, tdev)); fprintf(stderr, "[dxvk] D3D10 device + swapchain created through DXVK\n"); return 0;
 }
