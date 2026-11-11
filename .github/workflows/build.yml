@@ -302,7 +302,9 @@ jobs:
           if [ ! -f transpile.log ]; then touch transpile.log; fi
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
+        continue-on-error: true
         with:
+         update-package-index: true
          key: ${{ github.job }}-${{ runner.os }}
          max-size: 4G
       - name: Android SDK/NDK
@@ -333,15 +335,19 @@ jobs:
         run: mkdir -p android/app/src/main/jniLibs/arm64-v8a && cp android/app/src/main/jniLibs-vkd3d/libvkd3dshader.so android/app/src/main/jniLibs/arm64-v8a/
       - name: Configure CMake with ccache
         run: |
-          echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
-          echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
-          echo "CCACHE_COMPILERCHECK=content" >> $GITHUB_ENV
+          if command -v ccache >/dev/null 2>&1; then
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> $GITHUB_ENV
+            echo "CCACHE_COMPILERCHECK=content" >> $GITHUB_ENV
+          else
+            echo "ccache not available, building without it"
+          fi
       - name: Build APK
         working-directory: android
         run: gradle --no-daemon assembleDebug -PaotMode=$AOT_MODE
       - name: Check ccache stats
         if: always()
-        run: ccache -s  
+        run: ccache -s || true
       - uses: actions/upload-artifact@v4
         with:
           name: aotgame-apk
