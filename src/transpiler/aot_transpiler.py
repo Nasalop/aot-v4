@@ -323,7 +323,7 @@ class Gen:
         c = COND[mn[len(pre):]]
         # AC1 ray/grid walk (0x640270 loop): `fcompp; fnstsw; test ah,5; jp loop` spins forever on an unordered (NaN) compare and its visited-cell
         # writes then run through garbage indices. Treat unordered as loop exit, which ends the walk as "no hit" instead of hanging/corrupting.
-        if c == 'pf' and getattr(self, 'i', None) is not None and self.i.address == 0x64033f: return '(pf&&!(c->fsw&0x400))'
+        if c == 'pf' and getattr(self, 'i', None) is not None and self.i.address == 0xa4033f: return '(pf&&!(c->fsw&0x400))'
         return c
 
     # main translate ---------------------------------------------------------
@@ -473,8 +473,8 @@ class Gen:
             return '{pc=%s; goto dispatch;}' % self.rdop(op, PS)
         if mn[0] == 'j' and mn[1:] in COND:
             cc = COND[mn[1:]]
-            # AC1 ray/grid walk: `fcompp; fnstsw ax; test ah,5; jp 0x640270` spins forever on an unordered (NaN) compare; treat unordered as loop exit (walk ends "no hit")
-            if i.address == 0x64033f and cc == 'pf': cc = '(pf&&!(c->fsw&0x400))'
+            # AC1 ray/grid walk: `fcompp; fnstsw ax; test ah,5; jp 0xa40270` spins forever on an unordered (NaN) compare; treat unordered as loop exit (walk ends "no hit")
+            if i.address == 0xa4033f and cc == 'pf': cc = '(pf&&!(c->fsw&0x400))'
             return 'if(%s){%s}' % (cc, tgt(ops[0].imm))
         if mn.startswith('loop'):
             dec = 'r1=(uint32_t)(r1-1)' if m32 else 'r1--'
