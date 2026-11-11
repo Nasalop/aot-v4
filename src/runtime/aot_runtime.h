@@ -94,10 +94,16 @@ extern uint64_t (*const aot_region_fn[])(CPU *, uint64_t);
 void aot_unimpl(uint64_t addr, const char *text) __attribute__((noreturn));
 uint64_t aot_call(CPU *c, uint64_t fn, int nargs, ...);   /* call guest function from a shim */
 uint64_t aot_rdtsc(void);
+void aot_heap_check(const char *where);
 uint64_t aot_register_thunk(aot_host_fn fn, const char *name);
 
 #define LD(T, a) ({ T _v; memcpy(&_v, (const void *)(uintptr_t)(a), sizeof _v); _v; })
-#define ST(T, a, v) do { T _v = (T)(v); memcpy((void *)(uintptr_t)(a), &_v, sizeof _v); } while (0)
+/* Heap-corruption guard: stores into the game allocator's tree-bin table (0x199dec8..0x199df48) are checked.
+   A 4-byte non-pointer there is dropped and reported with the writing region (see aot_stguard). */
+extern int aot_stguard(uint64_t addr, uint64_t val, unsigned size);
+#define ST(T, a, v) do { T _v = (T)(v); uint64_t _a = (uint64_t)(uintptr_t)(a); \
+  if (__builtin_expect((uint32_t)(_a - 0x199dec8u) < 0x80u && _a < 0x100000000ull, 0) && !aot_stguard(_a, (uint64_t)_v, sizeof _v)) break; \
+  memcpy((void *)(uintptr_t)_a, &_v, sizeof _v); } while (0)
 #define LDX(a) ({ XMM _t; memcpy(&_t, (const void *)(uintptr_t)(a), 16); _t; })
 #define STX(a, v) do { XMM _t = (v); memcpy((void *)(uintptr_t)(a), &_t, 16); } while (0)
 #define PAR(v) ((uint8_t)!__builtin_parity((uint8_t)(v)))
