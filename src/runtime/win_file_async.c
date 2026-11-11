@@ -349,10 +349,9 @@ static uint64_t start_operation(CPU *c, int writing) {
     .active = 1
   };
   set_overlapped_status(overlapped, STATUS_PENDING, 0);
-  /* The event in OVERLAPPED belongs to the guest.  Win32 keeps a manual-reset event signalled until
-     ResetEvent, and even an auto-reset event only clears when a wait consumes it, so clearing it here
-     let a second outstanding request destroy the completion of the first: the waiter then blocked in
-     WaitForSingleObject(INFINITE) on an event that would never be set again.  Never clear it for the guest. */
+  /* Win32: the event in OVERLAPPED is set non-signalled when the request starts.  Without this a stale
+     signal from the previous request satisfies the guest wait before the data is read. */
+  if (event_value) { EventHandle *e0 = get_event(event_value); if (e0) e0->signaled = 0; }
   pthread_mutex_unlock(&async_mutex);
 
   pthread_once(&workers_once, io_workers_start);
