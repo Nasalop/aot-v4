@@ -994,12 +994,6 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                     s = g.tr(i, nd, tgt); nok += 1
                     # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
                     # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
-                    # AC1 allocator (dlmalloc tmalloc_large, 0x4136e0..0x413d00): a tree/chain pointer that reads back as a small integer (< 64 KB) is a corrupted link, never a real
-                    # address. Treat it as NULL (end of chain) so the allocator falls through to its grow-the-heap path instead of faulting on page zero.
-                    if 0x4136e0 <= i.address < 0x413d00 and i.mnemonic == 'mov' and len(i.operands) == 2:
-                        o0, o1 = i.operands[0], i.operands[1]
-                        if o0.type == X86_OP_REG and o0.size == 4 and o1.type == X86_OP_MEM and o1.size == 4 and o1.mem.disp in (8, 12, 16, 20, 24, 0x12c) and True:
-                            ri = g.reg(o0.reg)[0]; s += 'if((uint32_t)r%d<0x10000u)r%d=0;' % (ri, ri)
                     if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
                 except Exception as e:   # Unsup, or a translator bug on one instruction: record it, keep going
                     unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
