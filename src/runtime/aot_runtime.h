@@ -61,8 +61,8 @@ static inline aot_f80 aot_nanck(aot_f80 v, uint32_t pc) {
   return v;
 }
 /* x87 float -> integer with FCW rounding control (rc<0: truncate). Out-of-range / NaN -> integer indefinite. */
-static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int trunc) {
-  int rc = trunc ? 3 : (fcw >> 10) & 3; aot_f80 r;
+static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int trunc_) {
+  int rc = trunc_ ? 3 : (fcw >> 10) & 3; aot_f80 r;
   if (v != v) goto bad;
   r = rc == 0 ? F80(nearbyint)(v) : rc == 1 ? F80(floor)(v) : rc == 2 ? F80(ceil)(v) : F80(trunc)(v);
   if (bits == 16) { if (r > 32767 || r < -32768) goto bad; return (int16_t)r; }
