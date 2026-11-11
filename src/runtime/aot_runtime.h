@@ -52,6 +52,15 @@ static inline void aot_st80(uint64_t a, aot_f80 v) {
 #endif
 }
 /* NaN guard for x87 stores: the game's grid-walk loops spin forever on NaN. First sites are logged; NaN is stored as 0. */
+static inline aot_f80 aot_nanckm(aot_f80 v, uint32_t pc, uint64_t a) {
+  if (__builtin_expect(v != v, 0)) {
+    static volatile int n;
+    if (n < 24) { n++; const uint32_t *w = (const uint32_t *)(uintptr_t)(a & ~3ULL);
+      fprintf(stderr, "[aot] x87 NaN LOADED at pc=%#x from %#llx: [%08x %08x %08x %08x | %08x %08x %08x %08x]\n", pc, (unsigned long long)a, w[-4], w[-3], w[-2], w[-1], w[0], w[1], w[2], w[3]); }
+    return 0;
+  }
+  return v;
+}
 static inline aot_f80 aot_nanck(aot_f80 v, uint32_t pc) {
   if (__builtin_expect(v != v, 0)) {
     static volatile int n;
