@@ -240,6 +240,41 @@ static void dump_context(CPU *c) {
     for (int i = 0; i < 8; i++) fprintf(stderr, " %08x", LD(uint32_t, sp + 4 * i)); fprintf(stderr, "\n"); }
 }
 
+/* ---- allocator-corruption diagnostics (game dlmalloc object at 0x199dd6c, tree bins at 0x199dec8) ---- */
+__attribute__((noinline)) int aot_stguard(uint64_t addr, uint64_t val, unsigned size) {
+  static int n;
+  if (!aot_is_pe32) return 1;
+  uint32_t v = (uint32_t)val;
+  int bad = size == 4 && v && v < 0x10000u;
+  if (!bad && n > 8) return 1;
+  if (n++ < 40) {
+    uintptr_t ret = (uintptr_t)__builtin_return_address(0); int k = -1; uintptr_t best = 0;
+    for (int m = 0; m < aot_nregions; m++) { uintptr_t f = (uintptr_t)aot_region_fn[m]; if (f <= ret && f > best) { best = f; k = m; } }
+    fprintf(stderr, "[heap] %s store size=%u val=%#llx to tree-bin slot %#llx (bin %d); writer region #%d guest %#llx..%#llx +%#lx; last entry %#llx\n",
+        bad ? "BAD (dropped)" : "ok", size, (unsigned long long)val, (unsigned long long)addr, (int)((addr - 0x199dec8) / 4), k,
+        k >= 0 ? (unsigned long long)aot_region_lo[k] : 0ull, k >= 0 ? (unsigned long long)aot_region_hi[k] : 0ull, (unsigned long)(ret - best), (unsigned long long)aot_last_pc);
+    if (bad && n < 12) dump_context(cur_cpu);
+  }
+  return !bad;
+}
+/* Called when the guest takes/releases the allocator lock: a tree-bin slot holding a small non-pointer is the
+   exact state that later crashes tmalloc_large.  Report who ran before it and repair the slot. */
+void aot_heap_check(const char *where) {
+  static int n;
+  if (!aot_is_pe32 || !in_img(0x199dec8u, 0x80)) return;
+  volatile uint32_t *s = (volatile uint32_t *)(uintptr_t)0x199dec8u;
+  for (int i = 0; i < 32; i++) {
+    uint32_t v = s[i];
+    if (v && v < 0x10000u) {
+      if (n++ < 20) {
+        fprintf(stderr, "[heap] CORRUPT tree-bin %d = %#x seen at %s (last entry %#llx)\n", i, v, where, (unsigned long long)aot_last_pc);
+        if (n <= 3) dump_context(cur_cpu);
+      }
+      s[i] = 0;
+    }
+  }
+}
+
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
   CPU *prev_cpu = cur_cpu; cur_cpu = c;
   for (;;) {
