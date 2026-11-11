@@ -320,7 +320,11 @@ class Gen:
         return pre + body + self.wrop(ops[0], 'r', S) + '}}'
 
     def cond(self, mn, pre):
-        return COND[mn[len(pre):]]
+        c = COND[mn[len(pre):]]
+        # AC1 ray/grid walk (0x640270 loop): `fcompp; fnstsw; test ah,5; jp loop` spins forever on an unordered (NaN) compare and its visited-cell
+        # writes then run through garbage indices. Treat unordered as loop exit, which ends the walk as "no hit" instead of hanging/corrupting.
+        if c == 'pf' and getattr(self, 'i', None) is not None and self.i.address == 0x64033f: return '(pf&&!(c->fsw&0x400))'
+        return c
 
     # main translate ---------------------------------------------------------
     def tr(self, i, need, tgt):
