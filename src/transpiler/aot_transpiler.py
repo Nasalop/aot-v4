@@ -471,7 +471,11 @@ class Gen:
             op = ops[-1] if mn == 'ljmp' else ops[0]
             if op.type == X86_OP_IMM: return tgt(op.imm)
             return '{pc=%s; goto dispatch;}' % self.rdop(op, PS)
-        if mn[0] == 'j' and mn[1:] in COND: return 'if(%s){%s}' % (COND[mn[1:]], tgt(ops[0].imm))
+        if mn[0] == 'j' and mn[1:] in COND:
+            cc = COND[mn[1:]]
+            # AC1 ray/grid walk: `fcompp; fnstsw ax; test ah,5; jp 0x640270` spins forever on an unordered (NaN) compare; treat unordered as loop exit (walk ends "no hit")
+            if i.address == 0x64033f and cc == 'pf': cc = '(pf&&!(c->fsw&0x400))'
+            return 'if(%s){%s}' % (cc, tgt(ops[0].imm))
         if mn.startswith('loop'):
             dec = 'r1=(uint32_t)(r1-1)' if m32 else 'r1--'
             cc = 'r1' if mn == 'loop' else 'r1&&%s' % ('zf' if mn == 'loope' else '!zf')
