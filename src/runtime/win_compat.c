@@ -313,6 +313,7 @@ SH(VirtualQuery) {   /* Windows semantics: reservations report their real Alloca
   uintptr_t addr = (uintptr_t)A(0), page = addr & ~(uintptr_t)4095; unsigned char vec;
   size_t need = aot_is_pe32 ? 28 : 48; if (!A(1) || A(2) < need) { aot_last_error = 24; return 0; } uint8_t *o = (uint8_t *)(uintptr_t)A(1); memset(o, 0, need);
   uint64_t rb = 0, rn = 0; int vres = aot_vres_lookup(page, &rb, &rn), mapped = vres || !mincore((void *)page, 4096, &vec);
+  if (vres && page >= rb + rn) { vres = 0; mapped = !mincore((void *)page, 4096, &vec); }   /* 64K-granularity tail past the size the guest asked for */
   uint64_t alloc_base = vres ? rb : mapped ? page : 0, region = vres ? rb + rn - page : mapped ? 4096 : 0x10000 - (page & 0xffff);
   if (mapped && !vres) { uint64_t xl, xh; if (vq_extent(page, &xl, &xh)) { alloc_base = xl; region = xh - page; } }
   uint32_t state = mapped ? 0x1000 : 0x10000, prot = mapped ? 4 : 1, alloc_prot = mapped ? 4 : 0, type = mapped ? 0x20000 : 0; if (!mapped) prot = 1, alloc_prot = 0;
