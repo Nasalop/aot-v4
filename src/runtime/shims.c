@@ -145,7 +145,7 @@ SH(GetProcessHeap) { return (uint64_t)&g_heap; }
 SH(HeapAlloc) { void *p = (A1 & 8) ? calloc(1, A2 ? A2 : 1) : malloc(A2 ? A2 : 1); if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[ha] size=%llx -> %p\n", (unsigned long long)A2, p); return (uint64_t)p; }
 SH(HeapReAlloc) { return (uint64_t)realloc((void *)A2, A3); }
 SH(HeapFree) { free((void *)A2); return 1; }
-SH(HeapSize) { return 0; }
+SH(HeapSize) { if (!A2) return (uint64_t)-1; return aot_is_pe32 ? (uint64_t)(((size_t)1 << ((uint64_t *)(uintptr_t)A2)[-2]) - 16) : 0; }
 /* VirtualAlloc/VirtualFree with Windows semantics the guest allocators rely on: 64 KB-aligned reservations, a fixed address is honoured or the call
  * fails (never relocated), MEM_RELEASE frees the whole reservation (dwSize must be 0), MEM_DECOMMIT returns zeroed pages on recommit. */
 typedef struct { uint64_t raw, rawn, base, n; } VRes;
