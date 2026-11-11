@@ -51,8 +51,17 @@ static inline void aot_st80(uint64_t a, aot_f80 v) {
   memcpy((void *)(uintptr_t)a, &m, 8); memcpy((void *)(uintptr_t)(a + 8), &se, 2);
 #endif
 }
+/* NaN guard for x87 stores: the game's grid-walk loops spin forever on NaN. First sites are logged; NaN is stored as 0. */
+static inline aot_f80 aot_nanck(aot_f80 v, uint32_t pc) {
+  if (__builtin_expect(v != v, 0)) {
+    static volatile int n;
+    if (n < 24) { n++; fprintf(stderr, "[aot] x87 NaN store at pc=%#x -> stored 0 instead\n", pc); }
+    return 0;
+  }
+  return v;
+}
 /* x87 float -> integer with FCW rounding control (rc<0: truncate). Out-of-range / NaN -> integer indefinite. */
-static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int force_trunc) {
+static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int trunc) {
   int rc = trunc ? 3 : (fcw >> 10) & 3; aot_f80 r;
   if (v != v) goto bad;
   r = rc == 0 ? F80(nearbyint)(v) : rc == 1 ? F80(floor)(v) : rc == 2 ? F80(ceil)(v) : F80(trunc)(v);
@@ -61,10 +70,10 @@ static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int force_trun
   if (r >= 9223372036854775808.0 || r < -9223372036854775808.0) goto bad; return (int64_t)r;
 bad: return bits == 16 ? INT16_MIN : bits == 32 ? INT32_MIN : INT64_MIN;
 }
-static inline int64_t aot_fist_r(aot_f80 v, uint16_t fcw) {
-    // x87 FIST with rounding. '32' because FIST stores a 32-bit integer.
-    // '0' means force_trunc is false, so it obeys the fcw rounding mode.
-    return aot_fist(v, 32, fcw, 0);
+/* FRNDINT: round to integral value per FCW rounding control, staying in floating point (inf/NaN pass through). */
+static inline aot_f80 aot_fist_r(aot_f80 v, uint16_t fcw) {
+  int rc = (fcw >> 10) & 3;
+  return rc == 0 ? F80(nearbyint)(v) : rc == 1 ? F80(floor)(v) : rc == 2 ? F80(ceil)(v) : F80(trunc)(v);
 }
 typedef uint64_t (*aot_host_fn)(CPU *);
 
