@@ -169,8 +169,10 @@ SH(VirtualAlloc) {
       else if (p != MAP_FAILED) munmap(p, n);                                /* address taken, or out of memory: fail honestly */
     }
   } else {
-    size_t n = (sz + 0xFFFF) & ~0xFFFFULL; void *raw = aot_map_anon(n + 0x10000);
-    if (raw) { uint64_t base = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; if (vres_add((VRes){ (uint64_t)raw, n + 0x10000, base, n })) out = base; else munmap(raw, n + 0x10000); }
+    size_t n = (sz + 0xFFFF) & ~0xFFFFULL; void *raw = aot_map_anon(n);   /* exact size, 64K-aligned: no hidden slack pages past the region end (allocators probe/merge by adjacency and trust RegionSize) */
+    if (raw && ((uint64_t)raw & 0xFFFF)) { munmap(raw, n); raw = aot_map_anon(n + 0x10000); if (raw) { uint64_t b2 = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; if (vres_add((VRes){ (uint64_t)raw, n + 0x10000, b2, n })) out = b2; else munmap(raw, n + 0x10000); } }
+    else if (raw) { if (vres_add((VRes){ (uint64_t)raw, n, (uint64_t)raw, n })) out = (uint64_t)raw; else munmap(raw, n); }
+    if (0) { uint64_t base = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; if (vres_add((VRes){ (uint64_t)raw, n + 0x10000, base, n })) out = base; else munmap(raw, n + 0x10000); }
   }
   if (!out) { static int nf; if (nf++ < 20) fprintf(stderr, "[aot] VirtualAlloc failed: addr=%llx size=%llx type=%llx (reservations=%d)\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, vres_n); }
   if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[va] addr=%llx size=%llx type=%llx -> %llx\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, (unsigned long long)out);
