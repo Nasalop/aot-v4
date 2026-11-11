@@ -55,7 +55,7 @@ static inline void aot_st80(uint64_t a, aot_f80 v) {
 static inline aot_f80 aot_nanck(aot_f80 v, uint32_t pc) {
   if (__builtin_expect(v != v, 0)) {
     static volatile int n;
-    if (n < 24) { n++; fprintf(stderr, "[aot] x87 NaN store at pc=%#x -> stored 0 instead\n", pc); }
+    if (n < 24) { n++; fprintf(stderr, "[aot] x87 NaN store at pc=%#x -> replaced by 0\n", pc); }
     return 0;
   }
   return v;
