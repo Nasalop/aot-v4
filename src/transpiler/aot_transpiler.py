@@ -786,8 +786,8 @@ class Gen:
         if mn in ('fst', 'fstp', 'fstpnce'):
             o = ops[0]; pp = 'FPOP();' if mn != 'fst' else ''
             if o.type == X86_OP_MEM:
-                if o.size == 4: return 'ST(float,%s,(float)FST(0));%s' % (A(o), pp)
-                if o.size == 8: return 'ST(double,%s,(double)FST(0));%s' % (A(o), pp)
+                if o.size == 4: return 'ST(float,%s,(float)aot_nanck(FST(0),0x%x));%s' % (A(o), i.address, pp)
+                if o.size == 8: return 'ST(double,%s,(double)aot_nanck(FST(0),0x%x));%s' % (A(o), i.address, pp)
                 return 'aot_st80(%s,FST(0));%s' % (A(o), pp)
             return '%s=FST(0);%s' % (stv(o), pp)
         if mn in ('fist', 'fistp', 'fisttp'):
