@@ -83,7 +83,7 @@ void *aot_low_map(size_t n, uint64_t hint) {
       if (h + n > hi) { if (wrapped) break; wrapped = 1; h = lo; }
       if (wrapped && h >= start) break;
       p = mmap((void *)h, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
-      if (p == (void *)h) { next = h + n + 0x10000; break; }
+      if (p == (void *)h) { next = h + ((n + 0xFFFFULL) & ~0xFFFFULL); break; }
       if (p != MAP_FAILED) { munmap(p, n); p = MAP_FAILED; }   /* kernel without FIXED_NOREPLACE ignored the address */
       h += (n + 0xFFFFULL) & ~0xFFFFULL; if (h < next && !wrapped) h = next;
     }
