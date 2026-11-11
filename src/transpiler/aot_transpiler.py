@@ -990,7 +990,11 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
             needs.reverse()
             out.append('L_%x:;' % b[0].address)
             for i, nd in zip(b, needs):
-                try: s = g.tr(i, nd, tgt); nok += 1
+                try:
+                    s = g.tr(i, nd, tgt); nok += 1
+                    # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
+                    # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
+                    if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
                 except Exception as e:   # Unsup, or a translator bug on one instruction: record it, keep going
                     unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
                     s = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
