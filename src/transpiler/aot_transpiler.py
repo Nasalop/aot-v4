@@ -767,7 +767,7 @@ class Gen:
         def sti(op): return int(self.i.reg_name(op.reg)[3:-1])
         def memf(op):
             if mn.startswith('fi'): return '(aot_f80)(int%d_t)LD(int%d_t,%s)' % ((8 * op.size,) * 2 + (A(op),))
-            return {4: '(aot_f80)LD(float,%s)', 8: '(aot_f80)LD(double,%s)'}[op.size] % A(op) if op.size in (4, 8) else 'aot_ld80(%s)' % A(op)
+            return ('aot_nanck((aot_f80)LD(%s,%s),0x%x)' % ({4: 'float', 8: 'double'}[op.size], A(op), i.address)) if op.size in (4, 8) else 'aot_ld80(%s)' % A(op)
         def stv(op): return 'FST(%d)' % sti(op)
         base = mn[:-1] if mn.endswith('p') and mn not in ('fscale',) and not mn.startswith('fcom') and mn[1:-1] in ('add', 'sub', 'subr', 'mul', 'div', 'divr') else mn
         pop = base != mn
