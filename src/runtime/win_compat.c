@@ -298,11 +298,23 @@ SH(EnumSystemLocalesA) {
   uint64_t r = aot_call(c, A(0), 1, locale); return (uint32_t)r;
 }
 int aot_vres_lookup(uint64_t a, uint64_t *base, uint64_t *size);
+/* Real extent of the mapping holding addr (VMA run with identical permissions): VirtualQuery RegionSize for non-VirtualAlloc memory (heap, stacks, image). A 4 KB answer
+ * made the game's IsBadReadPtr/IsBadWritePtr reject valid multi-page buffers. */
+static int vq_extent(uint64_t addr, uint64_t *lo, uint64_t *hi) {
+  FILE *f = fopen("/proc/self/maps", "r"); if (!f) return 0; char ln[512], perm[8] = "", cp[8]; unsigned long long a, b, ra = 0, rb = 0; int found = 0;
+  while (fgets(ln, sizeof ln, f)) {
+    if (sscanf(ln, "%llx-%llx %7s", &a, &b, cp) != 3) continue;
+    if (!found) { if (addr >= a && addr < b) { found = 1; ra = a; rb = b; strcpy(perm, cp); } }
+    else { if (a != rb || strcmp(cp, perm)) break; rb = b; }
+  }
+  fclose(f); if (found) { *lo = ra; *hi = rb; } return found;
+}
 SH(VirtualQuery) {   /* Windows semantics: reservations report their real AllocationBase/RegionSize; unmapped space is MEM_FREE (a success, not an error) */
   uintptr_t addr = (uintptr_t)A(0), page = addr & ~(uintptr_t)4095; unsigned char vec;
   size_t need = aot_is_pe32 ? 28 : 48; if (!A(1) || A(2) < need) { aot_last_error = 24; return 0; } uint8_t *o = (uint8_t *)(uintptr_t)A(1); memset(o, 0, need);
   uint64_t rb = 0, rn = 0; int vres = aot_vres_lookup(page, &rb, &rn), mapped = vres || !mincore((void *)page, 4096, &vec);
   uint64_t alloc_base = vres ? rb : mapped ? page : 0, region = vres ? rb + rn - page : mapped ? 4096 : 0x10000 - (page & 0xffff);
+  if (mapped && !vres) { uint64_t xl, xh; if (vq_extent(page, &xl, &xh)) { alloc_base = xl; region = xh - page; } }
   uint32_t state = mapped ? 0x1000 : 0x10000, prot = mapped ? 4 : 1, alloc_prot = mapped ? 4 : 0, type = mapped ? 0x20000 : 0; if (!mapped) prot = 1, alloc_prot = 0;
   if (aot_is_pe32) { ST(uint32_t, o, page); ST(uint32_t, o + 4, alloc_base); ST(uint32_t, o + 8, alloc_prot); ST(uint32_t, o + 12, region); ST(uint32_t, o + 16, state); ST(uint32_t, o + 20, mapped ? prot : 1); ST(uint32_t, o + 24, type); }
   else { ST(uint64_t, o, page); ST(uint64_t, o + 8, alloc_base); ST(uint32_t, o + 16, alloc_prot); ST(uint64_t, o + 24, region); ST(uint32_t, o + 32, state); ST(uint32_t, o + 36, mapped ? prot : 1); ST(uint32_t, o + 40, type); }
