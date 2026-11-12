@@ -100,6 +100,7 @@ uint64_t aot_register_thunk(aot_host_fn fn, const char *name);
 
 #define LD(T, a) ({ T _v; memcpy(&_v, (const void *)(uintptr_t)(a), sizeof _v); _v; })
 int aot_vres_peek(uint64_t a, uint64_t *base, uint64_t *size);   /* crash-safe image of the VirtualAlloc reservation map */
+int aot_stack_grow(uintptr_t a, void *uc);   /* fatal-signal handler: commit a reserved guest-stack page and retry the access */
 /* Heap-corruption guards (game allocator): stores into the free-tree bin table, or into any live free-tree node while the writer does not hold the
    allocator lock, are reported with the writing region and the store is allowed through (see aot_stguard / aot_nodehit in runtime.c): a diagnostic
    that rewrites or drops guest state changes the very thing it is measuring. */

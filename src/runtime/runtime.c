@@ -267,6 +267,8 @@ __attribute__((noinline)) int aot_stguard(uint64_t addr, uint64_t val, unsigned 
 uint8_t aot_nodemap[8192];
 static uint32_t hc_nodes[8192]; static volatile unsigned hc_nn; static __thread int hc_in_lock;
 static __thread uint32_t hc_tmp[8192]; static __thread unsigned hc_tmp_n;
+/* last stores that landed on a live free-tree node (the chunk header writer, not the victim) */
+static struct { uint32_t node, addr, val; } hwr[16]; static volatile unsigned hwn;
 /* The host no longer unlinks nodes from the guest's free trees: a diagnostic must not edit the structure it is measuring. */
 __attribute__((noinline)) int aot_nodehit(uint64_t addr, uint64_t val, unsigned size) {
   static int n;
@@ -274,6 +276,7 @@ __attribute__((noinline)) int aot_nodehit(uint64_t addr, uint64_t val, unsigned 
   unsigned cnt = hc_nn; uint32_t hit = 0;
   for (unsigned i = 0; i < cnt && i < 8192; i++) { uint32_t nd = hc_nodes[i]; if (addr + size > nd + 4 && addr < nd + 0x1c) { hit = nd; break; } }
   if (!hit) return 1;
+  { unsigned q = __atomic_fetch_add(&hwn, 1, __ATOMIC_RELAXED) & 15; hwr[q].node = hit; hwr[q].addr = (uint32_t)addr; hwr[q].val = (uint32_t)val; }
   if (n++ < 30) {
     uintptr_t ret = (uintptr_t)__builtin_return_address(0); int k = -1; uintptr_t best = 0;
     for (int m = 0; m < aot_nregions; m++) { uintptr_t f = (uintptr_t)aot_region_fn[m]; if (f <= ret && f > best) { best = f; k = m; } }
@@ -332,7 +335,7 @@ static int heap_validate(const char *where, int crash) {
           return problems; }
         continue;
       }
-      if (!crash && hc_tmp_n < 8192) hc_tmp[hc_tmp_n++] = n;
+      if (hc_tmp_n < 8192) hc_tmp[hc_tmp_n++] = n;
       if (sp + 2 < 4096) { if (ch[0]) { st[sp][0] = ch[0]; st[sp++][1] = n; } if (ch[1]) { st[sp][0] = ch[1]; st[sp++][1] = n; } }
     }
   }
@@ -342,7 +345,7 @@ static int heap_validate(const char *where, int crash) {
 static int cmp_u32(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
 /* Two free chunks that overlap are what later hands one memory region to two owners. Find the operation that creates the overlap. */
 static void heap_overlap_check(const char *where) {
-  static int rep; if (rep >= 4 || hc_tmp_n < 2) return;
+  static int rep; if (rep >= 16 || hc_tmp_n < 2) return;
   static __thread uint32_t s[8192]; unsigned n = hc_tmp_n; memcpy(s, hc_tmp, n * 4); qsort(s, n, 4, cmp_u32);
   for (unsigned i = 0; i + 1 < n; i++) {
     uint32_t a = s[i], b = s[i + 1], sa = LD(uint32_t, a + 4) & ~3u;
@@ -352,6 +355,8 @@ static void heap_overlap_check(const char *where) {
           where, a, sa, a + sa, b, LD(uint32_t, b + 4) & ~3u, hc_n, (unsigned long long)hc_last_leave_pc, (unsigned long long)aot_last_pc);
       fprintf(stderr, "[heap]   words at a: "); for (int k = 0; k < 8; k++) fprintf(stderr, "%x ", LD(uint32_t, a + 4 * k));
       fprintf(stderr, "\n[heap]   words at b-8: "); for (int k = 0; k < 8; k++) fprintf(stderr, "%x ", LD(uint32_t, b - 8 + 4 * k)); fprintf(stderr, "\n");
+      { unsigned q = __atomic_load_n(&hwn, __ATOMIC_RELAXED); if (q > 16) q = 16; fprintf(stderr, "[heap]   last node stores (newest first):");
+        for (unsigned k = 0; k < q; k++) { unsigned j = (q - 1 - k) & 15; fprintf(stderr, " [node %#x <- %#x at %#x]", hwr[j].node, hwr[j].val, hwr[j].addr); } fprintf(stderr, "\n"); }
       dump_context(cur_cpu); return; }
   }
 }
@@ -375,6 +380,7 @@ void aot_heap_crash_dump(void) {
   fprintf(stderr, "[heap] state at crash (checks so far %llu, treemap %#x):\n", (unsigned long long)hc_checks, LD(uint32_t, 0x199dda0u));
   for (int i = 0; i < 32; i++) { uint32_t s = LD(uint32_t, 0x199dec8u + 4 * i); if (s) fprintf(stderr, "  bin %2d slot %#x\n", i, s); }
   int p = heap_validate("crash", 1); fprintf(stderr, "[heap] crash-time validation: %d problem(s)\n", p);
+  heap_overlap_check("crash");
 }
 
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
@@ -450,6 +456,34 @@ static void aot_pin_guest_thread(void) {
   uint64_t mask[2] = { g_pin_cpu < 64 ? 1ull << g_pin_cpu : 0, 0 };
   if (syscall(SYS_sched_setaffinity, 0, sizeof mask, mask) != 0) { static int w; if (!w++) fprintf(stderr, "[aot] pinning failed: %s\\n", strerror(errno)); }
 }
+/* ---- guest stacks: reserved in full, committed on demand (Windows grows a stack inside its reserve) ---- */
+#define GST_MAX 64
+static struct { uint32_t lo, hi, cl; } gst[GST_MAX]; static volatile int gst_n;
+static uint8_t *gstack_new(size_t ssz, size_t commit) {
+  uint8_t *p = aot_low_map(ssz, 0); if (!p) return NULL;
+  size_t keep = commit < ssz ? commit : ssz; keep = (keep + 0xFFF) & ~(size_t)0xFFF; if (keep > ssz) keep = ssz;
+  int i = __atomic_fetch_add(&gst_n, 1, __ATOMIC_RELAXED);
+  if (i < GST_MAX) { gst[i].lo = (uint32_t)(uintptr_t)p; gst[i].hi = (uint32_t)(uintptr_t)(p + ssz); gst[i].cl = gst[i].hi - (uint32_t)keep; }
+  else __atomic_store_n(&gst_n, GST_MAX, __ATOMIC_RELAXED);
+  if (keep < ssz) mprotect(p, ssz - keep, PROT_NONE);   /* the rest commits on first touch, see aot_stack_grow */
+  return p;
+}
+static void gstack_free(uint8_t *p, size_t ssz) {
+  int n = __atomic_load_n(&gst_n, __ATOMIC_RELAXED);
+  for (int i = 0; i < n && i < GST_MAX; i++) if (gst[i].lo == (uint32_t)(uintptr_t)p) { gst[i] = gst[n - 1]; __atomic_store_n(&gst_n, n - 1, __ATOMIC_RELAXED); break; }
+  munmap(p, ssz);
+}
+/* Fatal-signal handler: a fault on a reserved-but-uncommitted page of a guest stack commits that one page and returns 1, so the faulting access
+   retries instead of killing the process. Tracking cl means a repeat fault on an already committed page is NOT swallowed. */
+int aot_stack_grow(uintptr_t a, void *uc) {
+  (void)uc; int n = __atomic_load_n(&gst_n, __ATOMIC_RELAXED);
+  for (int i = 0; i < n && i < GST_MAX; i++)
+    if (a >= gst[i].lo && a < gst[i].cl) {
+      uintptr_t pg = a & ~(uintptr_t)0xFFF;
+      if (pg >= gst[i].lo && mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE) == 0) { __atomic_store_n(&gst[i].cl, (uint32_t)pg, __ATOMIC_RELAXED); return 1; }
+    }
+  return 0;
+}
 uint64_t aot_thread_run(uint64_t fn, uint64_t param, size_t ssz, uint32_t tid) {
   aot_pin_guest_thread();
   if (ssz < (1u << 20)) ssz = 1u << 20; if (ssz > (64u << 20)) ssz = 64u << 20;
@@ -457,8 +491,8 @@ uint64_t aot_thread_run(uint64_t fn, uint64_t param, size_t ssz, uint32_t tid) {
   if (aot_is_pe32) {
     uint8_t *teb = aot_gcalloc(1, 0x2000); uint32_t *slots = aot_gcalloc(64, 4);
     uint8_t *blk = g_tls_total ? aot_gcalloc(1, g_tls_total + 64) : NULL;
-    uint8_t *stk = aot_low_map(ssz, 0);
-    if (!teb || !slots || !stk || (g_tls_total && !blk)) { free(c); return 0; }
+    uint8_t *stk = gstack_new(ssz, 256u << 10);
+    if (!teb || !slots || !stk || (g_tls_total && !blk)) { if (stk) gstack_free(stk, ssz); free(c); return 0; }
     if (blk) memcpy(blk, (void *)g_tls_s0, g_tls_n); slots[0] = (uint32_t)(uintptr_t)blk;
     ST(uint32_t, teb + 0x00, 0xffffffffu); ST(uint32_t, teb + 0x04, (uint32_t)(uintptr_t)(stk + ssz)); ST(uint32_t, teb + 0x08, (uint32_t)(uintptr_t)stk);
     ST(uint32_t, teb + 0x18, (uint32_t)(uintptr_t)teb); ST(uint32_t, teb + 0x20, tid); ST(uint32_t, teb + 0x2c, (uint32_t)(uintptr_t)slots); ST(uint32_t, teb + 0x30, (uint32_t)g_peb_addr);
@@ -466,7 +500,7 @@ uint64_t aot_thread_run(uint64_t fn, uint64_t param, size_t ssz, uint32_t tid) {
     uint32_t esp = ((uint32_t)(uintptr_t)(stk + ssz - 0x100) & ~15u) - 4;
     ST(uint32_t, esp, (uint32_t)(THUNK_BASE + RET_IDX * THUNK_SZ)); ST(uint32_t, esp + 4, (uint32_t)param); c->r[4] = esp;
     uint64_t r = run(c, fn, RET_IDX);
-    munmap(stk, ssz); aot_gfree(slots); aot_gfree(blk); aot_gfree(teb); free(c); return r;
+    gstack_free(stk, ssz); aot_gfree(slots); aot_gfree(blk); aot_gfree(teb); free(c); return r;
   }
   uint8_t *teb = calloc(1, 0x2000); uint64_t *slots = calloc(64, 8);
   uint8_t *blk = g_tls_total ? calloc(1, g_tls_total + 64) : NULL; if (blk) memcpy(blk, (void *)g_tls_s0, g_tls_n); slots[0] = (uint64_t)blk;
@@ -540,7 +574,7 @@ int main(int argc, char **argv) {
   if (p32) {   /* PE32: TEB/PEB/stack/TLS array all live below 4GB; fs base = TEB */
     uint8_t *teb = aot_gcalloc(1, 0x2000), *peb = aot_gcalloc(1, 0x1000); uint32_t *slots = aot_gcalloc(64, 4); slots[0] = (uint32_t)tls_block;
     size_t ssz = u32(file, opt + 72); if (ssz < (4u << 20)) ssz = 4u << 20; if (ssz > (64u << 20)) ssz = 64u << 20;
-    uint8_t *stk = aot_low_map(ssz, 0); if (!stk) { fprintf(stderr, "[aot] cannot allocate 32-bit guest stack\n"); return 2; }
+    uint8_t *stk = gstack_new(ssz, 256u << 10); if (!stk) { fprintf(stderr, "[aot] cannot allocate 32-bit guest stack\n"); return 2; }
     ST(uint32_t, teb + 0x00, 0xFFFFFFFFu); ST(uint32_t, teb + 0x04, (uint64_t)stk + ssz); ST(uint32_t, teb + 0x08, stk); ST(uint32_t, teb + 0x18, teb);
     ST(uint32_t, teb + 0x20, 1); ST(uint32_t, teb + 0x24, 1); ST(uint32_t, teb + 0x2C, slots); ST(uint32_t, teb + 0x30, peb); ST(uint32_t, peb + 0x08, base);
     c = calloc(1, sizeof(CPU)); c->gs = (uint64_t)teb; c->fcw = 0x37F; c->mxcsr = 0x1f80; g_peb_addr = (uint64_t)peb; g_stack_top = (uint64_t)stk + ssz;
