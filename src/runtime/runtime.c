@@ -261,7 +261,23 @@ __attribute__((noinline)) int aot_stguard(uint64_t addr, uint64_t val, unsigned 
    exact state that later crashes tmalloc_large.  Report who ran before it and repair the slot. */
 uint8_t aot_nodemap[8192];
 static uint32_t hc_nodes[8192]; static volatile unsigned hc_nn; static __thread int hc_in_lock;
-static uint32_t hc_tmp[8192]; static __thread unsigned hc_tmp_n;
+static __thread uint32_t hc_tmp[8192]; static __thread unsigned hc_tmp_n;
+#define RW32(a) (*(volatile uint32_t *)(uintptr_t)(a))
+extern void aot_heap_lock(void); extern void aot_heap_unlock(void);
+/* Host port of the game's unlink_large_chunk (0x4133e0): remove tree node n from the free trees of the allocator at 0x199dd6c. */
+static void heap_unlink_large(uint32_t n) {
+  const uint32_t m = 0x199dd9cu; uint32_t xp = RW32(n + 0x18), R;
+  if (RW32(n + 0xc) != n) { uint32_t F = RW32(n + 8); R = RW32(n + 0xc); RW32(F + 0xc) = R; RW32(R + 8) = F; }
+  else {
+    uint32_t RP = n + 0x14; R = RW32(RP); if (!R) { RP = n + 0x10; R = RW32(RP); }
+    if (R) { for (;;) { uint32_t CP = R + 0x14; if (RW32(CP)) { R = RW32(CP); RP = CP; continue; } CP = R + 0x10; if (RW32(CP)) { R = RW32(CP); RP = CP; continue; } break; } RW32(RP) = 0; }
+  }
+  if (!xp) return;
+  uint32_t idx = RW32(n + 0x1c), H = m + 0x12c + idx * 4;
+  if (RW32(H) == n) { RW32(H) = R; if (!R) RW32(m + 4) &= ~(1u << idx); }
+  else { if (RW32(xp + 0x10) == n) RW32(xp + 0x10) = R; else RW32(xp + 0x14) = R; }
+  if (R) { RW32(R + 0x18) = xp; uint32_t c0 = RW32(n + 0x10), c1 = RW32(n + 0x14); if (c0) { RW32(R + 0x10) = c0; RW32(c0 + 0x18) = R; } if (c1) { RW32(R + 0x14) = c1; RW32(c1 + 0x18) = R; } }
+}
 __attribute__((noinline)) int aot_nodehit(uint64_t addr, uint64_t val, unsigned size) {
   static int n;
   if (hc_in_lock || !aot_is_pe32) return 1;
@@ -274,9 +290,15 @@ __attribute__((noinline)) int aot_nodehit(uint64_t addr, uint64_t val, unsigned 
     fprintf(stderr, "[heap] WRITE INTO FREE NODE (dropped): addr %#llx (node %#x +%#x) size %u val %#llx; writer region #%d guest %#llx..%#llx +%#lx; last entry %#llx\n",
         (unsigned long long)addr, hit, (unsigned)(addr - hit), size, (unsigned long long)val, k, k >= 0 ? (unsigned long long)aot_region_lo[k] : 0ull,
         k >= 0 ? (unsigned long long)aot_region_hi[k] : 0ull, (unsigned long)(ret - best), (unsigned long long)aot_last_pc);
-    if (n <= 6) dump_context(cur_cpu);
+    if (n <= 3) dump_context(cur_cpu);
   }
-  return 0;
+  /* A live block is being written over a node that is still in the free trees: the allocator coalesced that memory into the block without
+     unlinking the node. Do what free() should have done: unlink it (under the allocator lock), forget it, and let the write through. */
+  aot_heap_lock();
+  { unsigned c = hc_nn; int still = 0; for (unsigned i = 0; i < c && i < 8192; i++) if (hc_nodes[i] == hit) { hc_nodes[i] = hc_nodes[c - 1]; hc_nn = c - 1; still = 1; break; }
+    if (still) heap_unlink_large(hit); }
+  aot_heap_unlock();
+  return 1;
 }
 static int heap_ptr_ok(uint32_t p) { return !p || (!(p & 7) && ((p >= 0x400000u && p < 0x2a00000u) || (p >= 0x10000000u && p < 0xF0000000u))); }
 static __thread uint64_t hc_last_leave_pc; static __thread unsigned hc_n;
