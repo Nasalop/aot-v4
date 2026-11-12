@@ -95,6 +95,7 @@ void aot_unimpl(uint64_t addr, const char *text) __attribute__((noreturn));
 uint64_t aot_call(CPU *c, uint64_t fn, int nargs, ...);   /* call guest function from a shim */
 uint64_t aot_rdtsc(void);
 void aot_heap_check(const char *where);
+void aot_heap_crash_dump(void);
 uint64_t aot_register_thunk(aot_host_fn fn, const char *name);
 
 #define LD(T, a) ({ T _v; memcpy(&_v, (const void *)(uintptr_t)(a), sizeof _v); _v; })
