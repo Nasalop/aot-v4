@@ -362,7 +362,7 @@ static void crash_host_frames(void *uc) { (void)uc; }
 static void crash_handler(int sig, siginfo_t *si, void *uc) {
   char b[200]; int n = snprintf(b, sizeof b, "\n[aot] fatal signal %d at address %p (last guest block 0x%llx)\n", sig, si->si_addr, (unsigned long long)aot_last_pc);
   if (write(2, b, n) < 0) {}
-  { extern void aot_dump_crash_context(void); n = snprintf(b, sizeof b, "[aot] si_code=%d (1=unmapped address, 2=permission)\n", si->si_code); if (write(2, b, n) < 0) {} aot_dump_crash_context(); crash_host_frames(uc); }
+  { extern void aot_dump_crash_context(void); n = snprintf(b, sizeof b, "[aot] si_code=%d (1=unmapped address, 2=permission)\n", si->si_code); if (write(2, b, n) < 0) {} aot_dump_crash_context(); aot_heap_crash_dump(); crash_host_frames(uc); }
   _exit(139);
 }
 void aot_sys_init(void) {
