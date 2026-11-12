@@ -255,29 +255,14 @@ __attribute__((noinline)) int aot_stguard(uint64_t addr, uint64_t val, unsigned 
         k >= 0 ? (unsigned long long)aot_region_lo[k] : 0ull, k >= 0 ? (unsigned long long)aot_region_hi[k] : 0ull, (unsigned long)(ret - best), (unsigned long long)aot_last_pc);
     if (bad && n < 12) dump_context(cur_cpu);
   }
-  return !bad;
+  return 1;   /* report only: dropping the store rewrites the guest allocator's state and hides the real fault */
 }
 /* Called when the guest takes/releases the allocator lock: a tree-bin slot holding a small non-pointer is the
    exact state that later crashes tmalloc_large.  Report who ran before it and repair the slot. */
 uint8_t aot_nodemap[8192];
 static uint32_t hc_nodes[8192]; static volatile unsigned hc_nn; static __thread int hc_in_lock;
 static __thread uint32_t hc_tmp[8192]; static __thread unsigned hc_tmp_n;
-#define RW32(a) (*(volatile uint32_t *)(uintptr_t)(a))
-extern void aot_heap_lock(void); extern void aot_heap_unlock(void);
-/* Host port of the game's unlink_large_chunk (0x4133e0): remove tree node n from the free trees of the allocator at 0x199dd6c. */
-static void heap_unlink_large(uint32_t n) {
-  const uint32_t m = 0x199dd9cu; uint32_t xp = RW32(n + 0x18), R;
-  if (RW32(n + 0xc) != n) { uint32_t F = RW32(n + 8); R = RW32(n + 0xc); RW32(F + 0xc) = R; RW32(R + 8) = F; }
-  else {
-    uint32_t RP = n + 0x14; R = RW32(RP); if (!R) { RP = n + 0x10; R = RW32(RP); }
-    if (R) { for (;;) { uint32_t CP = R + 0x14; if (RW32(CP)) { R = RW32(CP); RP = CP; continue; } CP = R + 0x10; if (RW32(CP)) { R = RW32(CP); RP = CP; continue; } break; } RW32(RP) = 0; }
-  }
-  if (!xp) return;
-  uint32_t idx = RW32(n + 0x1c), H = m + 0x12c + idx * 4;
-  if (RW32(H) == n) { RW32(H) = R; if (!R) RW32(m + 4) &= ~(1u << idx); }
-  else { if (RW32(xp + 0x10) == n) RW32(xp + 0x10) = R; else RW32(xp + 0x14) = R; }
-  if (R) { RW32(R + 0x18) = xp; uint32_t c0 = RW32(n + 0x10), c1 = RW32(n + 0x14); if (c0) { RW32(R + 0x10) = c0; RW32(c0 + 0x18) = R; } if (c1) { RW32(R + 0x14) = c1; RW32(c1 + 0x18) = R; } }
-}
+/* The host no longer unlinks nodes from the guest's free trees: a diagnostic must not edit the structure it is measuring. */
 __attribute__((noinline)) int aot_nodehit(uint64_t addr, uint64_t val, unsigned size) {
   static int n;
   if (hc_in_lock || !aot_is_pe32) return 1;
@@ -292,15 +277,19 @@ __attribute__((noinline)) int aot_nodehit(uint64_t addr, uint64_t val, unsigned 
         k >= 0 ? (unsigned long long)aot_region_hi[k] : 0ull, (unsigned long)(ret - best), (unsigned long long)aot_last_pc);
     if (n <= 3) dump_context(cur_cpu);
   }
-  /* A live block is being written over a node that is still in the free trees: the allocator coalesced that memory into the block without
-     unlinking the node. Do what free() should have done: unlink it (under the allocator lock), forget it, and let the write through. */
-  aot_heap_lock();
-  { unsigned c = hc_nn; int still = 0; for (unsigned i = 0; i < c && i < 8192; i++) if (hc_nodes[i] == hit) { hc_nodes[i] = hc_nodes[c - 1]; hc_nn = c - 1; still = 1; break; }
-    if (still) heap_unlink_large(hit); }
-  aot_heap_unlock();
+  /* Report only. A live block written over a node that is still in the free trees means the allocator coalesced that memory into the block
+     without unlinking the node; repairing it here would change the guest's allocator while it holds its own lock, and the next validation
+     would then call the edited tree clean. */
   return 1;
 }
 static int heap_ptr_ok(uint32_t p) { return !p || (!(p & 7) && ((p >= 0x400000u && p < 0x2a00000u) || (p >= 0x10000000u && p < 0xF0000000u))); }
+/* A free chunk is only usable if every byte of it lies inside one live VirtualAlloc reservation. The free trees can be perfectly consistent
+   while a chunk reaches across a released region: that is the memcpy that faults one 64 KB page into a 400 KB copy. */
+static int heap_chunk_mapped(uint32_t a, uint32_t n) {
+  uint64_t base = 0, size = 0;
+  if (!n || a + (uint64_t)n > 0x100000000ull) return 0;
+  return aot_vres_peek(a, &base, &size) && (uint64_t)a + n <= base + size;
+}
 static __thread uint64_t hc_last_leave_pc; static __thread unsigned hc_n;
 static volatile int hc_reports; static volatile uint64_t hc_checks, hc_nodes_max;
 /* Walk all free trees of the game allocator. Returns the number of problems found; crash=1 reports everything with parent dumps and no repair. */
@@ -318,12 +307,15 @@ static int heap_validate(const char *where, int crash) {
       if (!n || !heap_ptr_ok(n)) { bad = 1; what = "node pointer"; }
       else { head = LD(uint32_t, n + 4); ch[0] = LD(uint32_t, n + 0x10); ch[1] = LD(uint32_t, n + 0x14); par = LD(uint32_t, n + 0x18);
         if (!heap_ptr_ok(ch[0]) || !heap_ptr_ok(ch[1])) { bad = 2; what = "child link"; }
-        else if (!(head & ~3u) || (head & ~3u) > 0x40000000u) { bad = 3; what = "chunk size"; } }
+        else if (!(head & ~3u) || (head & ~3u) > 0x40000000u) { bad = 3; what = "chunk size"; }
+        else if (crash && !heap_chunk_mapped(n, head & ~3u)) { bad = 4; what = "chunk reaches past its reservation"; } }
       if (bad) {
         problems++;
         if (hc_reports++ < 12 || crash) {
           fprintf(stderr, "[heap] TREE CORRUPT at %s: bin %d, %s (node %#x head %#x children %#x %#x parent %#x) reached from %#x; op %u, last leave pc %#llx, last entry %#llx\n",
               where, bin, what, n, head, ch[0], ch[1], par, from, hc_n, (unsigned long long)hc_last_leave_pc, (unsigned long long)aot_last_pc);
+          if (bad == 4) { uint64_t b = 0, s = 0; int have = aot_vres_peek(n, &b, &s);
+            fprintf(stderr, "[heap]   chunk %#x size %#x: %s %#llx+%#llx\n", n, head & ~3u, have ? "region" : "no region at", (unsigned long long)b, (unsigned long long)s); }
           if (n && heap_ptr_ok(n)) dump_hex("bad node", n, 64);
           if (from > 0x199df48u && heap_ptr_ok(from)) dump_hex("referrer", from, 64);
           if (!crash) dump_context(cur_cpu);

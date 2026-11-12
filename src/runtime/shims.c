@@ -142,15 +142,28 @@ SH(SetStdHandle) { int n = (int)A0; if (n < -12 || n > -10) return 0; g_std_hand
 SH(GetACP) { (void)c; return 1252; }
 SH(GetConsoleMode) { if (A1) ST(uint32_t, A1, 0); return 1; }
 SH(GetProcessHeap) { return (uint64_t)&g_heap; }
-SH(HeapAlloc) { void *p = (A1 & 8) ? calloc(1, A2 ? A2 : 1) : malloc(A2 ? A2 : 1); if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[ha] size=%llx -> %p\n", (unsigned long long)A2, p); return (uint64_t)p; }
-SH(HeapReAlloc) { return (uint64_t)realloc((void *)A2, A3); }
-SH(HeapFree) { free((void *)A2); return 1; }
-SH(HeapSize) { if (!A2) return (uint64_t)-1; return aot_is_pe32 ? (uint64_t)(((size_t)1 << ((uint64_t *)(uintptr_t)A2)[-2]) - 16) : 0; }
+/* The Heap* family must hand the guest addresses it can dereference: a host malloc pointer is 48-bit and would be truncated by a PE32 thunk, and
+ * HeapSize cannot decode a class byte the guest allocator never wrote. All four share one 16-byte header (size + magic) in low memory. */
+#define GHDR 16
+#define GMAGIC 0x48454150u
+static void *gheap_alloc(size_t n) { char *b = aot_gmalloc(n + GHDR); if (!b) return NULL; ((size_t *)b)[0] = n; ((size_t *)b)[1] = GMAGIC; return b + GHDR; }
+SH(HeapAlloc) { void *p = gheap_alloc(A2 ? (size_t)A2 : 1); if (p && (A1 & 8)) memset(p, 0, (size_t)A2); if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[ha] size=%llx -> %p\n", (unsigned long long)A2, p); return (uint64_t)(uintptr_t)p; }
+SH(HeapReAlloc) { char *b = A2 ? (char *)(uintptr_t)A2 - GHDR : NULL;
+  if (!b) return (uint64_t)(uintptr_t)gheap_alloc(A3 ? (size_t)A3 : 1);
+  if (((size_t *)b)[1] != GMAGIC) { aot_last_error = 6; return 0; }   /* not one of ours: never hand back a host pointer */
+  size_t old = ((size_t *)b)[0], n = A3 ? (size_t)A3 : 1; char *q = gheap_alloc(n); if (!q) { aot_last_error = 8; return 0; }
+  memcpy(q, b + GHDR, old < n ? old : n); aot_gfree(b); return (uint64_t)(uintptr_t)q; }
+SH(HeapFree) { char *b = A2 ? (char *)(uintptr_t)A2 - GHDR : NULL; if (b && ((size_t *)b)[1] == GMAGIC) aot_gfree(b); return 1; }
+SH(HeapSize) { char *b = A2 ? (char *)(uintptr_t)A2 - GHDR : NULL; if (!b || ((size_t *)b)[1] != GMAGIC) return (uint64_t)-1; return (uint64_t)((size_t *)b)[0]; }
 /* VirtualAlloc/VirtualFree with Windows semantics the guest allocators rely on: 64 KB-aligned reservations, a fixed address is honoured or the call
  * fails (never relocated), MEM_RELEASE frees the whole reservation (dwSize must be 0), MEM_DECOMMIT returns zeroed pages on recommit. */
 typedef struct { uint64_t raw, rawn, base, n, req; } VRes;   /* req: size the guest asked for (page-rounded) = what Windows reports as RegionSize */
 static VRes *vres; static int vres_n, vres_cap; static pthread_mutex_t vres_mu = PTHREAD_MUTEX_INITIALIZER;
-static int vres_add(VRes v) {   /* mu held: reuse a released slot, else grow (no fixed cap: guest allocators map thousands of 64 KB blocks) */
+static int vres_add(VRes v) {   /* mu held: reuse a released slot, else grow; never records two reservations over the same address */
+  for (int i = 0; i < vres_n; i++) if (vres[i].base && v.base < vres[i].base + vres[i].n && vres[i].base < v.base + v.n) {
+    static int rep; if (rep++ < 8) fprintf(stderr, "[va] overlapping reservation refused: %#llx+%#llx over %#llx+%#llx\n",
+      (unsigned long long)v.base, (unsigned long long)v.n, (unsigned long long)vres[i].base, (unsigned long long)vres[i].n);
+    return 0; }
   for (int i = 0; i < vres_n; i++) if (!vres[i].base) { vres[i] = v; return 1; }
   if (vres_n == vres_cap) { int nc = vres_cap ? vres_cap * 2 : 4096; VRes *nv = realloc(vres, (size_t)nc * sizeof *nv); if (!nv) return 0; vres = nv; vres_cap = nc; }
   vres[vres_n++] = v; return 1;
@@ -158,23 +171,31 @@ static int vres_add(VRes v) {   /* mu held: reuse a released slot, else grow (no
 static VRes *vres_find(uint64_t a) { for (int i = 0; i < vres_n; i++) if (vres[i].base && a >= vres[i].base && a < vres[i].base + vres[i].n) return &vres[i]; return NULL; }
 /* Released reservations stay mapped PROT_NONE ("quarantine") so their addresses are never handed out again behind the allocator's back: a stale free-list node
  * inside memory that VirtualAlloc re-issued is how the game's heap ended up with live blocks overlapping free chunks. Windows would fault on the stale access. */
-typedef struct { uint64_t a, n; } QEnt; static QEnt qlist[1024]; static int qhead, qcount; static uint64_t qbytes;
-static void va_quarantine(uint64_t a, uint64_t n) {
-  if (mmap((void *)a, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == MAP_FAILED) { munmap((void *)a, n); return; }
-  if (qcount == 1024 || qbytes + n > (768ull << 20)) { while (qcount && (qcount == 1024 || qbytes + n > (768ull << 20))) { QEnt *o = &qlist[qhead]; munmap((void *)o->a, o->n); qbytes -= o->n; qhead = (qhead + 1) % 1024; qcount--; } }
-  qlist[(qhead + qcount++) % 1024] = (QEnt){ a, n }; qbytes += n;
+/* Released space stays reserved PROT_NONE for good. Unmapping it (eviction, or a failed PROT_NONE map) is what puts a hole underneath a chunk
+ * the guest allocator has already coalesced into a live block, and the next copy write faults there one page past the surviving mapping. */
+#define QMAX 4096
+typedef struct { uint64_t a, n; } QEnt; static QEnt qlist[QMAX]; static int qcount;
+static int va_quarantine(uint64_t a, uint64_t n) {   /* 0: it could not be kept reserved, so the release must fail rather than leave a hole */
+  void *p = mmap((void *)a, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+  if (p != (void *)a) { if (p != MAP_FAILED) munmap(p, n); return 0; }
+  if (qcount == QMAX) { static int rep; if (rep++ < 4) fprintf(stderr, "[va] quarantine table full: %#llx+%#llx stays reserved but unreusable\n", (unsigned long long)a, (unsigned long long)n); return 1; }
+  qlist[qcount++] = (QEnt){ a, n }; return 1;
 }
-static int va_quarantine_take(uint64_t b, uint64_t n) {   /* a hinted VirtualAlloc over released space: hand it back as read/write */
-  for (int i = 0; i < qcount; i++) { QEnt *e = &qlist[(qhead + i) % 1024];
-    if (b >= e->a && b + n <= e->a + e->n) {
-      if (mprotect((void *)b, n, PROT_READ | PROT_WRITE) != 0) return 0;
-      madvise((void *)b, n, MADV_DONTNEED);   /* fresh zero pages */
-      if (b == e->a && n == e->n) { e->a = e->n = 0; }   /* exact reuse: entry consumed */
-      return 1; } }
+static int va_quarantine_take(uint64_t b, uint64_t n) {   /* hinted VirtualAlloc over released space: hand it back as read/write, keep the leftovers reserved */
+  for (int i = 0; i < qcount; i++) { QEnt old = qlist[i];
+    if (b < old.a || b + n > old.a + old.n) continue;
+    if (mprotect((void *)b, n, PROT_READ | PROT_WRITE) != 0) return 0;
+    madvise((void *)b, n, MADV_DONTNEED);   /* fresh zero pages */
+    qlist[i] = qlist[--qcount];
+    if (b > old.a && qcount < QMAX) qlist[qcount++] = (QEnt){ old.a, b - old.a };
+    if (b + n < old.a + old.n && qcount < QMAX) qlist[qcount++] = (QEnt){ b + n, old.a + old.n - (b + n) };
+    return 1; }
   return 0;
 }
 static void va_trace(const char *what, uint64_t addr, uint64_t size, uint64_t type, uint64_t out) {
-  static int n; if (!aot_is_pe32 || n >= 700) return; n++;
+  static int n; if (!aot_is_pe32) return;
+  if (n >= 700 && (strcmp(what, "alloc") != 0 || size < (256u << 10))) return;   /* keep the per-call budget, but never lose a heap-segment allocation */
+  n++;
   fprintf(stderr, "[va] %s addr=%#llx size=%#llx type=%#llx -> %#llx\n", what, (unsigned long long)addr, (unsigned long long)size, (unsigned long long)type, (unsigned long long)out);
 }
 SH(VirtualAlloc) {
@@ -184,34 +205,43 @@ SH(VirtualAlloc) {
     VRes *r = vres_find(addr);
     if (r) { if (addr + sz <= r->base + r->n) out = addr; }                  /* commit inside our reservation: pages are already there (zero or kept) */
     else {
-      uint64_t b = addr & ~0xFFFFULL; size_t n = sz + (size_t)(addr - b);
-      if (va_quarantine_take(b, n)) { if (vres_add((VRes){ b, n, b, n, n })) out = addr; }
+      /* Windows rounds a reservation hint down to the 64 KB granularity and returns that base; record exactly what is returned, so a
+         later VirtualFree(returned) succeeds and VirtualQuery reports the right base and RegionSize. */
+      uint64_t b = addr & ~0xFFFFULL; size_t n = (sz + (size_t)(addr - b) + 0xFFFF) & ~0xFFFFULL;
+      if (va_quarantine_take(b, n)) { if (vres_add((VRes){ b, n, b, n, n })) out = b; }
       else { void *p = mmap((void *)b, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
-      if (p == (void *)b && vres_add((VRes){ b, n, b, n })) out = addr;
+      if (p == (void *)b && vres_add((VRes){ b, n, b, n, n })) out = b;
       else if (p != MAP_FAILED) munmap(p, n); }                               /* address taken, or out of memory: fail honestly */
     }
   } else {
     size_t n = (sz + 0xFFFF) & ~0xFFFFULL; void *raw = aot_map_anon(n);   /* exact size, 64K-aligned: no hidden slack pages past the region end (allocators probe/merge by adjacency and trust RegionSize) */
-    if (raw && ((uint64_t)raw & 0xFFFF)) { munmap(raw, n); raw = aot_map_anon(n + 0x10000); if (raw) { uint64_t b2 = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; if (vres_add((VRes){ (uint64_t)raw, n + 0x10000, b2, n, sz })) out = b2; else munmap(raw, n + 0x10000); } }
-    else if (raw) { if (vres_add((VRes){ (uint64_t)raw, n, (uint64_t)raw, n, sz })) out = (uint64_t)raw; else munmap(raw, n); }
-    if (0) { uint64_t base = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; if (vres_add((VRes){ (uint64_t)raw, n + 0x10000, base, n })) out = base; else munmap(raw, n + 0x10000); }
+    if (raw && ((uint64_t)raw & 0xFFFF)) { munmap(raw, n); raw = aot_map_anon(n + 0x10000); if (raw) { uint64_t b2 = ((uint64_t)raw + 0xFFFF) & ~0xFFFFULL; if (vres_add((VRes){ (uint64_t)raw, n + 0x10000, b2, n, n })) out = b2; else munmap(raw, n + 0x10000); } }
+    else if (raw) { if (vres_add((VRes){ (uint64_t)raw, n, (uint64_t)raw, n, n })) out = (uint64_t)raw; else munmap(raw, n); }
   }
   if (!out) { static int nf; if (nf++ < 20) fprintf(stderr, "[aot] VirtualAlloc failed: addr=%llx size=%llx type=%llx (reservations=%d)\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, vres_n); }
   if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[va] addr=%llx size=%llx type=%llx -> %llx\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, (unsigned long long)out);
   va_trace("alloc", addr, A1, type, out);
   pthread_mutex_unlock(&vres_mu); (void)type; return out; }
 int aot_vres_lookup(uint64_t a, uint64_t *base, uint64_t *size) {   /* VirtualQuery support: the VirtualAlloc reservation containing a */
-  pthread_mutex_lock(&vres_mu); VRes *r = vres_find(a); int ok = r != NULL; if (ok) { *base = r->base; *size = r->req ? r->req : r->n; } pthread_mutex_unlock(&vres_mu); return ok; }
+  pthread_mutex_lock(&vres_mu); VRes *r = vres_find(a); int ok = r != NULL; if (ok) { *base = r->base; *size = r->req ? r->req : r->n; } pthread_mutex_unlock(&vres_mu); return ok;
+}
+int aot_vres_peek(uint64_t a, uint64_t *base, uint64_t *size) {   /* crash-handler safe: never blocks on a lock the faulting thread may hold */
+  if (pthread_mutex_trylock(&vres_mu)) return 0;
+  VRes *r = vres_find(a); int ok = r != NULL; if (ok) { *base = r->base; *size = r->req ? r->req : r->n; } pthread_mutex_unlock(&vres_mu); return ok;
+}
 SH(VirtualFree) {
   uint64_t addr = A0, size = A1, type = A2; int ok = 1; pthread_mutex_lock(&vres_mu); VRes *r = vres_find(addr);
-  if ((type & 0x8000) && r && r->base == addr) { va_trace("release", addr, r->n, type, 1); va_quarantine(r->raw, r->rawn); memset(r, 0, sizeof *r); }
+  if ((type & 0x8000) && r && r->base == addr) {
+    if (va_quarantine(r->raw, r->rawn)) { va_trace("release", addr, r->n, type, 1); memset(r, 0, sizeof *r); }
+    else ok = 0;   /* keeping it mapped is mandatory: an unmapped release is the hole a coalesced chunk later writes into */
+  }
   else if ((type & 0x4000) && r) { va_trace("decommit", addr, size, type, 1); size_t n = ((size ? size : r->n) + 0xFFF) & ~0xFFFULL; madvise((void *)(addr & ~0xFFFULL), n, MADV_DONTNEED); }   /* anonymous private: pages come back zeroed */
   else if (type & 0x8000) ok = 0;
   pthread_mutex_unlock(&vres_mu); return ok; }
 SH(VirtualProtect) { if (A3) ST(uint32_t, A3, 0x40); return 1; }
 SH(GetCommandLineA) {
   if (!aot_is_pe32) return (uint64_t)g_cmdline;
-  static char *guest; if (!guest) { guest = malloc(strlen(g_cmdline) + 1); if (!guest) return 0; strcpy(guest, g_cmdline); }
+  static char *guest; if (!guest) { guest = aot_gmalloc(strlen(g_cmdline) + 1); if (!guest) return 0; strcpy(guest, g_cmdline); }
   return (uint64_t)(uintptr_t)guest;
 }
 SH(GetCurrentProcess) { return (uint64_t)-1; }
@@ -227,11 +257,11 @@ SH(GetStartupInfoA) { size_t n = aot_is_pe32 ? 68 : 104; if (!A0) return 0; mems
 SH(GetEnvironmentStringsW) {
   if (g_env_w) return (uint64_t)(uintptr_t)g_env_w;
   size_t units = 1; for (char **e = environ; e && *e; e++) units += strlen(*e) + 1;
-  uint16_t *block = calloc(units, 2), *out = block; if (!block) { aot_last_error = 8; return 0; }
+  uint16_t *block = aot_gcalloc(units, 2), *out = block; if (!block) { aot_last_error = 8; return 0; }
   for (char **e = environ; e && *e; e++) { const unsigned char *s = (const unsigned char *)*e; while (*s) *out++ = *s++; *out++ = 0; }
   *out = 0; g_env_w = (char *)block; return (uint64_t)(uintptr_t)block;
 }
-SH(FreeEnvironmentStringsW) { void *p = (void *)(uintptr_t)A0; if (p == g_env_w) g_env_w = NULL; free(p); return 1; }
+SH(FreeEnvironmentStringsW) { void *p = (void *)(uintptr_t)A0; if (p == g_env_w) g_env_w = NULL; aot_gfree(p); return 1; }
 SH(TlsAlloc) { return (uint64_t)__atomic_fetch_add(&g_tls_n, 1, __ATOMIC_RELAXED); }
 SH(TlsGetValue) { return A0 < 1088 ? g_tls[A0] : 0; }
 SH(TlsSetValue) { if (A0 < 1088) g_tls[A0] = A1; return 1; }

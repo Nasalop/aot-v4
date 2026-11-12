@@ -99,9 +99,11 @@ void aot_heap_crash_dump(void);
 uint64_t aot_register_thunk(aot_host_fn fn, const char *name);
 
 #define LD(T, a) ({ T _v; memcpy(&_v, (const void *)(uintptr_t)(a), sizeof _v); _v; })
+int aot_vres_peek(uint64_t a, uint64_t *base, uint64_t *size);   /* crash-safe image of the VirtualAlloc reservation map */
 /* Heap-corruption guards (game allocator): stores into the free-tree bin table, or into any live free-tree node while the writer does not hold the
-   allocator lock, are dropped and reported with the writing region (see aot_stguard / aot_nodehit in runtime.c). */
-extern int aot_stguard(uint64_t addr, uint64_t val, unsigned size);
+   allocator lock, are reported with the writing region and the store is allowed through (see aot_stguard / aot_nodehit in runtime.c): a diagnostic
+   that rewrites or drops guest state changes the very thing it is measuring. */
+extern int aot_stguard(uint64_t addr, uint64_t val, unsigned size);   /* always 1: report only */
 extern uint8_t aot_nodemap[8192];
 extern int aot_nodehit(uint64_t addr, uint64_t val, unsigned size);
 #define AOT_NODE_SUSPECT(a, n) (((aot_nodemap[((a) >> 8) & 0x1FFF] >> (((a) >> 5) & 7)) | (aot_nodemap[(((a) + (n) - 1) >> 8) & 0x1FFF] >> ((((a) + (n) - 1) >> 5) & 7))) & 1)

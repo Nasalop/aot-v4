@@ -16,7 +16,8 @@
 extern int aot_main(int, char **);
 extern void aot_android_set_window(ANativeWindow *);
 static struct android_app *g_app;
-void aot_exit(int code) { fflush(stdout); dprintf(2, "\n[aot] program exited with code %d\n", code); LOG("exit %d", code); for (;;) sleep(3600); }
+/* A finished or crashed guest must end the process: parking the thread here leaves the activity alive with a dead renderer, which is the white screen. */
+void aot_exit(int code) { fflush(stdout); dprintf(2, "\n[aot] program exited with code %d\n", code); LOG("exit %d", code); _exit(code); }
 
 static void *game_thread(void *arg) {
   (void)arg;
