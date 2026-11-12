@@ -259,20 +259,42 @@ __attribute__((noinline)) int aot_stguard(uint64_t addr, uint64_t val, unsigned 
 }
 /* Called when the guest takes/releases the allocator lock: a tree-bin slot holding a small non-pointer is the
    exact state that later crashes tmalloc_large.  Report who ran before it and repair the slot. */
+static int heap_ptr_ok(uint32_t p) { return !p || (!(p & 7) && ((p >= 0x400000u && p < 0x2a00000u) || (p >= 0x10000000u && p < 0xF0000000u))); }
+static __thread uint64_t hc_last_leave_pc; static __thread unsigned hc_n;
 void aot_heap_check(const char *where) {
-  static int n;
-  if (!aot_is_pe32 || !in_img(0x199dec8u, 0x80)) return;
-  volatile uint32_t *s = (volatile uint32_t *)(uintptr_t)0x199dec8u;
-  for (int i = 0; i < 32; i++) {
-    uint32_t v = s[i];
-    if (v && v < 0x10000u) {
-      if (n++ < 20) {
-        fprintf(stderr, "[heap] CORRUPT tree-bin %d = %#x seen at %s (last entry %#llx)\n", i, v, where, (unsigned long long)aot_last_pc);
-        if (n <= 3) dump_context(cur_cpu);
+  static volatile int reports; static uint64_t ops;
+  if (!aot_is_pe32 || reports >= 12 || !in_img(0x199dec8u, 0x80)) return;
+  uint32_t stack[4096]; int sp = 0;
+  /* Walk every free tree: each node's child/parent links must be plausible heap pointers and the children must point back at the node. */
+  for (int bin = 0; bin < 32; bin++) {
+    uint32_t root = LD(uint32_t, 0x199dec8u + 4 * bin);
+    if (!root) continue;
+    stack[sp++] = root; unsigned visited = 0;
+    uint32_t parent_of_root = 0x199dec8u + 4 * bin;
+    (void)parent_of_root;
+    while (sp > 0 && visited++ < 20000) {
+      uint32_t n = stack[--sp]; int bad = 0; const char *what = "";
+      if (!heap_ptr_ok(n) || !n) { bad = 1; what = "node pointer"; }
+      uint32_t ch[2] = {0, 0}, par = 0, head = 0;
+      if (!bad) { head = LD(uint32_t, n + 4); ch[0] = LD(uint32_t, n + 0x10); ch[1] = LD(uint32_t, n + 0x14); par = LD(uint32_t, n + 0x18);
+        if (!heap_ptr_ok(ch[0]) || !heap_ptr_ok(ch[1])) { bad = 2; what = "child link"; }
+        else if (!(head & ~3u) || (head & ~3u) > 0x40000000u) { bad = 3; what = "chunk size"; } }
+      if (bad) {
+        reports++;
+        fprintf(stderr, "[heap] TREE CORRUPT at %s: bin %d, %s (node %#x head %#x children %#x %#x parent %#x), tid-local op %u, last leave pc %#llx, last entry %#llx\n",
+            where, bin, what, n, head, ch[0], ch[1], par, hc_n, (unsigned long long)hc_last_leave_pc, (unsigned long long)aot_last_pc);
+        if (n && heap_ptr_ok(n)) dump_hex("bad node", n, 64);
+        if (bad == 2) { /* repair: cut the bad link so the tree stays walkable */
+          if (!heap_ptr_ok(ch[0])) ST(uint32_t, n + 0x10, 0); if (!heap_ptr_ok(ch[1])) ST(uint32_t, n + 0x14, 0); }
+        else if (n == root || !n) ST(uint32_t, 0x199dec8u + 4 * bin, 0);
+        dump_context(cur_cpu); sp = 0; break;
       }
-      s[i] = 0;
+      if (sp + 2 < 4096) { if (ch[0]) stack[sp++] = ch[0]; if (ch[1]) stack[sp++] = ch[1]; }
     }
+    sp = 0;
   }
+  hc_n++; ops++;
+  if (where[3] == 'l') hc_last_leave_pc = aot_last_pc;
 }
 
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
@@ -337,7 +359,7 @@ uint64_t aot_call(CPU *c, uint64_t fn, int nargs, ...) {
    gives the same ordering guarantees a single-core x86 has, and thread switches are full barriers.  AOT_NOPIN=1 disables it. */
 static int g_pin_cpu = -2;
 static void aot_pin_guest_thread(void) {
-  if (getenv("AOT_NOPIN")) return;
+  if (!getenv("AOT_PIN")) return;   /* off by default: pinning did not change the crash */
   if (g_pin_cpu == -2) {
     int best = -1; long bf = -1;
     for (int i = 0; i < 16; i++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
