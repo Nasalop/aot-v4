@@ -230,6 +230,8 @@ static void cs_leave(uint64_t cs) {
 }
 SYS(InitializeCriticalSection) { memset((void *)(uintptr_t)A(0), 0, aot_is_pe32 ? 24 : 40); return 0; }
 SYS(InitializeCriticalSectionAndSpinCount) { memset((void *)(uintptr_t)A(0), 0, aot_is_pe32 ? 24 : 40); return 1; }
+void aot_heap_lock(void) { cs_enter(0x199df84u); }
+void aot_heap_unlock(void) { cs_leave(0x199df84u); }
 SYS(EnterCriticalSection) { if (A(0) == 0x199df84u) aot_heap_check("CS enter"); cs_enter(A(0)); return 0; }
 SYS(LeaveCriticalSection) { if (A(0) == 0x199df84u) aot_heap_check("CS leave"); cs_leave(A(0)); return 0; }
 SYS(TryEnterCriticalSection) { uint64_t cs = A(0), tid = cur_tid(), rec = cs_recursion_offset();
