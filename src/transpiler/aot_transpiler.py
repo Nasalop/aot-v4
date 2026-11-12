@@ -995,6 +995,12 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                     # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
                     # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
                     if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
+                    # AC1's own dlmalloc (mspace malloc 0x41ef40 / free 0x417890, both thiscall with one stack argument) ends up with overlapping free chunks here.
+                    # Serve those two entry points from the runtime's allocator instead (header words are emulated so size queries keep working).
+                    if i.address == 0x41ef40 and i.mnemonic == 'push':
+                        s = '{extern uint32_t aot_hook_malloc(uint32_t);r0=aot_hook_malloc(LD(uint32_t,(uint32_t)r4+4));pc=POP32();r4=(uint32_t)(r4+4);goto dispatch;}' + s
+                    if i.address == 0x417890 and i.mnemonic == 'push':
+                        s = '{extern void aot_hook_free(uint32_t);aot_hook_free(LD(uint32_t,(uint32_t)r4+4));pc=POP32();r4=(uint32_t)(r4+4);goto dispatch;}' + s
                 except Exception as e:   # Unsup, or a translator bug on one instruction: record it, keep going
                     unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
                     s = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
