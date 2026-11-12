@@ -331,7 +331,25 @@ uint64_t aot_call(CPU *c, uint64_t fn, int nargs, ...) {
 #define main aot_main
 #endif
 /* Run guest code `fn(param)` on a fresh guest CPU/TEB/stack (used by CreateThread). Returns eax. */
+#include <sys/syscall.h>
+/* x86 guests rely on total store order; ARM reorders plain loads/stores between cores, so lock-free hand-offs in the game
+   (job flags, refcounts, lock-free queues) can see stale data and corrupt its allocator.  Running every guest thread on ONE core
+   gives the same ordering guarantees a single-core x86 has, and thread switches are full barriers.  AOT_NOPIN=1 disables it. */
+static int g_pin_cpu = -2;
+static void aot_pin_guest_thread(void) {
+  if (getenv("AOT_NOPIN")) return;
+  if (g_pin_cpu == -2) {
+    int best = -1; long bf = -1;
+    for (int i = 0; i < 16; i++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+      FILE *f = fopen(p, "r"); if (!f) continue; long v = 0; if (fscanf(f, "%ld", &v) == 1 && v > bf) { bf = v; best = i; } fclose(f); }
+    g_pin_cpu = best >= 0 ? best : 7;
+    fprintf(stderr, "[aot] guest threads pinned to cpu %d (single-core ordering, x86 TSO emulation)\n", g_pin_cpu);
+  }
+  uint64_t mask[2] = { g_pin_cpu < 64 ? 1ull << g_pin_cpu : 0, 0 };
+  if (syscall(SYS_sched_setaffinity, 0, sizeof mask, mask) != 0) { static int w; if (!w++) fprintf(stderr, "[aot] pinning failed: %s\\n", strerror(errno)); }
+}
 uint64_t aot_thread_run(uint64_t fn, uint64_t param, size_t ssz, uint32_t tid) {
+  aot_pin_guest_thread();
   if (ssz < (1u << 20)) ssz = 1u << 20; if (ssz > (64u << 20)) ssz = 64u << 20;
   CPU *c = calloc(1, sizeof(CPU)); if (!c) return 0;
   if (aot_is_pe32) {
@@ -360,6 +378,7 @@ uint64_t aot_thread_run(uint64_t fn, uint64_t param, size_t ssz, uint32_t tid) {
 }
 
 int main(int argc, char **argv) {
+  aot_pin_guest_thread();
   if (argc < 2) { fprintf(stderr, "usage: %s game.exe [args...]\n", argv[0]); return 2; }
   g_exe_path = argv[1];
   { pthread_t wt; if (!pthread_create(&wt, NULL, watchdog, NULL)) pthread_detach(wt); }
