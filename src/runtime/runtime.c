@@ -261,40 +261,58 @@ __attribute__((noinline)) int aot_stguard(uint64_t addr, uint64_t val, unsigned 
    exact state that later crashes tmalloc_large.  Report who ran before it and repair the slot. */
 static int heap_ptr_ok(uint32_t p) { return !p || (!(p & 7) && ((p >= 0x400000u && p < 0x2a00000u) || (p >= 0x10000000u && p < 0xF0000000u))); }
 static __thread uint64_t hc_last_leave_pc; static __thread unsigned hc_n;
-void aot_heap_check(const char *where) {
-  static volatile int reports; static uint64_t ops;
-  if (!aot_is_pe32 || reports >= 12 || !in_img(0x199dec8u, 0x80)) return;
-  uint32_t stack[4096]; int sp = 0;
-  /* Walk every free tree: each node's child/parent links must be plausible heap pointers and the children must point back at the node. */
+static volatile int hc_reports; static volatile uint64_t hc_checks, hc_nodes_max;
+/* Walk all free trees of the game allocator. Returns the number of problems found; crash=1 reports everything with parent dumps and no repair. */
+static int heap_validate(const char *where, int crash) {
+  static __thread uint32_t st[4096][2]; int problems = 0; uint64_t total = 0;
+  uint32_t map = LD(uint32_t, 0x199dda0u);
   for (int bin = 0; bin < 32; bin++) {
-    uint32_t root = LD(uint32_t, 0x199dec8u + 4 * bin);
+    uint32_t root = LD(uint32_t, 0x199dec8u + 4 * bin); int sp = 0;
+    if (crash && (!!root != !!(map & (1u << bin)))) fprintf(stderr, "[heap] treemap bit %d = %d but slot = %#x\n", bin, !!(map & (1u << bin)), root);
     if (!root) continue;
-    stack[sp++] = root; unsigned visited = 0;
-    uint32_t parent_of_root = 0x199dec8u + 4 * bin;
-    (void)parent_of_root;
+    st[sp][0] = root; st[sp++][1] = 0x199dec8u + 4 * bin; unsigned visited = 0;
     while (sp > 0 && visited++ < 20000) {
-      uint32_t n = stack[--sp]; int bad = 0; const char *what = "";
-      if (!heap_ptr_ok(n) || !n) { bad = 1; what = "node pointer"; }
+      uint32_t n = st[--sp][0], from = st[sp][1]; int bad = 0; const char *what = ""; total++;
       uint32_t ch[2] = {0, 0}, par = 0, head = 0;
-      if (!bad) { head = LD(uint32_t, n + 4); ch[0] = LD(uint32_t, n + 0x10); ch[1] = LD(uint32_t, n + 0x14); par = LD(uint32_t, n + 0x18);
+      if (!n || !heap_ptr_ok(n)) { bad = 1; what = "node pointer"; }
+      else { head = LD(uint32_t, n + 4); ch[0] = LD(uint32_t, n + 0x10); ch[1] = LD(uint32_t, n + 0x14); par = LD(uint32_t, n + 0x18);
         if (!heap_ptr_ok(ch[0]) || !heap_ptr_ok(ch[1])) { bad = 2; what = "child link"; }
         else if (!(head & ~3u) || (head & ~3u) > 0x40000000u) { bad = 3; what = "chunk size"; } }
       if (bad) {
-        reports++;
-        fprintf(stderr, "[heap] TREE CORRUPT at %s: bin %d, %s (node %#x head %#x children %#x %#x parent %#x), tid-local op %u, last leave pc %#llx, last entry %#llx\n",
-            where, bin, what, n, head, ch[0], ch[1], par, hc_n, (unsigned long long)hc_last_leave_pc, (unsigned long long)aot_last_pc);
-        if (n && heap_ptr_ok(n)) dump_hex("bad node", n, 64);
-        if (bad == 2) { /* repair: cut the bad link so the tree stays walkable */
-          if (!heap_ptr_ok(ch[0])) ST(uint32_t, n + 0x10, 0); if (!heap_ptr_ok(ch[1])) ST(uint32_t, n + 0x14, 0); }
-        else if (n == root || !n) ST(uint32_t, 0x199dec8u + 4 * bin, 0);
-        dump_context(cur_cpu); sp = 0; break;
+        problems++;
+        if (hc_reports++ < 12 || crash) {
+          fprintf(stderr, "[heap] TREE CORRUPT at %s: bin %d, %s (node %#x head %#x children %#x %#x parent %#x) reached from %#x; op %u, last leave pc %#llx, last entry %#llx\n",
+              where, bin, what, n, head, ch[0], ch[1], par, from, hc_n, (unsigned long long)hc_last_leave_pc, (unsigned long long)aot_last_pc);
+          if (n && heap_ptr_ok(n)) dump_hex("bad node", n, 64);
+          if (from > 0x199df48u && heap_ptr_ok(from)) dump_hex("referrer", from, 64);
+          if (!crash) dump_context(cur_cpu);
+        }
+        if (!crash) {
+          if (bad == 2) { if (!heap_ptr_ok(ch[0])) ST(uint32_t, n + 0x10, 0); if (!heap_ptr_ok(ch[1])) ST(uint32_t, n + 0x14, 0); }
+          else if (from >= 0x199dec8u && from < 0x199df48u) ST(uint32_t, from, 0);
+          else if (heap_ptr_ok(from)) { if (LD(uint32_t, from + 0x10) == n) ST(uint32_t, from + 0x10, 0); if (LD(uint32_t, from + 0x14) == n) ST(uint32_t, from + 0x14, 0); }
+          return problems; }
+        continue;
       }
-      if (sp + 2 < 4096) { if (ch[0]) stack[sp++] = ch[0]; if (ch[1]) stack[sp++] = ch[1]; }
+      if (sp + 2 < 4096) { if (ch[0]) { st[sp][0] = ch[0]; st[sp++][1] = n; } if (ch[1]) { st[sp][0] = ch[1]; st[sp++][1] = n; } }
     }
-    sp = 0;
   }
-  hc_n++; ops++;
-  if (where[3] == 'l') hc_last_leave_pc = aot_last_pc;
+  if (total > hc_nodes_max) hc_nodes_max = total;
+  return problems;
+}
+void aot_heap_check(const char *where) {
+  if (!aot_is_pe32 || !in_img(0x199dec8u, 0x80)) return;
+  uint64_t k = __atomic_add_fetch(&hc_checks, 1, __ATOMIC_RELAXED);
+  if (k == 1000 || k == 100000 || k == 1000000) fprintf(stderr, "[heap] validator alive: %llu checks, largest tree set so far %llu nodes\n", (unsigned long long)k, (unsigned long long)hc_nodes_max);
+  heap_validate(where, 0);
+  hc_n++; if (where[3] == 'l') hc_last_leave_pc = aot_last_pc;
+}
+/* Called from the fatal-signal handler: report the allocator state exactly as it is at the crash. */
+void aot_heap_crash_dump(void) {
+  if (!aot_is_pe32 || !in_img(0x199dec8u, 0x80)) return;
+  fprintf(stderr, "[heap] state at crash (checks so far %llu, treemap %#x):\n", (unsigned long long)hc_checks, LD(uint32_t, 0x199dda0u));
+  for (int i = 0; i < 32; i++) { uint32_t s = LD(uint32_t, 0x199dec8u + 4 * i); if (s) fprintf(stderr, "  bin %2d slot %#x\n", i, s); }
+  int p = heap_validate("crash", 1); fprintf(stderr, "[heap] crash-time validation: %d problem(s)\n", p);
 }
 
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
