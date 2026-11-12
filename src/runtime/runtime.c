@@ -320,11 +320,28 @@ static int heap_validate(const char *where, int crash) {
   if (total > hc_nodes_max) hc_nodes_max = total;
   return problems;
 }
+static int cmp_u32(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+/* Two free chunks that overlap are what later hands one memory region to two owners. Find the operation that creates the overlap. */
+static void heap_overlap_check(const char *where) {
+  static int rep; if (rep >= 4 || hc_tmp_n < 2) return;
+  static __thread uint32_t s[8192]; unsigned n = hc_tmp_n; memcpy(s, hc_tmp, n * 4); qsort(s, n, 4, cmp_u32);
+  for (unsigned i = 0; i + 1 < n; i++) {
+    uint32_t a = s[i], b = s[i + 1], sa = LD(uint32_t, a + 4) & ~3u;
+    if (a + sa > b) {
+      rep++;
+      fprintf(stderr, "[heap] OVERLAPPING FREE CHUNKS at %s: %#x (size %#x, ends %#x) and %#x (size %#x); op %u, last leave pc %#llx, last entry %#llx\n",
+          where, a, sa, a + sa, b, LD(uint32_t, b + 4) & ~3u, hc_n, (unsigned long long)hc_last_leave_pc, (unsigned long long)aot_last_pc);
+      fprintf(stderr, "[heap]   words at a: "); for (int k = 0; k < 8; k++) fprintf(stderr, "%x ", LD(uint32_t, a + 4 * k));
+      fprintf(stderr, "\n[heap]   words at b-8: "); for (int k = 0; k < 8; k++) fprintf(stderr, "%x ", LD(uint32_t, b - 8 + 4 * k)); fprintf(stderr, "\n");
+      dump_context(cur_cpu); return; }
+  }
+}
 void aot_heap_check(const char *where) {
   if (!aot_is_pe32 || !in_img(0x199dec8u, 0x80)) return;
   uint64_t k = __atomic_add_fetch(&hc_checks, 1, __ATOMIC_RELAXED);
   if (k == 1000 || k == 100000 || k == 1000000) fprintf(stderr, "[heap] validator alive: %llu checks, largest tree set so far %llu nodes\n", (unsigned long long)k, (unsigned long long)hc_nodes_max);
   int bad = heap_validate(where, 0);
+  if (!bad) heap_overlap_check(where);
   hc_n++;
   if (where[3] == 'l') {   /* leave: publish the verified node set, then the lock is gone */
     hc_last_leave_pc = aot_last_pc;
