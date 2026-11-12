@@ -25,7 +25,7 @@ static inline uint64_t argn(CPU *c, int n) { return n == 0 ? c->r[1] : n == 1 ? 
 #define FLT(i) (c->x[i].f[0])
 
 static int g_argc; static char **g_argv; __thread uint32_t aot_last_error;
-static char g_iob[3 * 0x58]; static uint64_t g_tls[1088]; static int g_tls_n;
+static char g_iob[3 * 0x58]; static __thread uint64_t g_tls[1088];   /* per-thread slots: Win32 TLS is per thread (CRT _ptiddata lives here) */ static int g_tls_n;
 static uint64_t g_heap = 0x7000;
 static uint64_t g_std_handles[3] = { 0x10, 0x11, 0x12 };
 static char *g_env_w;
@@ -209,10 +209,10 @@ SH(GetEnvironmentStringsW) {
   *out = 0; g_env_w = (char *)block; return (uint64_t)(uintptr_t)block;
 }
 SH(FreeEnvironmentStringsW) { void *p = (void *)(uintptr_t)A0; if (p == g_env_w) g_env_w = NULL; free(p); return 1; }
-SH(TlsAlloc) { return (uint64_t)g_tls_n++; }
+SH(TlsAlloc) { return (uint64_t)__atomic_fetch_add(&g_tls_n, 1, __ATOMIC_RELAXED); }
 SH(TlsGetValue) { return A0 < 1088 ? g_tls[A0] : 0; }
 SH(TlsSetValue) { if (A0 < 1088) g_tls[A0] = A1; return 1; }
-SH(FlsAlloc) { return (uint64_t)g_tls_n++; }
+SH(FlsAlloc) { return (uint64_t)__atomic_fetch_add(&g_tls_n, 1, __ATOMIC_RELAXED); }
 static int copy_module_name_w(char *out, size_t cap, const uint16_t *wide) {
   if (!wide || !cap) return 0;
   size_t i = 0;
