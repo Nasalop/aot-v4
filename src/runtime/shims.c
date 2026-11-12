@@ -156,6 +156,27 @@ static int vres_add(VRes v) {   /* mu held: reuse a released slot, else grow (no
   vres[vres_n++] = v; return 1;
 }
 static VRes *vres_find(uint64_t a) { for (int i = 0; i < vres_n; i++) if (vres[i].base && a >= vres[i].base && a < vres[i].base + vres[i].n) return &vres[i]; return NULL; }
+/* Released reservations stay mapped PROT_NONE ("quarantine") so their addresses are never handed out again behind the allocator's back: a stale free-list node
+ * inside memory that VirtualAlloc re-issued is how the game's heap ended up with live blocks overlapping free chunks. Windows would fault on the stale access. */
+typedef struct { uint64_t a, n; } QEnt; static QEnt qlist[1024]; static int qhead, qcount; static uint64_t qbytes;
+static void va_quarantine(uint64_t a, uint64_t n) {
+  if (mmap((void *)a, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == MAP_FAILED) { munmap((void *)a, n); return; }
+  if (qcount == 1024 || qbytes + n > (768ull << 20)) { while (qcount && (qcount == 1024 || qbytes + n > (768ull << 20))) { QEnt *o = &qlist[qhead]; munmap((void *)o->a, o->n); qbytes -= o->n; qhead = (qhead + 1) % 1024; qcount--; } }
+  qlist[(qhead + qcount++) % 1024] = (QEnt){ a, n }; qbytes += n;
+}
+static int va_quarantine_take(uint64_t b, uint64_t n) {   /* a hinted VirtualAlloc over released space: hand it back as read/write */
+  for (int i = 0; i < qcount; i++) { QEnt *e = &qlist[(qhead + i) % 1024];
+    if (b >= e->a && b + n <= e->a + e->n) {
+      if (mprotect((void *)b, n, PROT_READ | PROT_WRITE) != 0) return 0;
+      madvise((void *)b, n, MADV_DONTNEED);   /* fresh zero pages */
+      if (b == e->a && n == e->n) { e->a = e->n = 0; }   /* exact reuse: entry consumed */
+      return 1; } }
+  return 0;
+}
+static void va_trace(const char *what, uint64_t addr, uint64_t size, uint64_t type, uint64_t out) {
+  static int n; if (!aot_is_pe32 || n >= 700) return; n++;
+  fprintf(stderr, "[va] %s addr=%#llx size=%#llx type=%#llx -> %#llx\n", what, (unsigned long long)addr, (unsigned long long)size, (unsigned long long)type, (unsigned long long)out);
+}
 SH(VirtualAlloc) {
   uint64_t addr = A0, type = A2; size_t sz = (A1 + 0xFFF) & ~0xFFFULL; if (!sz) return 0;
   pthread_mutex_lock(&vres_mu); uint64_t out = 0;
@@ -164,9 +185,10 @@ SH(VirtualAlloc) {
     if (r) { if (addr + sz <= r->base + r->n) out = addr; }                  /* commit inside our reservation: pages are already there (zero or kept) */
     else {
       uint64_t b = addr & ~0xFFFFULL; size_t n = sz + (size_t)(addr - b);
-      void *p = mmap((void *)b, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+      if (va_quarantine_take(b, n)) { if (vres_add((VRes){ b, n, b, n, n })) out = addr; }
+      else { void *p = mmap((void *)b, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
       if (p == (void *)b && vres_add((VRes){ b, n, b, n })) out = addr;
-      else if (p != MAP_FAILED) munmap(p, n);                                /* address taken, or out of memory: fail honestly */
+      else if (p != MAP_FAILED) munmap(p, n); }                               /* address taken, or out of memory: fail honestly */
     }
   } else {
     size_t n = (sz + 0xFFFF) & ~0xFFFFULL; void *raw = aot_map_anon(n);   /* exact size, 64K-aligned: no hidden slack pages past the region end (allocators probe/merge by adjacency and trust RegionSize) */
@@ -176,13 +198,14 @@ SH(VirtualAlloc) {
   }
   if (!out) { static int nf; if (nf++ < 20) fprintf(stderr, "[aot] VirtualAlloc failed: addr=%llx size=%llx type=%llx (reservations=%d)\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, vres_n); }
   if (getenv("AOT_TRACE_VA")) fprintf(stderr, "[va] addr=%llx size=%llx type=%llx -> %llx\n", (unsigned long long)addr, (unsigned long long)A1, (unsigned long long)type, (unsigned long long)out);
+  va_trace("alloc", addr, A1, type, out);
   pthread_mutex_unlock(&vres_mu); (void)type; return out; }
 int aot_vres_lookup(uint64_t a, uint64_t *base, uint64_t *size) {   /* VirtualQuery support: the VirtualAlloc reservation containing a */
   pthread_mutex_lock(&vres_mu); VRes *r = vres_find(a); int ok = r != NULL; if (ok) { *base = r->base; *size = r->req ? r->req : r->n; } pthread_mutex_unlock(&vres_mu); return ok; }
 SH(VirtualFree) {
   uint64_t addr = A0, size = A1, type = A2; int ok = 1; pthread_mutex_lock(&vres_mu); VRes *r = vres_find(addr);
-  if ((type & 0x8000) && r && r->base == addr) { munmap((void *)r->raw, r->rawn); memset(r, 0, sizeof *r); }
-  else if ((type & 0x4000) && r) { size_t n = ((size ? size : r->n) + 0xFFF) & ~0xFFFULL; madvise((void *)(addr & ~0xFFFULL), n, MADV_DONTNEED); }   /* anonymous private: pages come back zeroed */
+  if ((type & 0x8000) && r && r->base == addr) { va_trace("release", addr, r->n, type, 1); va_quarantine(r->raw, r->rawn); memset(r, 0, sizeof *r); }
+  else if ((type & 0x4000) && r) { va_trace("decommit", addr, size, type, 1); size_t n = ((size ? size : r->n) + 0xFFF) & ~0xFFFULL; madvise((void *)(addr & ~0xFFFULL), n, MADV_DONTNEED); }   /* anonymous private: pages come back zeroed */
   else if (type & 0x8000) ok = 0;
   pthread_mutex_unlock(&vres_mu); return ok; }
 SH(VirtualProtect) { if (A3) ST(uint32_t, A3, 0x40); return 1; }
