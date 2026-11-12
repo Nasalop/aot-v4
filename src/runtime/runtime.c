@@ -259,13 +259,32 @@ __attribute__((noinline)) int aot_stguard(uint64_t addr, uint64_t val, unsigned 
 }
 /* Called when the guest takes/releases the allocator lock: a tree-bin slot holding a small non-pointer is the
    exact state that later crashes tmalloc_large.  Report who ran before it and repair the slot. */
+uint8_t aot_nodemap[8192];
+static uint32_t hc_nodes[8192]; static volatile unsigned hc_nn; static __thread int hc_in_lock;
+static uint32_t hc_tmp[8192]; static __thread unsigned hc_tmp_n;
+__attribute__((noinline)) int aot_nodehit(uint64_t addr, uint64_t val, unsigned size) {
+  static int n;
+  if (hc_in_lock || !aot_is_pe32) return 1;
+  unsigned cnt = hc_nn; uint32_t hit = 0;
+  for (unsigned i = 0; i < cnt && i < 8192; i++) { uint32_t nd = hc_nodes[i]; if (addr + size > nd + 4 && addr < nd + 0x1c) { hit = nd; break; } }
+  if (!hit) return 1;
+  if (n++ < 30) {
+    uintptr_t ret = (uintptr_t)__builtin_return_address(0); int k = -1; uintptr_t best = 0;
+    for (int m = 0; m < aot_nregions; m++) { uintptr_t f = (uintptr_t)aot_region_fn[m]; if (f <= ret && f > best) { best = f; k = m; } }
+    fprintf(stderr, "[heap] WRITE INTO FREE NODE (dropped): addr %#llx (node %#x +%#x) size %u val %#llx; writer region #%d guest %#llx..%#llx +%#lx; last entry %#llx\n",
+        (unsigned long long)addr, hit, (unsigned)(addr - hit), size, (unsigned long long)val, k, k >= 0 ? (unsigned long long)aot_region_lo[k] : 0ull,
+        k >= 0 ? (unsigned long long)aot_region_hi[k] : 0ull, (unsigned long)(ret - best), (unsigned long long)aot_last_pc);
+    if (n <= 6) dump_context(cur_cpu);
+  }
+  return 0;
+}
 static int heap_ptr_ok(uint32_t p) { return !p || (!(p & 7) && ((p >= 0x400000u && p < 0x2a00000u) || (p >= 0x10000000u && p < 0xF0000000u))); }
 static __thread uint64_t hc_last_leave_pc; static __thread unsigned hc_n;
 static volatile int hc_reports; static volatile uint64_t hc_checks, hc_nodes_max;
 /* Walk all free trees of the game allocator. Returns the number of problems found; crash=1 reports everything with parent dumps and no repair. */
 static int heap_validate(const char *where, int crash) {
   static __thread uint32_t st[4096][2]; int problems = 0; uint64_t total = 0;
-  uint32_t map = LD(uint32_t, 0x199dda0u);
+  uint32_t map = LD(uint32_t, 0x199dda0u); hc_tmp_n = 0;
   for (int bin = 0; bin < 32; bin++) {
     uint32_t root = LD(uint32_t, 0x199dec8u + 4 * bin); int sp = 0;
     if (crash && (!!root != !!(map & (1u << bin)))) fprintf(stderr, "[heap] treemap bit %d = %d but slot = %#x\n", bin, !!(map & (1u << bin)), root);
@@ -294,6 +313,7 @@ static int heap_validate(const char *where, int crash) {
           return problems; }
         continue;
       }
+      if (!crash && hc_tmp_n < 8192) hc_tmp[hc_tmp_n++] = n;
       if (sp + 2 < 4096) { if (ch[0]) { st[sp][0] = ch[0]; st[sp++][1] = n; } if (ch[1]) { st[sp][0] = ch[1]; st[sp++][1] = n; } }
     }
   }
@@ -304,8 +324,14 @@ void aot_heap_check(const char *where) {
   if (!aot_is_pe32 || !in_img(0x199dec8u, 0x80)) return;
   uint64_t k = __atomic_add_fetch(&hc_checks, 1, __ATOMIC_RELAXED);
   if (k == 1000 || k == 100000 || k == 1000000) fprintf(stderr, "[heap] validator alive: %llu checks, largest tree set so far %llu nodes\n", (unsigned long long)k, (unsigned long long)hc_nodes_max);
-  heap_validate(where, 0);
-  hc_n++; if (where[3] == 'l') hc_last_leave_pc = aot_last_pc;
+  int bad = heap_validate(where, 0);
+  hc_n++;
+  if (where[3] == 'l') {   /* leave: publish the verified node set, then the lock is gone */
+    hc_last_leave_pc = aot_last_pc;
+    if (!bad) { memset(aot_nodemap, 0, sizeof aot_nodemap); memcpy(hc_nodes, hc_tmp, hc_tmp_n * 4); hc_nn = hc_tmp_n;
+      for (unsigned i = 0; i < hc_tmp_n; i++) { uint32_t a = hc_tmp[i] + 4, b = hc_tmp[i] + 0x1b; aot_nodemap[(a >> 8) & 0x1FFF] |= 1u << ((a >> 5) & 7); aot_nodemap[(b >> 8) & 0x1FFF] |= 1u << ((b >> 5) & 7); } }
+    hc_in_lock = 0;
+  } else hc_in_lock = 1;
 }
 /* Called from the fatal-signal handler: report the allocator state exactly as it is at the crash. */
 void aot_heap_crash_dump(void) {
