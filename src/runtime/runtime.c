@@ -237,7 +237,12 @@ static void dump_context(CPU *c) {
   for (unsigned i = 0; i < 32; i++) { int idx = recent[(recent_n + i) % 32]; if (idx > 0 && idx < nthunks) fprintf(stderr, "  %s\n", thunks[idx].name); }
   dump_call_site();
   if (aot_is_pe32 && c) { uint32_t sp = (uint32_t)c->r[4]; fprintf(stderr, "[aot] eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n[aot] stack:", (unsigned)c->r[0], (unsigned)c->r[1], (unsigned)c->r[2], (unsigned)c->r[3], sp, (unsigned)c->r[5], (unsigned)c->r[6], (unsigned)c->r[7]);
-    for (int i = 0; i < 8; i++) fprintf(stderr, " %08x", LD(uint32_t, sp + 4 * i)); fprintf(stderr, "\n"); }
+    /* Probe, never assume: when esp itself is the faulting address, a raw load here kills the dump and the log ends with no post-mortem. */
+    uint32_t w[8];
+    if (sp && safe_read(sp, w, sizeof w)) { for (int i = 0; i < 8; i++) fprintf(stderr, " %08x", w[i]); }
+    else { uint64_t b = 0, s = 0; int have = aot_vres_peek(sp, &b, &s);
+      fprintf(stderr, " <unreadable: esp %#x %s %#llx+%#llx>", sp, have ? "in region" : "in no reservation,", (unsigned long long)b, (unsigned long long)s); }
+    fprintf(stderr, "\n"); }
 }
 
 /* ---- allocator-corruption diagnostics (game dlmalloc object at 0x199dd6c, tree bins at 0x199dec8) ---- */
