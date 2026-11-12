@@ -192,6 +192,14 @@ static int va_quarantine_take(uint64_t b, uint64_t n) {   /* hinted VirtualAlloc
     return 1; }
   return 0;
 }
+/* mu held: is [a,a+n) overlapping or touching a live reservation or a quarantined range? Adjacent regions must never be handed to the guest: its
+ * allocator merges segments that touch and then builds chunks that span them, so a later release leaves a hole inside a live block. */
+static int va_clash(uint64_t a, uint64_t n) {
+  uint64_t hi = a + n;
+  for (int i = 0; i < vres_n; i++) if (vres[i].base && a <= vres[i].base + vres[i].n && vres[i].base <= hi) return 1;
+  for (int i = 0; i < qcount; i++) if (a <= qlist[i].a + qlist[i].n && qlist[i].a <= hi) return 1;
+  return 0;
+}
 static void va_trace(const char *what, uint64_t addr, uint64_t size, uint64_t type, uint64_t out) {
   static int n; if (!aot_is_pe32) return;
   if (n >= 700 && (strcmp(what, "alloc") != 0 || size < (256u << 10))) return;   /* keep the per-call budget, but never lose a heap-segment allocation */
@@ -208,7 +216,9 @@ SH(VirtualAlloc) {
       /* Windows rounds a reservation hint down to the 64 KB granularity and returns that base; record exactly what is returned, so a
          later VirtualFree(returned) succeeds and VirtualQuery reports the right base and RegionSize. */
       uint64_t b = addr & ~0xFFFFULL; size_t n = (sz + (size_t)(addr - b) + 0xFFFF) & ~0xFFFFULL;
-      if (va_quarantine_take(b, n)) { if (vres_add((VRes){ b, n, b, n, n })) out = b; }
+      for (int t = 0; t < 8 && b + n <= 0x100000000ULL && va_clash(b, n); t++) b += 0x10000ULL;   /* keep one page clear of every other region */
+      if (b + n > 0x100000000ULL || va_clash(b, n)) { /* no isolated address: fail the call, the guest allocator retries elsewhere */ }
+      else if (va_quarantine_take(b, n)) { if (vres_add((VRes){ b, n, b, n, n })) out = b; }
       else { void *p = mmap((void *)b, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
       if (p == (void *)b && vres_add((VRes){ b, n, b, n, n })) out = b;
       else if (p != MAP_FAILED) munmap(p, n); }                               /* address taken, or out of memory: fail honestly */
