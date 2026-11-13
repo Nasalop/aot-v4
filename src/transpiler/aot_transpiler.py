@@ -1013,6 +1013,7 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                 elif mn.startswith('f') and not mn.startswith('fcmov'): w = set()   # capstone 5.0 lists CF as modified by every x87 op (really FPU C0-C3): it dropped the CF of a preceding cmp before `jb`
                 if mn.startswith('fcmov'): r = {'cf', 'zf', 'pf'}
                 if mn in ('lahf', 'pushfd', 'pushf', 'pushfq'): r = set(F5)   # capstone lists no flag reads for these
+                if mn not in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest', 'pcmpestri', 'pcmpestrm', 'pcmpistri', 'pcmpistrm', 'vcomiss', 'vucomiss', 'vcomisd', 'vucomisd', 'vptest') and any(o.type == X86_OP_REG and i.reg_name(o.reg).startswith(('xmm', 'ymm', 'mm')) for o in i.operands): w = set(); r = set()   # SSE/MMX moves and arithmetic never touch EFLAGS; capstone mis-reports some, which made the liveness pass drop the ZF of a `test` before a `je` 30 SSE ops later (AC1 0x557d5f: je took the wrong side -> call with null this)
                 if mn == 'test': w = set(F5)   # capstone 5.0 reports no eflags for `test r/m, r` with a memory operand (1665 sites in AC1): the branch that follows then read stale flags
                 if mn == 'cmc': r = r | {'cf'}   # capstone omits the CF read of cmc (38 sites in AC1)
                 if mn in ('loope', 'loopz', 'loopne', 'loopnz'): r = r | {'zf'}
