@@ -64,7 +64,7 @@ RESERVE_PROBE = ('{static int n_=0;uint32_t w_=LD(uint32_t,(uint32_t)r1+4u);'
 # capacity wrapped costs two reallocs instead of one per push. Nothing is written but the
 # caller's own scratch argument slot; reserve still grows only when the capacity is smaller.
 RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=LD(uint32_t,(uint32_t)r4+4u),need_=sz_+1u;'
-                 'if(nc_<need_){uint32_t ask_=need_+(need_>>2);'
+                 'if(nc_>((w_>>0xe)&0x3fffu)&&nc_<need_){uint32_t ask_=need_+(need_>>2);'
                  'if(ask_>0x3fffu||ask_<need_)ask_=(need_<=0x3fffu)?0x3fffu:need_;'
                  'ST(uint32_t,(uint32_t)r4+4u,ask_);static int n_;'
                  'if(n_++<32)fprintf(stderr,"[aot] reserve %08x raised %u -> %u (size=%u cap=%u elem=%u ret=%08x)\\n",'
@@ -744,6 +744,10 @@ class Gen:
         if mn in ('ucomiss', 'comiss', 'ucomisd', 'comisd'):
             k = 'f' if mn.endswith('ss') else 'g'; T = 'float' if k == 'f' else 'double'
             return '{%s a=%s.%s[0],b=%s;int un=a!=a||b!=b;zf=un||a==b;pf=un;cf=un||a<b;of=0;sf=0;}' % (T, D, k, xs(ops[1], k))
+        if mn in ('pslldq', 'psrldq'):
+            n = min(ops[1].imm & 0xff, 16)
+            if mn == 'pslldq': return '{XMM s=%s;memset(%s.b,0,16);if(%d<16)memcpy(%s.b+%d,s.b,%d);}' % (D, D, n, D, n, 16 - n)
+            return '{XMM s=%s;memset(%s.b,0,16);if(%d<16)memcpy(%s.b,s.b+%d,%d);}' % (D, D, n, D, n, 16 - n)
         LN = {'b': (1, 16), 'w': (2, 8), 'd': (4, 4), 'q': (8, 2)}
         if mn[:2] == 'ps' and mn[2:5] in ('lld', 'rld', 'rad', 'llq', 'rlq', 'llw', 'rlw', 'raw') and mn != 'pshufd':
             L = mn[-1]; k = {'d': 'd', 'q': 'q', 'w': 'w'}[L]; B = 8 * LN[L][0]; N = LN[L][1]
@@ -1025,7 +1029,7 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                     # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
                     # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
                     if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
-                    if i.address == 0x8f6b50 and i.mnemonic.split()[-1] == 'push': s = RESERVE_PROBE + RESERVE_CLAMP + s
+                    if i.address == 0x8f6b50 and i.mnemonic.split()[-1] == 'push': s = RESERVE_CLAMP + s
                 except Exception as e:   # Unsup, or a translator bug on one instruction: record it, keep going
                     unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
                     s = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
