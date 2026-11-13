@@ -40,6 +40,17 @@ class Unsup(Exception): pass
 
 def is_term(mn): return mn in ('jmp', 'ljmp', 'ret', 'retf', 'iret', 'iretd', 'iretq', 'ud2', 'int3', 'hlt') or (mn[0] == 'j' and mn[1:] in COND)
 
+# Instrumentation only, no behaviour change. At the vector-reserve entry (0x8f6b50) log the
+# packed size/cap word, the requested capacity, the element size and the guest return address:
+# one device run then shows whether the capacity wrapped in its 14-bit field (a growth request
+# above 16383 reads back small on the next push) or reserve was asked for less than the current
+# size. Prints the first 32 calls plus every call that already breaks size <= newcap or asks for
+# more than the field can hold, so the output stays bounded on a 40 MB log.
+RESERVE_PROBE = ('{static int n_=0;uint32_t w_=LD(uint32_t,(uint32_t)r1+4u);'
+                 'uint32_t sz_=w_&0x3fffu,cp_=(w_>>0xe)&0x3fffu,nc_=LD(uint32_t,(uint32_t)r4+4u);'
+                 'if(n_<32||sz_>nc_||nc_>0x3fffu){n_++;fprintf(stderr,"[aot] reserve %08x size=%u cap=%u newcap=%u elem=%u ret=%08x\\n",'
+                 '(uint32_t)r1,sz_,cp_,nc_,LD(uint32_t,(uint32_t)r4+8u),LD(uint32_t,(uint32_t)r4));}}')
+
 class Rec:
     def __init__(self, path):
         self.pe = pefile.PE(path)
@@ -995,6 +1006,7 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                     # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
                     # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
                     if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
+                    if i.address == 0x8f6b50 and i.mnemonic.split()[-1] == 'push': s = RESERVE_PROBE + s
                 except Exception as e:   # Unsup, or a translator bug on one instruction: record it, keep going
                     unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
                     s = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
