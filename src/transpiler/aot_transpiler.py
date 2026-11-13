@@ -51,6 +51,25 @@ RESERVE_PROBE = ('{static int n_=0;uint32_t w_=LD(uint32_t,(uint32_t)r1+4u);'
                  'if(n_<32||sz_>nc_||nc_>0x3fffu){n_++;fprintf(stderr,"[aot] reserve %08x size=%u cap=%u newcap=%u elem=%u ret=%08x\\n",'
                  '(uint32_t)r1,sz_,cp_,nc_,LD(uint32_t,(uint32_t)r4+8u),LD(uint32_t,(uint32_t)r4));}}')
 
+# The fix for the crash in aot_log.txt (reserve 2506fca8: size=12487 cap=12487 newcap=16645
+# elem=8, then size=12488 cap=261 newcap=347). Capacity and size share one 14-bit field, so a
+# growth request above 16383 is stored as itself minus 16384 (16645 -> 261) while the vector
+# still holds 12487 elements. The next push then grows from 261 by a factor of 1.333 and asks
+# for 347 elements; 0x8f6b50 compares that request with the capacity only, never with the size,
+# allocates 347*8 = 2776 bytes and memcpys 12488*8 = 99904 into them -- past the block and the
+# heap region, SIGSEGV at 0x81360000.
+#
+# Reserve one element past the current size (push_back writes element index `size` after the
+# call), and add 25%% headroom only where that stays inside the 14-bit field, so a vector whose
+# capacity wrapped costs two reallocs instead of one per push. Nothing is written but the
+# caller's own scratch argument slot; reserve still grows only when the capacity is smaller.
+RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=LD(uint32_t,(uint32_t)r4+4u),need_=sz_+1u;'
+                 'if(nc_<need_){uint32_t ask_=need_+(need_>>2);'
+                 'if(ask_>0x3fffu||ask_<need_)ask_=(need_<=0x3fffu)?0x3fffu:need_;'
+                 'ST(uint32_t,(uint32_t)r4+4u,ask_);static int n_;'
+                 'if(n_++<32)fprintf(stderr,"[aot] reserve %08x raised %u -> %u (size=%u cap=%u elem=%u ret=%08x)\\n",'
+                 '(uint32_t)r1,nc_,ask_,sz_,(w_>>0xe)&0x3fffu,LD(uint32_t,(uint32_t)r4+8u),LD(uint32_t,(uint32_t)r4));}}')
+
 class Rec:
     def __init__(self, path):
         self.pe = pefile.PE(path)
@@ -1006,7 +1025,7 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                     # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
                     # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
                     if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
-                    if i.address == 0x8f6b50 and i.mnemonic.split()[-1] == 'push': s = RESERVE_PROBE + s
+                    if i.address == 0x8f6b50 and i.mnemonic.split()[-1] == 'push': s = RESERVE_PROBE + RESERVE_CLAMP + s
                 except Exception as e:   # Unsup, or a translator bug on one instruction: record it, keep going
                     unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
                     s = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
