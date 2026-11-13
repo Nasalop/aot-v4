@@ -998,6 +998,12 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
                     # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
                     # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
                     if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
+                    # AC1 vector<T>::reserve(newcap, elemsize) at 0x8f6b50 (14-bit size/capacity fields in [this+4]) mallocs newcap*elemsize and then copies size*elemsize
+                    # bytes into it. The game never asks for less than the current size, but here it did (a runaway element count from bad level data), and the copy then ran
+                    # past the new block. Raise the request to the current size (a no-op for every valid call) so the copy always fits; logged, never silent.
+                    if i.address == 0x8f6b50 and i.mnemonic == 'push':
+                        s = ('{uint32_t sz_=LD(uint32_t,(uint32_t)r1+4)&0x3fffu,nc_=LD(uint32_t,(uint32_t)r4+4);if(nc_<sz_){static int n_;if(n_++<8)fprintf(stderr,"[aot] vector reserve(%u) below its size %u (obj %#x): request raised to the size\n",nc_,sz_,(uint32_t)r1);'
+                             'ST(uint32_t,(uint32_t)r4+4,sz_);}}') + s
                     # AC1's own dlmalloc (mspace malloc 0x41ef40 / free 0x417890, both thiscall with one stack argument) ends up with overlapping free chunks here.
                     # Serve those two entry points from the runtime's allocator instead (header words are emulated so size queries keep working).
                     if HEAPHOOK and i.address == 0x41ef40 and i.mnemonic == 'push':
