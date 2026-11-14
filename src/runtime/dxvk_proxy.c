@@ -27,7 +27,7 @@ typedef struct { void *g, *h; size_t sz; uint32_t sub, type; void *spare; size_t
 /* The guest-visible object is only {vtable, magic, id}; everything the host side relies on (host pointer, interface, map shadows) lives in host memory,
    so guest code that scribbles on a COM object (intrusive refcounts at +4/+8, ...) cannot corrupt it. */
 typedef struct { void **vt; uint32_t magic, id; } GO;
-typedef struct PX { uint32_t gaddr; void *host; const PI *pi; Shadow sh[4]; } PX;
+typedef struct PX { uint32_t gaddr; void *host; const PI *pi; Shadow sh[4]; int qtype; } PX;   /* qtype: D3D10_QUERY + 1 for queries (0 = not a query) */
 #define NPX (1 << 16)
 static PX *pxs[NPX]; static uint32_t npx;
 #define GN (1 << 17)
@@ -121,18 +121,21 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
      (copies into it, UpdateSubresource, GPU use), so the shadow stops being a usable mirror. */
   if (!(m->name[0] == 'M' && !strcmp(m->name, "Map")) && !(m->name[0] == 'U' && !strcmp(m->name, "Unmap")))
     for (int i = 0; i < 4; i++) o->sh[i].sv = 0;
+  if ((m->name[0] == 'U' && !strcmp(m->name, "UpdateSubresource")) || (m->name[0] == 'C' && !strncmp(m->name, "Copy", 4)) || (m->name[0] == 'R' && !strcmp(m->name, "ResolveSubresource")))
+    for (uint32_t pi_ = 0; pi_ < npx; pi_++) for (int k_ = 0; k_ < 4; k_++) pxs[pi_]->sh[k_].sv = 0;   /* these write into OTHER resources behind their shadows' backs */
 #define ALLOC(sz) ({ size_t _s = ((sz) + 15) & ~15u; if (ap + _s > sizeof ar) { fprintf(stderr, "[dxvk] %s::%s: argument too large for marshalling arena\n", pi->name, m->name); return E_NOTIMPL_; } void *_p = ar + ap; ap += _s; memset(_p, 0, _s); _p; })
   if (m->name[0] == 'U' && !strcmp(m->name, "Unmap")) {   /* flush a low-memory shadow back into the host mapping */
     uint32_t sub = m->n ? A(1) : 0;
     for (int i = 0; i < 4; i++) if (o->sh[i].g && o->sh[i].sub == sub) { Shadow *s = &o->sh[i];
       if (s->type != 1) { memcpy(s->h, s->g, s->sz); m_down += s->sz; }   /* READ maps wrote nothing back */
-      if (!s->spare && s->gcap <= (256u << 10)) { s->spare = s->g; s->spcap = s->gcap; } else aot_gfree(s->g); s->g = NULL; m_n++; m_report(); break; }
+      if (!s->spare && s->gcap <= (256u << 10)) { s->spare = s->g; s->spcap = s->gcap; } else { aot_gfree(s->g); s->sv = 0; } s->g = NULL; m_n++; m_report(); break; }
   }
   if (m->name[0] == 'C' && !strcmp(m->name, "CreateBuffer") && A(1) && LD(uint32_t, A(1)) == 0) {
     /* The game asks for a zero-size buffer (a shader without constant buffers); native D3D10 drivers tolerated this, DXVK rejects it. Give it the smallest valid buffer instead of a NULL the game does not check. */
     static int warned; if (!warned++) fprintf(stderr, "[dxvk] CreateBuffer with ByteWidth 0 (usage=%u bind=%#x): substituting a 16-byte buffer\n", LD(uint32_t, A(1) + 4), LD(uint32_t, A(1) + 8));
     ST(uint32_t, A(1), 16);
   }
+  int new_qtype = 0; if (m->name[0] == 'C' && (!strcmp(m->name, "CreateQuery") || !strcmp(m->name, "CreatePredicate")) && A(1)) new_qtype = (int)LD(uint32_t, A(1)) + 1;
   iv[ni++] = (uint64_t)(uintptr_t)o->host;
   for (int i = 0; i < m->n; i++) {
     uint32_t v = A(i + 1); char k = m->k[i];
@@ -158,13 +161,18 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   int is_gd = m->name[0] == 'G' && !strcmp(m->name, "GetData") && ni >= 4;
   if (is_gd) iv[3] &= ~1ull;   /* D3D10_ASYNC_GETDATA_DONOTFLUSH: native drivers still make progress on their own, DXVK only submits work on a flush, so the game polls forever */
   uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
-  if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0) {   /* S_FALSE: submit the query's commands once, then wait for the GPU HERE (short host sleeps) instead of bouncing back to the guest's SwitchToThread spin, which re-flushed on every poll */
+  int occl = is_gd && (o->qtype == 2 || o->qtype == 6 || o->qtype == 8);   /* OCCLUSION, OCCLUSION_PREDICATE, SO_OVERFLOW_PREDICATE: culling hints, never worth stalling the frame on the GPU */
+  if (occl && hr == 1) {   /* not ready: answer "visible" now. Culling is only an optimisation; waiting for it serialised CPU and GPU every frame */
+    uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; int pred = o->qtype != 2;   /* predicate: BOOL FALSE = not occluded; occlusion: a large sample count */
+    if (pd && sz >= 8) *(uint64_t *)(uintptr_t)pd = pred ? 0 : 1000000; else if (pd && sz >= 4) *(uint32_t *)(uintptr_t)pd = pred ? 0 : 1000000;
+    hr = 0; r = 0; }
+  if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0) {   /* S_FALSE on an event/timestamp query: submit once, then wait for the GPU HERE (short host sleeps) instead of bouncing back to the guest's SwitchToThread spin */
     uint64_t fi[1] = { (uint64_t)(uintptr_t)g_hdev }; float z[4] = { 0 }; hcall(g_hdev, g_flush_slot, fi, 1, z);
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) { r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r; if (hr != 1) break;
-      clock_gettime(CLOCK_MONOTONIC, &t1); if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 >= 40) break;   /* a query that never completes: fake below */
-      usleep(150); } }
-  if (is_gd && hr == 1) {   /* still not ready after 40 ms of real waiting: report it finished (BOOL/UINT64 = 1) so the game cannot stall forever */
+      clock_gettime(CLOCK_MONOTONIC, &t1); if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 >= 40) break;
+      usleep(100); } }
+  if (is_gd && hr == 1) {   /* still not ready after 40 ms: report it finished so the game cannot stall forever (BOOL/UINT64 = 1) */
     uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; if (pd && sz >= 8) *(uint64_t *)(uintptr_t)pd = 1; else if (pd && sz >= 4) *(uint32_t *)(uintptr_t)pd = 1;
     static int warned; if (!warned++) fprintf(stderr, "[dxvk] GPU query still not ready after 40 ms: reporting it as finished (result 1)\n");
     hr = 0; r = 0; } if (m->ret && (int32_t)hr < 0) {
@@ -176,7 +184,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   for (int p = 0; p < np; p++) {
     Post *q = &post[p]; const uint8_t *h = q->tmp;
     switch (q->kind) {
-    case 'O': { void *hp = *(void **)q->tmp; if (hp) { GO *x = wrap(hp, q->ti); G32(q->g, x); } else G32(q->g, 0); break; }
+    case 'O': { void *hp = *(void **)q->tmp; if (hp) { GO *x = wrap(hp, q->ti); G32(q->g, x); if (new_qtype && x) { PX *qx = px_of((uint32_t)(uintptr_t)x); if (qx) qx->qtype = new_qtype; } } else G32(q->g, 0); break; }
     case 'R': { void *hp = *(void **)q->tmp; uint8_t id[16]; memcpy(id, (void *)(uintptr_t)q->n, 16); static const uint8_t unk[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46 };
       int ti = !memcmp(id, unk, 16) ? (int)(pi - PIS) : ti_by_guid(id);
       if (!hp) { G32(q->g, 0); break; }
@@ -197,7 +205,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
       if (!hp || !sz) { fprintf(stderr, "[dxvk] %s::Map: cannot size the mapped region (sz=%zu)\n", pi->name, sz); break; }
       int si = -1; for (int i = 0; i < 4; i++) if (!o->sh[i].g) { si = i; break; }
       if (si < 0) { fprintf(stderr, "[dxvk] too many concurrent maps on one resource\n"); break; }
-      Shadow *sp_ = &o->sh[si]; void *g = NULL; size_t gcap = sz; if (sp_->spare && sp_->spcap >= sz) { g = sp_->spare; gcap = sp_->spcap; sp_->spare = NULL; sp_->spcap = 0; } else { if (sp_->spare) { aot_gfree(sp_->spare); sp_->spare = NULL; sp_->spcap = 0; } g = aot_gmalloc(sz); } if (!g) { fprintf(stderr, "[dxvk] Map: out of low memory for %zu bytes\n", sz); break; }
+      Shadow *sp_ = &o->sh[si]; void *g = NULL; size_t gcap = sz; int reused = 0; if (sp_->spare && sp_->spcap >= sz) { reused = 1; g = sp_->spare; gcap = sp_->spcap; sp_->spare = NULL; sp_->spcap = 0; } else { if (sp_->spare) { aot_gfree(sp_->spare); sp_->spare = NULL; sp_->spcap = 0; } g = aot_gmalloc(sz); } if (!g) { fprintf(stderr, "[dxvk] Map: out of low memory for %zu bytes\n", sz); break; }
       /* What has to be copied in is decided by the map mode, so only the modes that need it pay:
            DISCARD (4)  - the contents are undefined, the app writes what it uses: no copy, no zeroing
                           (zeroing the whole subresource per map was pure traffic for nothing);
@@ -205,7 +213,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
                           unless something else touched the resource in between (sv);
            READ/WRITE/READ_WRITE - the app may read, so the current contents must be there. */
       if (q->type == 4) { }
-      else if (q->type == 5 && sp_->sv && sp_->sub == q->sub) { }
+      else if (q->type == 5 && reused && sp_->sv && sp_->sub == q->sub) { }   /* only a retained block still holds the host contents; a fresh one is garbage */
       else { memcpy(g, hp, sz); m_up += sz; }
       if (!m_logged) { m_logged = 1; fprintf(stderr, "[dxvk] Map: DISCARD maps are not zero-filled; NO_OVERWRITE maps skip the up-copy while the shadow is current\n"); }
       sp_->g = g; sp_->h = hp; sp_->sz = sz; sp_->sub = q->sub; sp_->type = q->type; sp_->gcap = gcap; sp_->sv = 1;
