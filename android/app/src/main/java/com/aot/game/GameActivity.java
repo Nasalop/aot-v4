@@ -275,8 +275,12 @@ public final class GameActivity extends NativeActivity {
         int[] ids = android.view.InputDevice.getDeviceIds();
         for (int id : ids) {
             android.view.InputDevice d = android.view.InputDevice.getDevice(id);
-            if (d != null && (d.getSources() & android.view.InputDevice.SOURCE_GAMEPAD) != 0
-                    || d != null && (d.getSources() & android.view.InputDevice.SOURCE_JOYSTICK) != 0) any = true;
+            if (d == null || d.isVirtual()) continue;   // the touch panel, keyboards' media keys and virtual devices are not controllers
+            int src = d.getSources();
+            boolean padLike = (src & android.view.InputDevice.SOURCE_GAMEPAD) == android.view.InputDevice.SOURCE_GAMEPAD;
+            boolean stickLike = (src & android.view.InputDevice.SOURCE_JOYSTICK) == android.view.InputDevice.SOURCE_JOYSTICK
+                    && d.getMotionRange(android.view.MotionEvent.AXIS_X) != null;   // a real stick has an X axis
+            if (padLike || stickLike) any = true;
         }
         int v = any ? 1 : 0;
         if (v == padPresent) return;
