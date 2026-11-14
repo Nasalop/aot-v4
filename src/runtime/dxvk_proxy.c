@@ -19,6 +19,9 @@ typedef struct { const char *name; int nm; const PM *m; const fn_t *wf; const ui
 static uint64_t px_call(CPU *c, const PI *pi, int slot);
 static void *g_hdev; static int g_flush_slot = -1;
 volatile uint64_t aot_frames;   /* presented frames, for the FPS counter */
+volatile uint64_t aot_ns[4];    /* wall time the game thread spent blocked: [0] inside Present, [1] waiting for an event/timestamp query */
+extern void aot_present_tick(void);   /* android_main.c: frame pacing hint for the Android scheduler */
+static inline uint64_t px_now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 #include "d3d10_proxy_gen.inc"
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
 #define E_NOTIMPL_ 0x80004001u
@@ -161,8 +164,11 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   }
   int is_gd = m->name[0] == 'G' && !strcmp(m->name, "GetData") && ni >= 4;
   if (is_gd) iv[3] &= ~1ull;   /* D3D10_ASYNC_GETDATA_DONOTFLUSH: native drivers still make progress on their own, DXVK only submits work on a flush, so the game polls forever */
+  int is_present = m->name[0] == 'P' && !strcmp(m->name, "Present") && ni >= 2;
+  if (is_present) iv[1] = 0;   /* no vsync wait: SyncInterval 0 (the game asks for 1, which makes every frame a multiple of the refresh period) */
+  uint64_t pt0 = is_present ? px_now_ns() : 0;
   uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
-  if (m->name[0] == 'P' && !strcmp(m->name, "Present")) __atomic_add_fetch(&aot_frames, 1, __ATOMIC_RELAXED);   /* read by the debug overlay (GameActivity) */
+  if (is_present) { __atomic_add_fetch(&aot_ns[0], px_now_ns() - pt0, __ATOMIC_RELAXED); __atomic_add_fetch(&aot_frames, 1, __ATOMIC_RELAXED); aot_present_tick(); }
   int occl = is_gd && (o->qtype == 2 || o->qtype == 6 || o->qtype == 8);   /* OCCLUSION, OCCLUSION_PREDICATE, SO_OVERFLOW_PREDICATE: culling hints, never worth stalling the frame on the GPU */
   if (occl && hr == 1) {   /* not ready: answer "visible" now. Culling is only an optimisation; waiting for it serialised CPU and GPU every frame */
     uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; int pred = o->qtype != 2;   /* predicate: BOOL FALSE = not occluded; occlusion: a large sample count */
@@ -173,7 +179,8 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) { r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r; if (hr != 1) break;
       clock_gettime(CLOCK_MONOTONIC, &t1); if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 >= 40) break;
-      usleep(100); } }
+      usleep(100); }
+    __atomic_add_fetch(&aot_ns[1], px_now_ns() - ((uint64_t)t0.tv_sec * 1000000000ull + (uint64_t)t0.tv_nsec), __ATOMIC_RELAXED); }
   if (is_gd && hr == 1) {   /* still not ready after 40 ms: report it finished so the game cannot stall forever (BOOL/UINT64 = 1) */
     uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; if (pd && sz >= 8) *(uint64_t *)(uintptr_t)pd = 1; else if (pd && sz >= 4) *(uint32_t *)(uintptr_t)pd = 1;
     static int warned; if (!warned++) fprintf(stderr, "[dxvk] GPU query still not ready after 40 ms: reporting it as finished (result 1)\n");
