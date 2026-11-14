@@ -129,6 +129,8 @@ JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativePad0(JNIEnv *env, jc
   p.lx = (int16_t)lx; p.ly = (int16_t)ly; p.rx = (int16_t)rx; p.ry = (int16_t)ry;
   pad = p; aot_input_pad(&pad);
 }
+extern volatile uint64_t aot_frames;
+JNIEXPORT jlong JNICALL Java_com_aot_game_GameActivity_nativeFrames0(JNIEnv *env, jclass cls) { (void)env; (void)cls; return (jlong)aot_frames; }
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeView0(JNIEnv *env, jclass cls, jint w, jint h) { (void)env; (void)cls; LOG("overlay view size %dx%d", w, h); aot_input_view((uint32_t)w, (uint32_t)h); }
 static void on_cmd(struct android_app *app, int32_t cmd) {
   if (cmd == APP_CMD_INIT_WINDOW) aot_android_set_window(app->window);
