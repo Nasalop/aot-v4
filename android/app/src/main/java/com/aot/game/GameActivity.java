@@ -76,6 +76,7 @@ public final class GameActivity extends NativeActivity {
     private static native void nativeMouse0(int kind, float x, float y);
     private static native void nativeView0(int w, int h);
     private static native long nativeFrames0();
+    private static native long nativeNs0(int k);
     private static boolean nativesOk = true;
     private static void nativeKey(int vk, int down) { if (nativesOk) try { nativeKey0(vk, down); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
     private static void nativeMouse(int kind, float x, float y) { if (nativesOk) try { nativeMouse0(kind, x, y); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
@@ -143,7 +144,7 @@ public final class GameActivity extends NativeActivity {
         }
         private final java.util.ArrayList<Btn> game = new java.util.ArrayList<>(), kb = new java.util.ArrayList<>();
         /* Debug-build performance readout: FPS (frames presented by the game), process CPU (% of one core) and GPU busy (kgsl, when the OS lets an app read it). */
-        private final boolean dbg; private long sNs, sFrames = -1, sCpu; private String stats = "";
+        private final boolean dbg; private long sNs, sFrames = -1, sCpu; private String stats = "", stats2 = "", stats3 = ""; private long sPres, sWait; private final java.util.HashMap<String, Long> thPrev = new java.util.HashMap<>();
         private final Runnable statsTick = new Runnable() { @Override public void run() { updateStats(); invalidate(); postDelayed(this, 500); } };
         private static long readCpuTicks() {
             try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader("/proc/self/stat"))) {
@@ -155,11 +156,27 @@ public final class GameActivity extends NativeActivity {
                 String l = br.readLine(); if (l != null) { l = l.replaceAll("[^0-9]", ""); if (!l.isEmpty()) return Integer.parseInt(l); }
             } catch (Throwable t) { }
             return -1; }
+        private String threadLine(double dt) {   /* busiest threads over the last interval: shows whether the game really uses several cores */
+            java.io.File[] ts = new java.io.File("/proc/self/task").listFiles(); if (ts == null) return "";
+            java.util.ArrayList<double[]> top = new java.util.ArrayList<>(); java.util.ArrayList<String> names = new java.util.ArrayList<>(); java.util.HashMap<String, Long> now = new java.util.HashMap<>();
+            for (java.io.File t : ts) try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(new java.io.File(t, "stat")))) {
+                String l = br.readLine(); String comm = l.substring(l.indexOf('(') + 1, l.lastIndexOf(')')); String[] f = l.substring(l.lastIndexOf(')') + 2).split(" ");
+                long ticks = Long.parseLong(f[11]) + Long.parseLong(f[12]); String key = t.getName(); now.put(key, ticks); Long pv = thPrev.get(key);
+                double pct = pv == null ? 0 : (ticks - pv) * 10.0 / (dt * 1000.0) * 100.0; if (pct < 4) continue;
+                int at = 0; while (at < top.size() && top.get(at)[0] > pct) at++; top.add(at, new double[] { pct }); names.add(at, comm.replace("com.aot.game", "game") + "#" + (Integer.parseInt(key) % 1000));
+            } catch (Throwable e) { }
+            thPrev.clear(); thPrev.putAll(now);
+            StringBuilder sb = new StringBuilder("threads: "); for (int i = 0; i < top.size() && i < 5; i++) sb.append(names.get(i)).append(' ').append(Math.round(top.get(i)[0])).append("%   ");
+            return sb.toString(); }
         private void updateStats() {
             long now = System.nanoTime(), fr = -1, cpu = readCpuTicks(); try { fr = nativeFrames0(); } catch (Throwable t) { }
             if (sNs != 0 && now > sNs && sFrames >= 0 && fr >= 0) {
                 double dt = (now - sNs) / 1e9, fps = (fr - sFrames) / dt, cp = cpu >= 0 && sCpu >= 0 ? (cpu - sCpu) * 10.0 / (dt * 1000.0) * 100.0 : -1; int g = readGpu();
                 stats = String.format(java.util.Locale.ROOT, "FPS %.0f (%.1f ms)   CPU %s   GPU %s", fps, fps > 0 ? 1000.0 / fps : 0.0, cp >= 0 ? String.format(java.util.Locale.ROOT, "%.0f%%", cp) : "n/a", g >= 0 ? g + "%" : "n/a");
+                long pr = -1, wt = -1; try { pr = nativeNs0(0); wt = nativeNs0(1); } catch (Throwable t) { }
+                long df = Math.max(1, fr - sFrames);
+                if (pr >= 0 && sPres >= 0) stats3 = String.format(java.util.Locale.ROOT, "blocked per frame: Present %.1f ms   query wait %.1f ms", (pr - sPres) / 1e6 / df, (wt - sWait) / 1e6 / df);
+                stats2 = threadLine(dt); sPres = pr; sWait = wt;
             }
             sNs = now; sFrames = fr; sCpu = cpu; }
         @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); if (dbg) post(statsTick); }
@@ -236,8 +253,9 @@ public final class GameActivity extends NativeActivity {
             try {
                 float r = radius(), w = getWidth(), h = getHeight();
                 if (dbg && !stats.isEmpty()) { p.setStyle(Paint.Style.FILL); p.setTextAlign(Paint.Align.CENTER); p.setTextSize(h * 0.034f);
-                    float tw = p.measureText(stats); p.setColor(0x99000000); c.drawRect(w * 0.5f - tw / 2 - 12, h * 0.012f, w * 0.5f + tw / 2 + 12, h * 0.012f + h * 0.05f, p);
-                    p.setColor(0xFF7CFC00); c.drawText(stats, w * 0.5f, h * 0.012f + h * 0.038f, p); }
+                    String[] ls = { stats, stats2, stats3 }; float lh = h * 0.045f, y0 = h * 0.012f; p.setTextSize(h * 0.03f);
+                    for (int i = 0; i < ls.length; i++) { if (ls[i].isEmpty()) continue; float tw = p.measureText(ls[i]); p.setColor(0x99000000);
+                        c.drawRect(w * 0.5f - tw / 2 - 12, y0 + i * lh, w * 0.5f + tw / 2 + 12, y0 + (i + 1) * lh, p); p.setColor(0xFF7CFC00); c.drawText(ls[i], w * 0.5f, y0 + i * lh + lh * 0.75f, p); } }
                 for (Btn b : active()) drawBtn(c, b, w, h, b.ptr >= 0 || b.on);
                 drawBtn(c, kbToggle, w, h, kbToggle.on);
                 if (!kbToggle.on) {
