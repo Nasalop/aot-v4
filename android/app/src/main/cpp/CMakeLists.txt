@@ -48,7 +48,7 @@ else()
   if(AOT_PREBUILT_GEN)   # game parts were compiled in parallel CI shards (static archives); only the small table is built here
     set(GEN ${CMAKE_CURRENT_SOURCE_DIR}/gen/aot_tab.c)
   endif()
-  set_source_files_properties(${GEN} PROPERTIES COMPILE_FLAGS "-O1")
+  set_source_files_properties(${GEN} PROPERTIES COMPILE_FLAGS "-O2 -fwrapv -fno-strict-aliasing")   # same flags the release.yml shards use for these files
   add_library(aotgame SHARED android_main.c ${GLUE}/android_native_app_glue.c ${RT}/runtime.c ${RT}/win_resolver.c ${RT}/shims.c ${RT}/win_compat.c ${RT}/win_file.c ${RT}/win_file_async.c ${RT}/win_audio.c ${RT}/win_d3d10.c ${RT}/win_sys.c ${RT}/win_x86.c ${RT}/win_x86_dll.c ${RT}/win_input.c ${RT}/win_gfx.c ${RT}/dxvk_proxy.c ${RT}/hlsl_compile.c ${RT}/gfx_backend.c ${RT}/gfx_draw_batch.c ${GEN})
   target_sources(aotgame PRIVATE ${RT}/aot_prof.c)   # sampling profiler (compiles to nothing with -DAOT_RELEASE)
   add_library(aotreserve SHARED ${RT}/aot_reserve.c)   # LD_PRELOADed by wrap.sh to reserve the PE32 image range before ART starts

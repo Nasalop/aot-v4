@@ -1050,7 +1050,7 @@ class FOp:
     def __init__(self, reg, size): self.reg = reg; self.size = size
 REGOP_RAX = {1: FOp(X86_REG_AL, 1), 2: FOp(X86_REG_AX, 2), 4: FOp(X86_REG_EAX, 4), 8: FOp(X86_REG_RAX, 8)}
 
-def emit(rec, outdir, per_region=300, regions_per_file=8):
+def emit(rec, outdir, per_region=1200, regions_per_file=8):
     g = Gen(rec); blocks = rec.blocks(); os.makedirs(outdir, exist_ok=True)
     regions = []; cur = []; cnt = 0
     for b in blocks:

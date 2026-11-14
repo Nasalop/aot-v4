@@ -108,15 +108,25 @@ extern int aot_stguard(uint64_t addr, uint64_t val, unsigned size);   /* always 
 extern uint8_t aot_nodemap[8192];
 extern int aot_nodehit(uint64_t addr, uint64_t val, unsigned size);
 #define AOT_NODE_SUSPECT(a, n) (((aot_nodemap[((a) >> 8) & 0x1FFF] >> (((a) >> 5) & 7)) | (aot_nodemap[(((a) + (n) - 1) >> 8) & 0x1FFF] >> ((((a) + (n) - 1) >> 5) & 7))) & 1)
+#ifdef AOT_RELEASE
+/* Release builds (release.yml defines AOT_RELEASE) drop the heap-corruption guards: the checks below ran on every
+   guest store, which is a fixed tax on the busiest instructions in the recompiled image. Debug builds keep them. */
+#define ST(T, a, v) do { T _v = (T)(v); memcpy((void *)(uintptr_t)(a), &_v, sizeof _v); } while (0)
+#else
 #define ST(T, a, v) do { T _v = (T)(v); uint64_t _a = (uint64_t)(uintptr_t)(a); \
   if (__builtin_expect(_a < 0x100000000ull, 1)) { \
     if (__builtin_expect((uint32_t)(_a - 0x199dec8u) < 0x80u, 0) && !aot_stguard(_a, (uint64_t)_v, sizeof _v)) break; \
     if (__builtin_expect(AOT_NODE_SUSPECT(_a, sizeof _v), 0) && !aot_nodehit(_a, (uint64_t)_v, sizeof _v)) break; } \
   memcpy((void *)(uintptr_t)_a, &_v, sizeof _v); } while (0)
+#endif
 #define LDX(a) ({ XMM _t; memcpy(&_t, (const void *)(uintptr_t)(a), 16); _t; })
+#ifdef AOT_RELEASE
+#define STX(a, v) do { XMM _t = (v); memcpy((void *)(uintptr_t)(a), &_t, 16); } while (0)
+#else
 #define STX(a, v) do { XMM _t = (v); uint64_t _a = (uint64_t)(uintptr_t)(a); \
   if (__builtin_expect(_a < 0x100000000ull, 1) && __builtin_expect(AOT_NODE_SUSPECT(_a, 16), 0) && !aot_nodehit(_a, 0, 16)) break; \
   memcpy((void *)(uintptr_t)_a, &_t, 16); } while (0)
+#endif
 #define PAR(v) ((uint8_t)!__builtin_parity((uint8_t)(v)))
 extern const int aot_is_pe32;   /* 1 when the recompiled image is a 32-bit PE32 (guest pointers are 32-bit) */
 #define PUSH32(v) do { uint32_t _p = (uint32_t)(v); r4 = (uint32_t)(r4 - 4); ST(uint32_t, r4, _p); } while (0)

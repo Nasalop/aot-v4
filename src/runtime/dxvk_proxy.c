@@ -198,7 +198,13 @@ static void *sym(const char *n) { for (int i = 0; i < 3; i++) if (hd[i]) { void 
 static int init_dxvk(void) {
   if (inited) return inited > 0 ? 0 : -1; inited = -1;
   if (!aot_is_pe32) return -1;
-  setenv("DXVK_LOG_PATH", "none", 0); setenv("DXVK_STATE_CACHE", "0", 0);
+  setenv("DXVK_LOG_PATH", "none", 0);
+  /* The state cache is what carries compiled pipelines from one run to the next; with it off every pipeline is
+     compiled again, which is the dxvk-shader-<n> CPU seen in the profile. The game data folder is this process's
+     working directory (android_main.c and win_file.c chdir into it before any D3D object exists), so name it
+     explicitly instead of inheriting whatever cwd we were started with. overwrite=0 keeps a user override. */
+  { char cd[512]; if (getcwd(cd, sizeof cd)) setenv("DXVK_STATE_CACHE_PATH", cd, 0); }
+  setenv("DXVK_STATE_CACHE", "1", 0);
   static const char *names[3] = { "libdxvk_dxgi.so", "libdxvk_d3d11.so", "libdxvk_d3d10core.so" };
   for (int i = 0; i < 3; i++) { hd[i] = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL); if (!hd[i]) { fprintf(stderr, "[dxvk] %s unavailable: %s (using the built-in D3D10 emulation)\n", names[i], dlerror()); return -1; } }
   void *w = aot_present_window(); if (!w) { fprintf(stderr, "[dxvk] no Android window yet\n"); return -1; }
