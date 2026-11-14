@@ -146,8 +146,8 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
                   * time, which stalls the whole frame. After 64 consecutive "not ready" answers for one query, report it finished: BOOL/UINT64 = 1 (event done / visible). */
     static __thread void *lastq; static __thread int nfalse;
     if (hr == 1) { if (lastq != (void *)o) { lastq = o; nfalse = 0; }
-      if (++nfalse >= 64) { uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; if (pd && sz >= 8) *(uint64_t *)(uintptr_t)pd = 1; else if (pd && sz >= 4) *(uint32_t *)(uintptr_t)pd = 1;
-        static int warned; if (!warned++) fprintf(stderr, "[dxvk] GPU query still not ready after 64 polls: reporting it as finished (result 1) so the game does not stall\n");
+      if (++nfalse >= 2) {   /* one flush + one retry already happened; do not spin the frame on a GPU round trip */ uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; if (pd && sz >= 8) *(uint64_t *)(uintptr_t)pd = 1; else if (pd && sz >= 4) *(uint32_t *)(uintptr_t)pd = 1;
+        static int warned; if (!warned++) fprintf(stderr, "[dxvk] GPU query still not ready after 2 polls: reporting it as finished (result 1) so the game does not stall\n");
         hr = 0; r = 0; nfalse = 0; lastq = NULL; } }
     else { nfalse = 0; lastq = NULL; } } if (m->ret && (int32_t)hr < 0) {
     fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x args:", pi->name, m->name, hr);
