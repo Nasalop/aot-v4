@@ -70,6 +70,13 @@ RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=L
                  'if(n_++<32)fprintf(stderr,"[aot] reserve %08x raised %u -> %u (size=%u cap=%u elem=%u ret=%08x)\\n",'
                  '(uint32_t)r1,nc_,ask_,sz_,(w_>>0xe)&0x3fffu,LD(uint32_t,(uint32_t)r4+8u),LD(uint32_t,(uint32_t)r4));}}')
 
+
+# Direct (in-region) calls for these leaf imports; set AOT_FASTCALL=0 in the environment of the transpiler to disable.
+FAST_CALLS = os.environ.get('AOT_FASTCALL', '1') != '0'
+FAST_IMPORTS = {'EnterCriticalSection', 'LeaveCriticalSection', 'TryEnterCriticalSection', 'GetTickCount', 'QueryPerformanceCounter', 'QueryPerformanceFrequency',
+                'TlsGetValue', 'TlsSetValue', 'GetLastError', 'SetLastError', 'SetEvent', 'ResetEvent', 'WaitForSingleObject', 'ReleaseSemaphore', 'ReleaseMutex',
+                'SwitchToThread', 'GetCurrentThreadId', 'InterlockedIncrement', 'InterlockedDecrement', 'InterlockedExchange', 'InterlockedExchangeAdd', 'InterlockedCompareExchange'}
+
 class Rec:
     def __init__(self, path):
         self.pe = pefile.PE(path)
@@ -357,6 +364,53 @@ class Gen:
         return c
 
     # main translate ---------------------------------------------------------
+
+    # ---- direct calls to hot leaf imports (skip the dispatcher round trip: SAVES/DECL_STATE, thunk lookup, region lookup) ----
+    def iat_map(self):
+        m = getattr(self, '_iat', None)
+        if m is None:
+            m = {}
+            for ent in getattr(self.rec.pe, 'DIRECTORY_ENTRY_IMPORT', []):
+                dll = ent.dll.decode()
+                for imp in ent.imports:
+                    if imp.name and imp.address: m[imp.address] = (dll, imp.name.decode())
+            self._iat = m
+        return m
+    def fast_imp_of(self, ins):
+        # `call dword ptr [abs IAT slot]` of a whitelisted leaf import -> (dll, name) else None
+        if ins.mnemonic.split()[-1] != 'call' or len(ins.operands) != 1: return None
+        o = ins.operands[0]
+        if o.type != X86_OP_MEM or o.mem.base or o.mem.index or o.mem.segment or o.size != 4: return None
+        e = self.iat_map().get(o.mem.disp & 0xFFFFFFFF)
+        return e if e and e[1] in FAST_IMPORTS else None
+    def fast_call(self, i, op, nx, tgt):
+        pre = ''; dll = name = None
+        if op.type == X86_OP_MEM:
+            e = self.fast_imp_of(i)
+            if not e: return ''
+            dll, name = e
+        elif op.type == X86_OP_IMM:   # tiny leaf wrapper: [mov r,[ecx+d]] [push r|imm]* call [fast import] ret
+            a = op.imm; body = []
+            for _ in range(8):
+                ins = self.rec.decode(a)
+                if ins is None: return ''
+                body.append(ins); a += ins.size
+                if ins.mnemonic.split()[-1] in ('ret', 'jmp'): break
+            if len(body) < 2 or body[-1].mnemonic.split()[-1] != 'ret' or body[-1].operands: return ''
+            e = self.fast_imp_of(body[-2])
+            if not e: return ''
+            dll, name = e
+            for ins in body[:-2]:
+                mn2 = ins.mnemonic.split()[-1]; o2 = ins.operands
+                if mn2 == 'push' and len(o2) == 1 and o2[0].type in (X86_OP_REG, X86_OP_IMM) and not (o2[0].type == X86_OP_REG and self.i.reg_name(o2[0].reg) == 'esp'): pass
+                elif mn2 == 'mov' and len(o2) == 2 and o2[0].type == X86_OP_REG and o2[1].type == X86_OP_MEM and o2[1].size == 4 and o2[1].mem.base and not o2[1].mem.index and not o2[1].mem.segment \
+                        and ins.reg_name(o2[1].mem.base) in ('ecx', 'edx', 'eax', 'esi', 'edi', 'ebx', 'ebp') and ins.reg_name(o2[0].reg) in ('eax', 'ecx', 'edx'): pass
+                else: return ''
+            pre = ''.join(self.tr(ins, set(), tgt) for ins in body[:-2])
+        else: return ''
+        return ('{static uint64_t(*f_)(CPU*);static int p_=-1,q_;if(p_<0){int fp_=0,pp_=0;f_=aot_x86_resolve("%s","%s",&pp_,&fp_);q_=fp_;p_=pp_;}'
+                'if(f_&&!q_){%sPUSH32(0x%xULL);c->r[4]=r4;aot_x86_thunk(c,f_,p_,0);r0=c->r[0];r1=c->r[1];r2=c->r[2];r8=c->r[8];r9=c->r[9];r4=c->r[4];%s}}'
+                % (dll, name, pre, nx, tgt(nx)))
     def tr(self, i, need, tgt):
         """returns C statements. tgt(addr)-> goto statement for a code address."""
         self.i = i; mn = i.mnemonic.split()[-1]; pre = i.mnemonic.split()[:-1]
@@ -516,8 +570,15 @@ class Gen:
                 if not m32: raise Unsup(mn)
                 if op.type == X86_OP_IMM: return 'PUSH32(c->sregs[1]);PUSH32(0x%xULL);%s' % (nx, tgt(op.imm))
                 return '{uint64_t a=%s;uint32_t t=LD(uint32_t,a);PUSH32(c->sregs[1]);PUSH32(0x%xULL);pc=t;goto dispatch;}' % (self.addr(op), nx)
-            if op.type == X86_OP_IMM: return '%s(0x%xULL);%s' % (PU, nx, tgt(op.imm))
-            return '{uint64_t t=%s; %s(0x%xULL); pc=t; goto dispatch;}' % (self.rdop(op, PS), PU, nx)
+            if op.type == X86_OP_IMM: orig = '%s(0x%xULL);%s' % (PU, nx, tgt(op.imm))
+            else: orig = '{uint64_t t=%s; %s(0x%xULL); pc=t; goto dispatch;}' % (self.rdop(op, PS), PU, nx)
+            if self.m32 and FAST_CALLS:
+                try:
+                    fast = self.fast_call(i, op, nx, tgt)
+                except Exception:
+                    fast = ''
+                if fast: return fast + orig
+            return orig
         if mn == 'into': return 'if(of)aot_unimpl(0x%xULL,"into overflow exception");' % i.address
         if mn == 'sidt': return 'ST(uint16_t,%s,0);ST(uint32_t,%s+2,0);' % (self.addr(ops[0]), self.addr(ops[0]))
         if mn == 'str': return self.wrop(ops[0], '0', S)
@@ -996,7 +1057,7 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
     if cur: regions.append(cur)
     owner = {b[0].address: k for k, r in enumerate(regions) for b in r}
     unsup = rec.unsup; nok = 0
-    files = []; buf = ['#include "aot_runtime.h"\n']
+    files = []; buf = ['#include "aot_runtime.h"\nextern uint64_t (*aot_x86_resolve(const char*,const char*,int*,int*))(CPU*);\nextern uint64_t aot_x86_thunk(CPU*,uint64_t(*)(CPU*),int,int);\n']
     for k, reg in enumerate(regions):
         out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;\ndispatch:switch(pc){' % k]
         out += ['case 0x%xULL:goto L_%x;' % (b[0].address, b[0].address) for b in reg]
