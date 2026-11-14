@@ -163,6 +163,9 @@ jobs:
           assert s.count(a) == 1, 'anchor not found in dxvk_proxy.c'
           b = ('if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0 && ({ static __thread uint64_t lf_; struct timespec ts_; clock_gettime(CLOCK_MONOTONIC, &ts_); '
                'uint64_t n_ = (uint64_t)ts_.tv_sec * 1000000000ull + (uint64_t)ts_.tv_nsec; int ok_ = n_ - lf_ > 2000000ull; if (ok_) lf_ = n_; ok_; })) {')
+          c = '  int is_gd = m->name[0] == \'G\' && !strcmp(m->name, "GetData") && ni >= 4;'
+          assert s.count(c) == 1, 'is_gd anchor not found in dxvk_proxy.c'
+          s = s.replace(c, '  if (m->name[0] == \'P\' && !strcmp(m->name, "Present") && ni >= 2) iv[1] = 0;   /* release: no vsync wait, so a 17 ms miss no longer snaps 60 -> 30 -> 15 fps */\n' + c)
           s = '#include <time.h>\n' + s.replace(a, b)
           open(p, 'w').write(s)
           PY
