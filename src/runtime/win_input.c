@@ -236,8 +236,16 @@ void aot_input_pad(const AotPad *p) {
   if (!p) { pad_on = 0; return; }
   if (!pad_on || memcmp(&pad, p, sizeof pad)) pad_packet++;
   pad = *p; pad_on = 1; pad_present = 1;
+  { static int n; if (n++ < 6) fprintf(stderr, "[in] pad buttons=%04x lt=%u rt=%u lx=%d ly=%d rx=%d ry=%d\n",
+      (unsigned)pad.buttons, (unsigned)pad.lt, (unsigned)pad.rt, pad.lx, pad.ly, pad.rx, pad.ry); }
+}
+int aot_input_pad_get(AotPad *out) {
+  if (!pad_present) return 0;
+  if (out) *out = pad;   /* zeroes until the pad is touched, which is what a connected idle pad looks like */
+  return 1;
 }
 SYS(XInputGetState) {   /* the game reads the sticks itself: this is a real XInput pad, not a mouse */
+  { static int n; if (n++ < 4) fprintf(stderr, "[in] XInputGetState(%u) called by the guest (pad_on=%d present=%d)\n", (unsigned)A(0), pad_on, pad_present); }
   if ((uint32_t)A(0) != 0 || (!pad_on && !pad_present)) return 1167;
   uint64_t o = A(1); if (!o) return 160;
   memset((void *)(uintptr_t)o, 0, 16); ST(uint32_t, o, pad_packet);
@@ -251,7 +259,7 @@ SYS(XInputSetState) { return (uint32_t)A(0) == 0 && (pad_on || pad_present) ? 0 
 SYS(XInputGetCapabilities) {
   if ((uint32_t)A(0) != 0 || (!pad_on && !pad_present)) return 1167;
   uint64_t o = A(2); if (!o) return 160;
-  memset((void *)(uintptr_t)o, 0, 20); ST(uint8_t, o, 1); ST(uint8_t, o + 1, 1); ST(uint16_t, o + 4, 0xF3FF); ST(uint8_t, o + 6, 255); ST(uint8_t, o + 7, 255);
+  memset((void *)(uintptr_t)o, 0, 20); ST(uint8_t, o, 1); ST(uint8_t, o + 1, 1); ST(uint16_t, o + 4, 0x1); ST(uint8_t, o + 6, 255); ST(uint8_t, o + 7, 255);
   ST(int16_t, o + 8, 32767); ST(int16_t, o + 10, 32767); ST(int16_t, o + 12, 32767); ST(int16_t, o + 14, 32767); return 0;
 }
 SYS(XInputGetBatteryInformation) {   /* XINPUT_BATTERY_INFORMATION: wired, full */

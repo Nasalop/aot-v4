@@ -225,7 +225,8 @@ DSB(QueryInterface) {
   if (P(1) && P(2) && !memcmp(P(1), IID_DS3DB_, 16)) {   /* 3D buffer: real position state, used by the mixer */
     DS3DObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E;
     l->o.vt = ds_vt_3db; l->o.ref = 1; l->b = THIS_B; l->min_d = 1.0f; l->max_d = 1e9f;
-    THIS_B->is3d = 1; THIS_B->min3 = 1.0f; THIS_B->max3 = 1e9f; aot_ds_3d(THIS_B, 0, 0, 0, 1.0f, 1e9f);
+    /* is3d stays 0 until the game actually positions the buffer: a 3D-capable source it never positions
+       must keep playing at full volume instead of being attenuated against a listener it ignores. */
     *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; return 0; }
   if (P(1) && P(2) && !memcmp(P(1), IID_DSL_, 16)) {   /* 3D listener: where the camera is and which way it faces */
     DSLisObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E;
@@ -311,11 +312,51 @@ DIO(QI) { uint32_t *o = P(2); if (!o) return 0x80004003u; *o = (uint32_t)A(0); (
 DIO(AddRef) { return (uint32_t)++((DSObj *)P(0))->ref; }
 DIO(Release) { DSObj *o = P(0); return (uint32_t)(o->ref > 0 ? --o->ref : 0); }
 DIO(Ok) { return 0; }
-DIO(State) {   /* (this, cb, void *data): keyboard = 256 DIK bytes; mouse = DIMOUSESTATE(2): lX,lY,lZ + buttons */
+/* ---- DirectInput joystick: the same pad the XInput shim exposes is enumerated here too, because a game
+ * of this era usually decides whether a controller exists from EnumDevices, long before it polls anything. ---- */
+static const uint16_t di_bm[10] = { 0x1000, 0x2000, 0x4000, 0x8000, 0x100, 0x200, 0x20, 0x10, 0x40, 0x80 };   /* A B X Y LB RB Back Start LS RS */
+static void di_joy_fill(uint8_t *o, const AotPad *p) {   /* DIJOYSTATE: 6 axes, 2 sliders, 4 POVs, 32 buttons */
+  ST(int32_t, o + 0, p->lx); ST(int32_t, o + 4, p->ly);
+  ST(int32_t, o + 8, ((int32_t)p->rt - (int32_t)p->lt) * 128);
+  ST(int32_t, o + 12, p->rx); ST(int32_t, o + 16, p->ry); ST(int32_t, o + 20, 0);
+  ST(int32_t, o + 24, (int32_t)p->lt * 257 - 32767); ST(int32_t, o + 28, (int32_t)p->rt * 257 - 32767);
+  uint32_t pov = 0xFFFFFFFFu;
+  switch (p->buttons & 0xF) { case 1: pov = 0; break; case 2: pov = 18000; break; case 4: pov = 27000; break; case 8: pov = 9000; break;
+    case 5: pov = 31500; break; case 9: pov = 4500; break; case 6: pov = 22500; break; case 10: pov = 13500; break; default: break; }
+  ST(uint32_t, o + 32, pov); ST(uint32_t, o + 36, 0xFFFFFFFFu); ST(uint32_t, o + 40, 0xFFFFFFFFu); ST(uint32_t, o + 44, 0xFFFFFFFFu);
+  for (int i = 0; i < 10; i++) o[48 + i] = (p->buttons & di_bm[i]) ? 0x80 : 0;
+}
+DIO(Caps) {   /* DIDEVCAPS: 5 axes, 10 buttons, one POV hat */
+  uint8_t *cp = P(1); if (!cp) return 0x80070057u;
+  DIDev *dv = P(0); int joy = dv->kind == 3;
+  uint32_t sz = LD(uint32_t, cp); if (sz < 44) sz = 44;
+  memset(cp, 0, sz); ST(uint32_t, cp, sz); ST(uint32_t, cp + 4, 0x1 | 0x4); ST(uint32_t, cp + 8, joy ? 0x1501u : 0x1200u);
+  ST(uint32_t, cp + 12, joy ? 5 : 3); ST(uint32_t, cp + 16, joy ? 10 : 8); ST(uint32_t, cp + 20, joy ? 1 : 0);
+  return 0; }
+DIO(Enum) {   /* (this, devtype, callback, ctx, flags): one emulated gamepad, only while a pad is attached */
+  uint32_t want = (uint32_t)A(1), cbk = (uint32_t)A(2), ctx = (uint32_t)A(3);
+  if (!cbk) return 0x80070057u;
+  if (want == 0x12 || want == 0x13) return 0;   /* keyboard / mouse classes are not pads */
+  AotPad pd; if (!aot_input_pad_get(&pd)) return 0;
+  uint8_t *di = aot_gmalloc(580); if (!di) return 0x8007000E;
+  memset(di, 0, 580);
+  ST(uint32_t, di, 580);                        /* dwSize */
+  ST(uint32_t, di + 4, 0x6F1D2B70u);            /* guidInstance */
+  ST(uint32_t, di + 20, 0x6F1D2B70u);           /* guidProduct */
+  ST(uint32_t, di + 36, 0x1501u);               /* dwDevType: gamepad, standard */
+  memcpy(di + 40, "Xbox 360 Controller (XInput)", 28);   /* tszInstanceName[260] */
+  memcpy(di + 300, "Xbox 360 Controller", 19);            /* tszProductName[260] */
+  ST(uint16_t, di + 576, 0x01); ST(uint16_t, di + 578, 0x05);   /* usage page generic desktop, usage gamepad */
+  { static int n; if (n++ < 1) fprintf(stderr, "[in] DirectInput: EnumDevices reports one emulated gamepad\n"); }
+  aot_call(c, cbk, 2, (uint64_t)(uintptr_t)di, (uint64_t)ctx);
+  aot_gfree(di);
+  return 0; }
+DIO(State) {   /* (this, cb, void *data): keyboard = 256 DIK bytes; mouse = DIMOUSESTATE(2); joystick = DIJOYSTATE */
   DIDev *dv = P(0); uint8_t *o = P(2); uint32_t cb = (uint32_t)A(1); if (!o) return 0x80070057u;
   memset(o, 0, cb);
   if (dv->kind == 1) { uint8_t k[256]; aot_input_dik(k); memcpy(o, k, cb < 256 ? cb : 256); }
   else if (dv->kind == 2 && cb >= 16) { int32_t dx, dy; uint8_t b[3]; aot_input_dimouse(&dx, &dy, b); ((int32_t *)o)[0] = dx; ((int32_t *)o)[1] = dy; o[12] = b[0]; o[13] = b[1]; o[14] = b[2]; }
+  else if (dv->kind == 3 && cb >= 80) { AotPad pd; memset(&pd, 0, sizeof pd); if (aot_input_pad_get(&pd)) di_joy_fill(o, &pd); }
   return 0; }
 DIO(Data) {   /* (this, cbObjectData, DIDEVICEOBJECTDATA*, DWORD *inout, flags): buffered events = changes since the last read */
   DIDev *dv = P(0); uint32_t cbo = (uint32_t)A(1), *cnt = P(3), cap = cnt ? *cnt : 0, flags = (uint32_t)A(4), n = 0; uint8_t *out = P(2);
@@ -323,6 +364,9 @@ DIO(Data) {   /* (this, cbObjectData, DIDEVICEOBJECTDATA*, DWORD *inout, flags):
   uint8_t cur[256] = {0}; uint32_t ofs[256], nofs = 0; int32_t dx = 0, dy = 0;
   if (dv->kind == 1) { aot_input_dik(cur); for (uint32_t i = 0; i < 256; i++) ofs[nofs++] = i; }
   else if (dv->kind == 2) { uint8_t b[3]; aot_input_dimouse(&dx, &dy, b); for (int i = 0; i < 3; i++) { cur[i] = b[i]; ofs[nofs++] = 12 + i; } }
+  else if (dv->kind == 3) { AotPad pd; memset(&pd, 0, sizeof pd); aot_input_pad_get(&pd);   /* buttons and the POV byte, as buffered events */
+    for (int i = 0; i < 10; i++) { cur[i] = (pd.buttons & di_bm[i]) ? 0x80 : 0; ofs[nofs++] = 48 + i; }
+    cur[10] = (uint8_t)(pd.buttons & 0xF); ofs[nofs++] = 32; }
   uint8_t nxt[256]; memcpy(nxt, dv->prev, 256); struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint32_t tick = (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
   #define EV(o, v) do { if (n < cap && out) { uint32_t *e = (uint32_t *)(out + n * cbo); memset(e, 0, cbo); e[0] = (o); e[1] = (uint32_t)(v); e[2] = tick; e[3] = ++dv->seq; } n++; } while (0)
   if (dv->kind == 2) { if (dx) EV(0, dx); if (dy) EV(4, dy); }
@@ -330,16 +374,16 @@ DIO(Data) {   /* (this, cbObjectData, DIDEVICEOBJECTDATA*, DWORD *inout, flags):
   if (!(flags & 1)) memcpy(dv->prev, nxt, 256);   /* DIGDD_PEEK leaves the buffer intact */
   *cnt = out ? (n < cap ? n : cap) : 0; return 0; }
 DIO(CreateDevice) {
-  uint32_t *out = P(2); if (!out) return 0x80070057u; DIDev *d = aot_gcalloc(1, sizeof *d); if (!d) return 0x8007000Eu; { const uint32_t *g = P(1); d->kind = g && g[0] == 0x6F1D2B61u ? 1 : g && g[0] == 0x6F1D2B60u ? 2 : 0; }
+  uint32_t *out = P(2); if (!out) return 0x80070057u; DIDev *d = aot_gcalloc(1, sizeof *d); if (!d) return 0x8007000Eu; { const uint32_t *g = P(1); d->kind = g && g[0] == 0x6F1D2B61u ? 1 : g && g[0] == 0x6F1D2B60u ? 2 : 3; }   /* anything else: the emulated pad */
   d->vt = di_vt_dev; d->ref = 1; *out = (uint32_t)(uintptr_t)d; return 0; }
 static void di_init(void) {
   if (di_vt) return;
-  static const DSSlot dev[] = { {0,"QueryInterface",u_di_QI,3}, {1,"AddRef",u_di_AddRef,1}, {2,"Release",u_di_Release,1}, {3,"GetCapabilities",u_di_Ok,2}, {4,"EnumObjects",u_di_Ok,4},
+  static const DSSlot dev[] = { {0,"QueryInterface",u_di_QI,3}, {1,"AddRef",u_di_AddRef,1}, {2,"Release",u_di_Release,1}, {3,"GetCapabilities",u_di_Caps,2}, {4,"EnumObjects",u_di_Ok,4},
     {5,"GetProperty",u_di_Ok,3}, {6,"SetProperty",u_di_Ok,3}, {7,"Acquire",u_di_Ok,1}, {8,"Unacquire",u_di_Ok,1}, {9,"GetDeviceState",u_di_State,3}, {10,"GetDeviceData",u_di_Data,5},
     {11,"SetDataFormat",u_di_Ok,2}, {12,"SetEventNotification",u_di_Ok,2}, {13,"SetCooperativeLevel",u_di_Ok,3}, {14,"GetObjectInfo",u_di_Ok,4}, {15,"GetDeviceInfo",u_di_Ok,2},
     {16,"RunControlPanel",u_di_Ok,3}, {17,"Initialize",u_di_Ok,4}, {25,"Poll",u_di_Ok,1}, {26,"SendDeviceData",u_di_Ok,5}, {0,0,0,0} };
   static const DSSlot idi[] = { {0,"QueryInterface",u_di_QI,3}, {1,"AddRef",u_di_AddRef,1}, {2,"Release",u_di_Release,1}, {3,"CreateDevice",u_di_CreateDevice,4},
-    {4,"EnumDevices",u_di_Ok,5}, {5,"GetDeviceStatus",u_di_Ok,2}, {6,"RunControlPanel",u_di_Ok,3}, {7,"Initialize",u_di_Ok,3}, {0,0,0,0} };
+    {4,"EnumDevices",u_di_Enum,5}, {5,"GetDeviceStatus",u_di_Ok,2}, {6,"RunControlPanel",u_di_Ok,3}, {7,"Initialize",u_di_Ok,3}, {0,0,0,0} };
   di_vt_dev = ds_build("IDirectInputDevice8", 32, dev); di_vt = ds_build("IDirectInput8", 11, idi);
 }
 S(DirectInput8Create) {   /* (hinst, version, riid, void** ppv, outer) */

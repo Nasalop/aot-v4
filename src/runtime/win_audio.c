@@ -74,7 +74,7 @@ static SLObjectItf output_mix_object;
    first buffer that plays; sources with any other format are left silent rather than resampled, and the
    first such mismatch is reported once. ---- */
 static int audio_engine_init(void);
-#define AOT_DS_SRC 24
+#define AOT_DS_SRC 64
 #define AOT_DS_FRAMES 1024
 #define AOT_DS_QSZ 3
 #define AOT_DS_FADE 128
@@ -117,6 +117,9 @@ static void ds_gains(DsSrc *s, int32_t *gl, int32_t *gr) {   /* 8.8 fixed point 
     float md = s->min_d > 0.01f ? s->min_d : 1.0f;
     float att = d <= md ? 1.0f : md / (md + lis_rolloff * (d - md));
     if (att > 1.0f) att = 1.0f;
+    /* Never let distance mute a voice outright: one stale listener (a cut-scene that never moves it, a
+       source left at the origin) turned whole scenes silent while the mix itself was fine. */
+    if (att < 0.15f) att = 0.15f;
     g *= att;
     if (d > 0.0001f) {   /* lateral offset along the listener's right axis, scaled to -1..1 */
       float rx = lis_ty * lis_fz - lis_tz * lis_fy, ry = lis_tz * lis_fx - lis_tx * lis_fz, rz = lis_tx * lis_fy - lis_ty * lis_fx;
@@ -210,7 +213,9 @@ void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int
   int fresh = 0;
   if (!s) {
     for (int i = 0; i < AOT_DS_SRC; i++) if (!ds_src[i].key) { s = &ds_src[i]; break; }
-    if (!s) { pthread_mutex_unlock(&ds_mu); return NULL; }
+    if (!s) {   /* every slot busy: a cut-scene voice used to be dropped here in silence */
+      static int n; if (!n++) fprintf(stderr, "[audio] DirectSound: no free voice slot (64 playing): new buffers are dropped\n");
+      pthread_mutex_unlock(&ds_mu); return NULL; }
     memset(s, 0, sizeof *s); s->key = key; s->gain = 1.0f; fresh = 1;
   }
   s->data = data; s->size = size; s->ch = channels == 1 ? 1 : 2; s->looping = looping; s->playing = 1;
