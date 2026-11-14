@@ -9,12 +9,23 @@ android {
   ndkVersion '26.1.10909125'
 
   defaultConfig {
-    applicationId 'com.aot.game'; minSdk 26; targetSdk 34; versionCode 1; versionName '1.0'
-    ndk { abiFilters 'arm64-v8a'}
-    
+    applicationId 'com.aot.game'
+    // 29 = native TLS (no emulated __thread); the runtime's per-call thread-locals were ~25% of CPU at 26
+    minSdk 29
+    targetSdk 34
+    versionCode 1
+    versionName '1.0'
+    ndk { abiFilters 'arm64-v8a' }
+
     externalNativeBuild {
       cmake {
-        arguments "-DCMAKE_C_COMPILER_LAUNCHER=ccache", "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache", "-DAOT_MODE=${project.findProperty('aotMode') ?: 'transpiler'}", "-DAOT_PREBUILT_GEN=${project.findProperty('aotPrebuilt') ?: ''}"
+        // The debug variant defaults to -O0; force optimisation for the runtime and generated code
+        cFlags '-O2'
+        cppFlags '-O2'
+        arguments "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
+                  "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+                  "-DAOT_MODE=${project.findProperty('aotMode') ?: 'transpiler'}",
+                  "-DAOT_PREBUILT_GEN=${project.findProperty('aotPrebuilt') ?: ''}"
       }
     }
   }
@@ -25,19 +36,19 @@ android {
     }
   }
 
-  externalNativeBuild { 
-    cmake { 
+  externalNativeBuild {
+    cmake {
       path 'src/main/cpp/CMakeLists.txt'
-      version '3.22.1' 
-    } 
+      version '3.22.1'
+    }
   }
 
-  buildTypes { 
-    debug { debuggable true } 
+  buildTypes {
+    debug { debuggable true }
   }
 
-  packaging { 
-    jniLibs { useLegacyPackaging = true } 
+  packaging {
+    jniLibs { useLegacyPackaging = true }
   }
 }
 
