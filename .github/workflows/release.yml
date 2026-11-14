@@ -154,19 +154,14 @@ jobs:
         run: bash third_party/vkd3d/build.sh android/app/src/main/jniLibs-vkd3d
       - name: Stage vkd3d-shader into jniLibs
         run: mkdir -p android/app/src/main/jniLibs/arm64-v8a && cp android/app/src/main/jniLibs-vkd3d/libvkd3dshader.so android/app/src/main/jniLibs/arm64-v8a/
-      - name: Perf patch - rate-limit the forced device Flush in query polling
+      - name: Release patch - no vsync wait in Present
         run: |
           python3 - <<'PY'
           p = 'src/runtime/dxvk_proxy.c'
           s = open(p).read()
-          a = 'if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0) {'
-          assert s.count(a) == 1, 'anchor not found in dxvk_proxy.c'
-          b = ('if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0 && ({ static __thread uint64_t lf_; struct timespec ts_; clock_gettime(CLOCK_MONOTONIC, &ts_); '
-               'uint64_t n_ = (uint64_t)ts_.tv_sec * 1000000000ull + (uint64_t)ts_.tv_nsec; int ok_ = n_ - lf_ > 2000000ull; if (ok_) lf_ = n_; ok_; })) {')
           c = '  int is_gd = m->name[0] == \'G\' && !strcmp(m->name, "GetData") && ni >= 4;'
           assert s.count(c) == 1, 'is_gd anchor not found in dxvk_proxy.c'
-          s = s.replace(c, '  if (m->name[0] == \'P\' && !strcmp(m->name, "Present") && ni >= 2) iv[1] = 0;   /* release: no vsync wait, so a 17 ms miss no longer snaps 60 -> 30 -> 15 fps */\n' + c)
-          s = '#include <time.h>\n' + s.replace(a, b)
+          s = s.replace(c, '  if (m->name[0] == \'P\' && !strcmp(m->name, "Present") && ni >= 2) iv[1] = 0;   /* release: no vsync wait */\n' + c)
           open(p, 'w').write(s)
           PY
       - name: Install ccache (the app's CMake config uses it as compiler launcher)
