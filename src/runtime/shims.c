@@ -176,8 +176,10 @@ static VRes *vres_find(uint64_t a) { for (int i = 0; i < vres_n; i++) if (vres[i
 #define QMAX 4096
 typedef struct { uint64_t a, n; } QEnt; static QEnt qlist[QMAX]; static int qcount;
 static int va_quarantine(uint64_t a, uint64_t n) {   /* 0: it could not be kept reserved, so the release must fail rather than leave a hole */
-  void *p = mmap((void *)a, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
-  if (p != (void *)a) { if (p != MAP_FAILED) munmap(p, n); return 0; }
+  /* Keep the released space mapped READ/WRITE with its contents instead of PROT_NONE: the game's allocator sometimes releases a segment that still holds live
+   * objects (its own bookkeeping, not ours), and a PROT_NONE page turned that into a fatal SIGSEGV in the next getter call. The address range stays reserved
+   * (never re-issued, see va_quarantine_take), so nothing else can land on top of it; stale objects simply keep their data. */
+  if (mprotect((void *)a, n, PROT_READ | PROT_WRITE) != 0) return 0;
   if (qcount == QMAX) { static int rep; if (rep++ < 4) fprintf(stderr, "[va] quarantine table full: %#llx+%#llx stays reserved but unreusable\n", (unsigned long long)a, (unsigned long long)n); return 1; }
   qlist[qcount++] = (QEnt){ a, n }; return 1;
 }
