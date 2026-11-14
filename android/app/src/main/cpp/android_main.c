@@ -101,11 +101,14 @@ static int32_t on_input(struct android_app *app, AInputEvent *e) {
     float x = AMotionEvent_getX(e, 0), y = AMotionEvent_getY(e, 0);
     if (g_app->window) aot_input_view((uint32_t)ANativeWindow_getWidth(g_app->window), (uint32_t)ANativeWindow_getHeight(g_app->window));
     switch (act) {
-      case AMOTION_EVENT_ACTION_DOWN: aot_input_mouse(0, x, y); aot_input_mouse(1, x, y); break;
-      case AMOTION_EVENT_ACTION_MOVE: aot_input_mouse(0, x, y); break;
-      case AMOTION_EVENT_ACTION_UP: case AMOTION_EVENT_ACTION_CANCEL: aot_input_mouse(2, x, y); break;
-      case AMOTION_EVENT_ACTION_POINTER_DOWN: if (idx == 1) aot_input_mouse(3, AMotionEvent_getX(e, 1), AMotionEvent_getY(e, 1)); break;
-      case AMOTION_EVENT_ACTION_POINTER_UP: if (idx == 1) aot_input_mouse(4, x, y); break;
+      /* A finger on the surface only moves the pointer: clicks come from the on-screen buttons (the Java
+         overlay in GameActivity.ControlsView) and from a physical gamepad, so dragging to look around can
+         never fire the weapon, open a door or pick a menu entry. */
+      case AMOTION_EVENT_ACTION_DOWN: case AMOTION_EVENT_ACTION_POINTER_DOWN:
+      case AMOTION_EVENT_ACTION_MOVE:
+      case AMOTION_EVENT_ACTION_UP: case AMOTION_EVENT_ACTION_CANCEL:
+      case AMOTION_EVENT_ACTION_POINTER_UP:
+        aot_input_mouse(0, x, y); break;
     }
     return 1;
   }
@@ -114,6 +117,15 @@ static int32_t on_input(struct android_app *app, AInputEvent *e) {
 /* Called by the Java on-screen controller overlay (GameActivity.ControlsView). */
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeKey0(JNIEnv *env, jclass cls, jint vk, jint down) { (void)env; (void)cls; { static int n; if (n++ < 200) LOG("overlay key vk=%d down=%d", vk, down); } aot_input_key(vk, down); }
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeMouse0(JNIEnv *env, jclass cls, jint kind, jfloat x, jfloat y) { (void)env; (void)cls; { static int n; if (n++ < 200) LOG("overlay mouse kind=%d at (%d,%d)", kind, (int)x, (int)y); } aot_input_mouse(kind, x, y); }
+/* A physical gamepad delivers its events to the Activity, not to this native input queue, so GameActivity
+   forwards them here: the same AotPad the native path fills, so XInputGetState sees one device either way. */
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativePad0(JNIEnv *env, jclass cls, jint buttons, jint lt, jint rt, jint lx, jint ly, jint rx, jint ry) {
+  (void)env; (void)cls;
+  AotPad p; memset(&p, 0, sizeof p);
+  p.buttons = (uint16_t)buttons; p.lt = (uint8_t)lt; p.rt = (uint8_t)rt;
+  p.lx = (int16_t)lx; p.ly = (int16_t)ly; p.rx = (int16_t)rx; p.ry = (int16_t)ry;
+  pad = p; aot_input_pad(&pad);
+}
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeView0(JNIEnv *env, jclass cls, jint w, jint h) { (void)env; (void)cls; LOG("overlay view size %dx%d", w, h); aot_input_view((uint32_t)w, (uint32_t)h); }
 static void on_cmd(struct android_app *app, int32_t cmd) {
   if (cmd == APP_CMD_INIT_WINDOW) aot_android_set_window(app->window);

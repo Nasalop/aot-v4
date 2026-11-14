@@ -80,12 +80,63 @@ public final class GameActivity extends NativeActivity {
     private static void nativeMouse(int kind, float x, float y) { if (nativesOk) try { nativeMouse0(kind, x, y); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
     private static void nativeView(int w, int h) { if (nativesOk) try { nativeView0(w, h); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
 
+    /* Physical gamepad. Its key/motion events are delivered to this Activity, not to the native input
+       queue, so a real pad used to be invisible to the guest. Forward buttons and sticks to the guest's
+       XInput device (buttons as the XINPUT_GAMEPAD bitmask); the right stick is turned into mouse look
+       in win_input.c, so aiming works the same way it does with a finger drag. */
+    private static native void nativePad0(int buttons, int lt, int rt, int lx, int ly, int rx, int ry);
+    private int padButtons, padLx, padLy, padRx, padRy, padLt, padRt;
+    private static int padAxis(android.view.MotionEvent e, int a) {
+        float v = e.getAxisValue(a); if (v > 1f) v = 1f; if (v < -1f) v = -1f; return (int) (v * 32767f); }
+    private void sendPad() {
+        if (!nativesOk) return;
+        try { nativePad0(padButtons, padLt, padRt, padLx, padLy, padRx, padRy); }
+        catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
+    private boolean padKey(int code, boolean down) {
+        int bit;
+        switch (code) {
+            case android.view.KeyEvent.KEYCODE_BUTTON_A: bit = 0x1000; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_B: bit = 0x2000; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_X: bit = 0x4000; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_Y: bit = 0x8000; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_L1: bit = 0x100; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_R1: bit = 0x200; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_THUMBL: bit = 0x40; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_THUMBR: bit = 0x80; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_START: bit = 0x10; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_SELECT: bit = 0x20; break;
+            case android.view.KeyEvent.KEYCODE_DPAD_UP: bit = 1; break;
+            case android.view.KeyEvent.KEYCODE_DPAD_DOWN: bit = 2; break;
+            case android.view.KeyEvent.KEYCODE_DPAD_LEFT: bit = 4; break;
+            case android.view.KeyEvent.KEYCODE_DPAD_RIGHT: bit = 8; break;
+            case android.view.KeyEvent.KEYCODE_BUTTON_L2: padLt = down ? 255 : 0; sendPad(); return true;
+            case android.view.KeyEvent.KEYCODE_BUTTON_R2: padRt = down ? 255 : 0; sendPad(); return true;
+            default: return false;
+        }
+        if (down) padButtons |= bit; else padButtons &= ~bit;
+        sendPad(); return true;
+    }
+    @Override public boolean onKeyDown(int code, android.view.KeyEvent e) { return padKey(code, true) || super.onKeyDown(code, e); }
+    @Override public boolean onKeyUp(int code, android.view.KeyEvent e) { return padKey(code, false) || super.onKeyUp(code, e); }
+    @Override public boolean onGenericMotionEvent(android.view.MotionEvent e) {
+        int src = e.getSource();
+        if ((src & android.view.InputDevice.SOURCE_JOYSTICK) != 0 || (src & android.view.InputDevice.SOURCE_GAMEPAD) != 0) {
+            padLx = padAxis(e, android.view.MotionEvent.AXIS_X); padLy = padAxis(e, android.view.MotionEvent.AXIS_Y);
+            padRx = padAxis(e, android.view.MotionEvent.AXIS_Z); padRy = padAxis(e, android.view.MotionEvent.AXIS_RZ);
+            padLt = (int) (e.getAxisValue(android.view.MotionEvent.AXIS_LTRIGGER) * 255f);
+            padRt = (int) (e.getAxisValue(android.view.MotionEvent.AXIS_RTRIGGER) * 255f);
+            sendPad(); return true;
+        }
+        return super.onGenericMotionEvent(e);
+    }
+
     /** Text-only on-screen controller. Left stick = W/A/S/D; labelled round buttons = keys; "KB" opens a typing keyboard; any other touch = mouse
      *  (1st finger left click/drag, 2nd finger right click). Everything is drawn with plain text and circles/rectangles, nothing is loaded. */
     private static final class ControlsView extends View {
         private static final class Btn {
-            final String label; final int vk; final float cx, cy, hw, hh; final boolean sticky; int ptr = -1; boolean on;
-            Btn(String l, int v, float x, float y, float w, float h, boolean s) { label = l; vk = v; cx = x; cy = y; hw = w; hh = h; sticky = s; }
+            final String label; final int vk; final int mk; final float cx, cy, hw, hh; final boolean sticky; int ptr = -1; boolean on;
+            Btn(String l, int v, float x, float y, float w, float h, boolean s) { label = l; vk = v; mk = 0; cx = x; cy = y; hw = w; hh = h; sticky = s; }
+            Btn(String l, int m, float x, float y, float w, float h) { label = l; mk = m; vk = 0; cx = x; cy = y; hw = w; hh = h; sticky = false; }
         }
         private final java.util.ArrayList<Btn> game = new java.util.ArrayList<>(), kb = new java.util.ArrayList<>();
         private final Btn kbToggle = new Btn("KB", -1, 0.93f, 0.08f, 0.05f, 0.07f, true);
@@ -98,6 +149,10 @@ public final class GameActivity extends NativeActivity {
             Object[][] g = { {"SPACE\njump/act", 0x20, 0.93f, 0.80f}, {"E\naction", 0x45, 0.85f, 0.64f}, {"SHIFT\nhigh prof.", 0x10, 0.76f, 0.84f}, {"CTRL\nlow prof.", 0x11, 0.68f, 0.66f},
                 {"ENTER", 0x0D, 0.93f, 0.55f}, {"Q", 0x51, 0.58f, 0.84f}, {"TAB\nmap", 0x09, 0.50f, 0.68f}, {"ESC\nmenu", 0x1B, 0.06f, 0.08f}, {"F", 0x46, 0.85f, 0.43f}, {"R", 0x52, 0.76f, 0.50f} };
             for (Object[] o : g) game.add(new Btn((String) o[0], (Integer) o[1], (Float) o[2], (Float) o[3], 0.045f, 0.075f, false));
+            /* Mouse buttons are their own buttons: a finger dragged across the surface only moves the pointer,
+               so looking around cannot click. mk 1 = left, 3 = right; release sends mk + 1. */
+            game.add(new Btn("LMB\nclick", 1, 0.93f, 0.30f, 0.045f, 0.075f));
+            game.add(new Btn("RMB\naim", 3, 0.93f, 0.42f, 0.045f, 0.075f));
             String[] rows = { "1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM" };
             for (int r = 0; r < rows.length; r++) for (int i = 0; i < rows[r].length(); i++) {
                 char ch = rows[r].charAt(i); float x = 0.5f + (i - (rows[r].length() - 1) / 2f) * 0.075f;
@@ -120,7 +175,7 @@ public final class GameActivity extends NativeActivity {
             kx = x; ky = y; float dx = x - sx, dy = y - sy, dz = radius() * 0.6f;
             setDir(0, dy < -dz); setDir(2, dy > dz); setDir(1, dx < -dz); setDir(3, dx > dz); }
         private void releaseAll() {
-            for (java.util.List<Btn> l : java.util.Arrays.asList(game, kb)) for (Btn b : l) { if (b.ptr >= 0 || b.on) nativeKey(b.vk, 0); b.ptr = -1; b.on = false; }
+            for (java.util.List<Btn> l : java.util.Arrays.asList(game, kb)) for (Btn b : l) { if (b.ptr >= 0 || b.on) { if (b.mk != 0) nativeMouse(b.mk + 1, 0, 0); else nativeKey(b.vk, 0); } b.ptr = -1; b.on = false; }
             for (int k = 0; k < 4; k++) setDir(k, false); stickPtr = -1; }
         @Override public boolean onTouchEvent(MotionEvent e) {
             try {
@@ -128,19 +183,17 @@ public final class GameActivity extends NativeActivity {
                 if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
                     float x = e.getX(i), y = e.getY(i); Btn b = hit(x, y);
                     if (b == kbToggle) { releaseAll(); kbToggle.on = !kbToggle.on; }
-                    else if (b != null) { b.ptr = id; if (b.sticky) { b.on = !b.on; nativeKey(b.vk, b.on ? 1 : 0); } else nativeKey(b.vk, 1); }
+                    else if (b != null) { b.ptr = id; if (b.mk != 0) nativeMouse(b.mk, x, y); else if (b.sticky) { b.on = !b.on; nativeKey(b.vk, b.on ? 1 : 0); } else nativeKey(b.vk, 1); }
                     else if (!kbToggle.on && x < getWidth() * 0.30f && y > getHeight() * 0.35f && stickPtr < 0) { stickPtr = id; sx = x; sy = y; stick(x, y); }
-                    else if (mousePtr < 0) { mousePtr = id; nativeMouse(0, x, y); nativeMouse(1, x, y); }
-                    else if (rightPtr < 0) { rightPtr = id; nativeMouse(3, x, y); }
+                    else if (mousePtr < 0) { mousePtr = id; nativeMouse(0, x, y); }
                 } else if (a == MotionEvent.ACTION_MOVE) {
                     for (int k = 0; k < e.getPointerCount(); k++) { int pid = e.getPointerId(k);
                         if (pid == stickPtr) stick(e.getX(k), e.getY(k)); else if (pid == mousePtr) nativeMouse(0, e.getX(k), e.getY(k)); }
                 } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_POINTER_UP || a == MotionEvent.ACTION_CANCEL) {
                     float x = e.getX(i), y = e.getY(i); boolean cancel = a == MotionEvent.ACTION_CANCEL;
-                    for (java.util.List<Btn> l : java.util.Arrays.asList(game, kb)) for (Btn b : l) if (b.ptr == id || cancel) { if (b.ptr >= 0 && !b.sticky) nativeKey(b.vk, 0); b.ptr = -1; }
+                    for (java.util.List<Btn> l : java.util.Arrays.asList(game, kb)) for (Btn b : l) if (b.ptr == id || cancel) { if (b.ptr >= 0) { if (b.mk != 0) nativeMouse(b.mk + 1, x, y); else if (!b.sticky) nativeKey(b.vk, 0); } b.ptr = -1; }
                     if (id == stickPtr || cancel) { stickPtr = -1; for (int k = 0; k < 4; k++) setDir(k, false); }
-                    if (id == mousePtr || cancel) { if (mousePtr >= 0) nativeMouse(2, x, y); mousePtr = -1; }
-                    if (id == rightPtr || cancel) { if (rightPtr >= 0) nativeMouse(4, x, y); rightPtr = -1; }
+                    if (id == mousePtr || cancel) { mousePtr = -1; }
                 }
                 invalidate();
             } catch (Throwable t) { android.util.Log.w("aotgame", "controls: " + t); }

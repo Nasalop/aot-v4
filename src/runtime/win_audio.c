@@ -69,6 +69,98 @@ static SLObjectItf engine_object;
 static SLEngineItf engine;
 static SLObjectItf output_mix_object;
 
+/* ---- DirectSound output: the DS buffers the x86 DSOUND shim keeps in guest memory are mixed here and
+   handed to OpenSLES, so IDirectSoundBuffer8::Play is actually audible. One player at the format of the
+   first buffer that plays; sources with any other format are left silent rather than resampled, and the
+   first such mismatch is reported once. ---- */
+static int audio_engine_init(void);
+#define AOT_DS_SRC 16
+#define AOT_DS_FRAMES 1024
+typedef struct { void *key; const uint8_t *data; uint32_t size, pos; int looping, playing; } DsSrc;
+static DsSrc ds_src[AOT_DS_SRC];
+static pthread_mutex_t ds_mu = PTHREAD_MUTEX_INITIALIZER;
+static SLObjectItf ds_obj; static SLPlayItf ds_play; static SLAndroidSimpleBufferQueueItf ds_queue;
+static int ds_freq = 44100, ds_ch = 2, ds_warned;
+static int16_t ds_mix[AOT_DS_FRAMES * 2];
+static int16_t ds_out[2][AOT_DS_FRAMES * 2];
+static int ds_flip;
+
+static void ds_feed(void) {   /* 16-bit stereo at ds_freq, saturating add of every playing source */
+  memset(ds_mix, 0, sizeof ds_mix);
+  int n = (int)(sizeof ds_mix / sizeof ds_mix[0]);
+  for (int i = 0; i < AOT_DS_SRC; i++) {
+    DsSrc *s = &ds_src[i];
+    if (!s->key || !s->playing || !s->data || s->size < 4) continue;
+    for (int k = 0; k < n; k++) {
+      uint32_t at = s->pos;
+      if (at + 2 > s->size) { if (!s->looping) { s->playing = 0; break; } s->pos = at = 0; }
+      int16_t v = (int16_t)(uint16_t)(s->data[at] | (s->data[at + 1] << 8));
+      int32_t m = (int32_t)ds_mix[k] + v;
+      ds_mix[k] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m);
+      s->pos = at + 2; if (s->pos >= s->size) s->pos = s->looping ? 0 : s->size;
+    }
+  }
+}
+static void ds_queue_cb(SLAndroidSimpleBufferQueueItf q, void *ctx) {
+  (void)q; (void)ctx;
+  pthread_mutex_lock(&ds_mu);
+  ds_feed();
+  int16_t *b = ds_out[ds_flip]; memcpy(b, ds_mix, sizeof ds_mix); ds_flip ^= 1;
+  pthread_mutex_unlock(&ds_mu);
+  (*ds_queue)->Enqueue(ds_queue, b, sizeof ds_mix);
+}
+static int ds_open(int freq, int ch) {
+  if (ds_obj) return 0;
+  ds_freq = freq > 0 ? freq : 44100; ds_ch = ch == 1 ? 1 : 2;
+  if (audio_engine_init() != 0) return -1;
+  SLDataLocator_AndroidSimpleBufferQueue loc = { SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 2 };
+  SLDataFormat_PCM pcm = { SL_DATAFORMAT_PCM, (SLuint32)ds_ch, (SLuint32)ds_freq * 1000, SL_PCMSAMPLEFORMAT_FIXED_16, 16,
+                           ds_ch == 1 ? SL_SPEAKER_FRONT_CENTER : (SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT), SL_BYTEORDER_LITTLEENDIAN };
+  SLDataSource src = { &loc, &pcm };
+  SLDataLocator_OutputMix mixloc = { SL_DATALOCATOR_OUTPUTMIX, output_mix_object };
+  SLDataSink sink = { &mixloc, NULL };
+  const SLInterfaceID ids[] = { SL_IID_ANDROIDSIMPLEBUFFERQUEUE };
+  const SLboolean req[] = { SL_BOOLEAN_TRUE };
+  if ((*engine)->CreateAudioPlayer(engine, &ds_obj, &src, &sink, 1, ids, req) != SL_RESULT_SUCCESS) goto bad;
+  if ((*ds_obj)->Realize(ds_obj, SL_BOOLEAN_FALSE) != SL_RESULT_SUCCESS) goto bad;
+  if ((*ds_obj)->GetInterface(ds_obj, SL_IID_PLAY, &ds_play) != SL_RESULT_SUCCESS) goto bad;
+  if ((*ds_obj)->GetInterface(ds_obj, SL_IID_ANDROIDSIMPLEBUFFERQUEUE, &ds_queue) != SL_RESULT_SUCCESS) goto bad;
+  if ((*ds_queue)->RegisterCallback(ds_queue, ds_queue_cb, NULL) != SL_RESULT_SUCCESS) goto bad;
+  if ((*ds_play)->SetPlayState(ds_play, SL_PLAYSTATE_PLAYING) != SL_RESULT_SUCCESS) goto bad;
+  memset(ds_out, 0, sizeof ds_out);
+  (*ds_queue)->Enqueue(ds_queue, ds_out[0], sizeof ds_out[0]);
+  (*ds_queue)->Enqueue(ds_queue, ds_out[1], sizeof ds_out[1]);
+  ds_flip = 0;
+  fprintf(stderr, "[audio] DirectSound output %d Hz %d ch 16-bit (OpenSLES)\n", ds_freq, ds_ch);
+  return 0;
+bad:
+  if (ds_obj) { (*ds_obj)->Destroy(ds_obj); ds_obj = NULL; }
+  ds_play = NULL; ds_queue = NULL;
+  fprintf(stderr, "[audio] OpenSLES refused a %d Hz %d ch player: DirectSound stays silent\n", ds_freq, ds_ch);
+  return -1;
+}
+void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int channels, int bits, int looping) {
+  if (!key || !data || size < 4 || bits != 16) return NULL;
+  pthread_mutex_lock(&ds_mu);
+  if (ds_open((int)freq, channels) != 0) { pthread_mutex_unlock(&ds_mu); return NULL; }
+  if ((int)freq != ds_freq || (channels == 1 ? 1 : 2) != ds_ch) {
+    if (!ds_warned++) fprintf(stderr, "[audio] DirectSound buffer at %u Hz %d ch is not mixed (output is %d Hz %d ch)\n", freq, channels, ds_freq, ds_ch);
+    pthread_mutex_unlock(&ds_mu); return NULL;
+  }
+  int slot = -1, spare = -1;
+  for (int i = 0; i < AOT_DS_SRC; i++) { if (ds_src[i].key == key) { slot = i; break; } if (spare < 0 && !ds_src[i].key) spare = i; }
+  if (slot < 0) slot = spare;
+  if (slot < 0) { pthread_mutex_unlock(&ds_mu); return NULL; }
+  ds_src[slot].key = key; ds_src[slot].data = data; ds_src[slot].size = size; ds_src[slot].pos = 0;
+  ds_src[slot].looping = looping; ds_src[slot].playing = 1;
+  pthread_mutex_unlock(&ds_mu);
+  return &ds_src[slot];
+}
+void aot_ds_stop(void *h) {
+  DsSrc *s = (DsSrc *)h; if (!s) return;
+  pthread_mutex_lock(&ds_mu); s->playing = 0; s->key = NULL; pthread_mutex_unlock(&ds_mu);
+}
+
 static int audio_engine_init(void) {
   if (engine) return 0;
   if (slCreateEngine(&engine_object, 0, NULL, 0, NULL, NULL) != SL_RESULT_SUCCESS)

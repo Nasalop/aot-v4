@@ -229,7 +229,17 @@ void aot_input_dimouse(int32_t *dx, int32_t *dy, uint8_t b[3]) {
 }
 /* ---- XInput ---- */
 static AotPad pad; static int pad_on; static uint32_t pad_packet;
-void aot_input_pad(const AotPad *p) { if (!p) { pad_on = 0; return; } if (!pad_on || memcmp(&pad, p, sizeof pad)) pad_packet++; pad = *p; pad_on = 1; }
+void aot_input_pad(const AotPad *p) {
+  if (!p) { pad_on = 0; return; }
+  if (!pad_on || memcmp(&pad, p, sizeof pad)) pad_packet++;
+  pad = *p; pad_on = 1;
+  /* Right stick = look. The guest reads the pointer as a look offset, so feed it the same kind of delta the
+     touch drag path feeds, scaled from the 32767 range; ~5 px per event at full deflection, nothing inside
+     the dead zone. Buttons stay on the pad, so looking around never presses anything. */
+  { int dx = p->rx / 6000, dy = p->ry / 6000;
+    if (dx || dy) { mx += dx; my += dy;
+      uint64_t lp = (uint64_t)(uint16_t)mx | ((uint64_t)(uint16_t)my << 16); post(HWND_BASE, WM_MOUSEMOVE, 0, lp); } }
+}
 SYS(XInputGetState) {
   if ((uint32_t)A(0) != 0 || !pad_on) return 1167;
   uint64_t o = A(1); memset((void *)(uintptr_t)o, 0, 16); ST(uint32_t, o, pad_packet); ST(uint16_t, o + 4, pad.buttons); ST(uint8_t, o + 6, pad.lt); ST(uint8_t, o + 7, pad.rt);

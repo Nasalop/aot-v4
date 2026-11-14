@@ -100,7 +100,18 @@ S(waveOutGetDevCapsA) { return 6; }                                   /* MMSYSER
  * backend): that is announced once on stderr. 3D buffers / IKsPropertySet (EAX) are not offered: QueryInterface answers E_NOINTERFACE. */
 void aot_thunk_set_pop(uint64_t addr, int pop);
 typedef struct { uint32_t vt; int ref; } DSObj;
-typedef struct { uint32_t vt; int ref; uint8_t *data; uint32_t size, flags, pos, freq, align; int playing, looping; int32_t vol, pan; uint64_t t0; uint8_t wfx[18]; } DSBuf;
+typedef struct { uint32_t vt; int ref; uint8_t *data; uint32_t size, flags, pos, freq, align; int playing, looping; int32_t vol, pan; uint64_t t0; uint8_t wfx[18]; void *out; } DSBuf;
+/* The audio backend that turns a playing DS buffer into sound (win_audio.c mixes the guest buffers and feeds OpenSLES).
+   Desktop builds have no audio device, so they link against the no-ops below. */
+#if defined(__ANDROID__)
+void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int channels, int bits, int looping);
+void aot_ds_stop(void *handle);
+#else
+static void *aot_ds_play(void *k, const void *d, uint32_t n, uint32_t f, int ch, int b, int l) { (void)k; (void)d; (void)n; (void)f; (void)ch; (void)b; (void)l; return NULL; }
+static void aot_ds_stop(void *h) { (void)h; }
+#endif
+#define DS_CH(b) (*(const uint16_t *)((b)->wfx + 2))
+#define DS_BITS(b) (*(const uint16_t *)((b)->wfx + 14))
 static uint32_t ds_vt_dev, ds_vt_buf, ds_vt_lis;
 static const uint8_t IID_DSL_[16] = {0x84,0xFA,0x9A,0x27,0x81,0x49,0xCE,0x11,0xA5,0x21,0x00,0x20,0xAF,0x0B,0xE5,0x60};
 static const uint8_t IID_IUnknown_[16] = {0,0,0,0,0,0,0,0,0xC0,0,0,0,0,0,0,0x46}, IID_DS_[16] = {0x83,0xFA,0x9A,0x27,0x81,0x49,0xCE,0x11,0xA5,0x21,0x00,0x20,0xAF,0x0B,0xE5,0x60},
@@ -161,7 +172,7 @@ DSB(QueryInterface) {
     DSObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E; l->vt = ds_vt_lis; l->ref = 1; *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; return 0; }
   return ds_qi((uint32_t)A(0), P(1), P(2), 0);
 }
-DSB(Release) { DSBuf *b = THIS_B; int r = __atomic_sub_fetch(&b->ref, 1, __ATOMIC_RELAXED); if (!r) { aot_gfree(b->data); aot_gfree(b); } return (uint32_t)r; }
+DSB(Release) { DSBuf *b = THIS_B; int r = __atomic_sub_fetch(&b->ref, 1, __ATOMIC_RELAXED); if (!r) { if (b->out) aot_ds_stop(b->out); aot_gfree(b->data); aot_gfree(b); } return (uint32_t)r; }
 DSB(GetCaps) { uint32_t *p = P(1); if (!p || p[0] < 20) return DS_E_PARAM; DSBuf *b = THIS_B; p[1] = b->flags; p[2] = b->size; p[3] = 0; p[4] = 0; return 0; }
 DSB(GetCurrentPosition) { DSBuf *b = THIS_B; uint32_t pl = ds_cursor(b), *pp = P(1), *pw = P(2); if (pp) *pp = pl; if (pw) *pw = (pl + b->freq * b->align / 50) % b->size / b->align * b->align; return 0; }   /* write cursor ~20 ms ahead */
 DSB(GetFormat) { DSBuf *b = THIS_B; uint8_t *f = P(1); uint32_t n = (uint32_t)A(2), *w = P(3); if (f) memcpy(f, b->wfx, n < 18 ? n : 18); if (w) *w = 18; return 0; }
@@ -178,15 +189,22 @@ DSB(Lock) {
   if (p2) *p2 = n > first ? (uint32_t)(uintptr_t)b->data : 0; if (b2) *b2 = n - first; return 0;
 }
 DSB(Play) {
-  DSBuf *b = THIS_B; static int note; note_once(&note, "DirectSound: audio is mixed/timed in software but NOT output (no Android audio backend yet)");
-  ds_cursor(b); b->looping = (A(3) & 1) != 0; if (!b->playing) { b->playing = 1; b->t0 = ds_now(); } return 0;
+  DSBuf *b = THIS_B;
+  ds_cursor(b); b->looping = (A(3) & 1) != 0; if (!b->playing) { b->playing = 1; b->t0 = ds_now(); }
+  /* Hand the buffer to the audio backend, so Play is audible and not only a timed cursor. */
+  if (b->out) { aot_ds_stop(b->out); b->out = NULL; }
+  b->out = aot_ds_play(b, b->data, b->size, b->freq, DS_CH(b), DS_BITS(b), b->looping);
+  return 0;
 }
-DSB(SetCurrentPosition) { DSBuf *b = THIS_B; uint32_t p = (uint32_t)A(1); if (p >= b->size) return DS_E_PARAM; b->pos = p; b->t0 = ds_now(); return 0; }
+DSB(SetCurrentPosition) { DSBuf *b = THIS_B; uint32_t p = (uint32_t)A(1); if (p >= b->size) return DS_E_PARAM; b->pos = p; b->t0 = ds_now();
+  if (b->out) { /* the backend reads from the top of the buffer, so re-seat it where the guest is now writing */
+    aot_ds_stop(b->out); b->out = aot_ds_play(b, b->data, b->size, b->freq, DS_CH(b), DS_BITS(b), b->looping); }
+  return 0; }
 DSB(SetFormat) { DSBuf *b = THIS_B; const uint8_t *f = P(1); if (!f) return DS_E_PARAM; memcpy(b->wfx, f, 16); b->freq = *(uint32_t *)(b->wfx + 4); b->align = *(uint16_t *)(b->wfx + 12); if (!b->freq) b->freq = 44100; if (!b->align) b->align = 4; return 0; }
 DSB(SetVolume) { THIS_B->vol = (int32_t)A(1); return 0; }
 DSB(SetPan) { THIS_B->pan = (int32_t)A(1); return 0; }
 DSB(SetFrequency) { DSBuf *b = THIS_B; uint32_t f = (uint32_t)A(1); b->pos = ds_cursor(b); b->t0 = ds_now(); b->freq = f ? f : *(uint32_t *)(b->wfx + 4); return 0; }
-DSB(Stop) { DSBuf *b = THIS_B; b->pos = ds_cursor(b); b->playing = 0; return 0; }
+DSB(Stop) { DSBuf *b = THIS_B; b->pos = ds_cursor(b); b->playing = 0; if (b->out) { aot_ds_stop(b->out); b->out = NULL; } return 0; }
 DSB(Ok) { return 0; }
 DSB(Unsupported) { return DS_E_UNSUPPORTED; }
 typedef struct { int idx; const char *name; uint64_t (*fn)(CPU *); int argc; } DSSlot;
