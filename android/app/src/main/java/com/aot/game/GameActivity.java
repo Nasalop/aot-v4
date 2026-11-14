@@ -75,6 +75,7 @@ public final class GameActivity extends NativeActivity {
     private static native void nativeKey0(int vk, int down);
     private static native void nativeMouse0(int kind, float x, float y);
     private static native void nativeView0(int w, int h);
+    private static native long nativeFrames0();
     private static boolean nativesOk = true;
     private static void nativeKey(int vk, int down) { if (nativesOk) try { nativeKey0(vk, down); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
     private static void nativeMouse(int kind, float x, float y) { if (nativesOk) try { nativeMouse0(kind, x, y); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
@@ -141,6 +142,28 @@ public final class GameActivity extends NativeActivity {
             Btn(String l, int m, float x, float y, float w, float h) { label = l; mk = m; vk = 0; cx = x; cy = y; hw = w; hh = h; sticky = false; }
         }
         private final java.util.ArrayList<Btn> game = new java.util.ArrayList<>(), kb = new java.util.ArrayList<>();
+        /* Debug-build performance readout: FPS (frames presented by the game), process CPU (% of one core) and GPU busy (kgsl, when the OS lets an app read it). */
+        private final boolean dbg; private long sNs, sFrames = -1, sCpu; private String stats = "";
+        private final Runnable statsTick = new Runnable() { @Override public void run() { updateStats(); invalidate(); postDelayed(this, 500); } };
+        private static long readCpuTicks() {
+            try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader("/proc/self/stat"))) {
+                String l = br.readLine(); String[] f = l.substring(l.lastIndexOf(')') + 2).split(" "); return Long.parseLong(f[11]) + Long.parseLong(f[12]);
+            } catch (Throwable t) { return -1; } }
+        private static int readGpu() {
+            String[] paths = { "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage", "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load" };
+            for (String p : paths) try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(p))) {
+                String l = br.readLine(); if (l != null) { l = l.replaceAll("[^0-9]", ""); if (!l.isEmpty()) return Integer.parseInt(l); }
+            } catch (Throwable t) { }
+            return -1; }
+        private void updateStats() {
+            long now = System.nanoTime(), fr = -1, cpu = readCpuTicks(); try { fr = nativeFrames0(); } catch (Throwable t) { }
+            if (sNs != 0 && now > sNs && sFrames >= 0 && fr >= 0) {
+                double dt = (now - sNs) / 1e9, fps = (fr - sFrames) / dt, cp = cpu >= 0 && sCpu >= 0 ? (cpu - sCpu) * 10.0 / (dt * 1000.0) * 100.0 : -1; int g = readGpu();
+                stats = String.format(java.util.Locale.ROOT, "FPS %.0f (%.1f ms)   CPU %s   GPU %s", fps, fps > 0 ? 1000.0 / fps : 0.0, cp >= 0 ? String.format(java.util.Locale.ROOT, "%.0f%%", cp) : "n/a", g >= 0 ? g + "%" : "n/a");
+            }
+            sNs = now; sFrames = fr; sCpu = cpu; }
+        @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); if (dbg) post(statsTick); }
+        @Override protected void onDetachedFromWindow() { removeCallbacks(statsTick); super.onDetachedFromWindow(); }
         private final Btn kbToggle = new Btn("KB", -1, 0.93f, 0.08f, 0.05f, 0.07f, true);
         private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         private int stickPtr = -1, mousePtr = -1, rightPtr = -1; private float sx, sy, kx, ky; private final boolean[] dir = new boolean[4];   // W A S D
@@ -148,6 +171,7 @@ public final class GameActivity extends NativeActivity {
 
         ControlsView(Context c) {
             super(c);
+            dbg = (c.getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
             Object[][] g = { {"SPACE\njump/act", 0x20, 0.93f, 0.80f}, {"E\naction", 0x45, 0.85f, 0.64f}, {"SHIFT\nhigh prof.", 0x10, 0.76f, 0.84f}, {"CTRL\nlow prof.", 0x11, 0.68f, 0.66f},
                 {"ENTER", 0x0D, 0.93f, 0.55f}, {"Q", 0x51, 0.58f, 0.84f}, {"TAB\nmap", 0x09, 0.50f, 0.68f}, {"ESC\nmenu", 0x1B, 0.06f, 0.08f}, {"F", 0x46, 0.85f, 0.43f}, {"R", 0x52, 0.76f, 0.50f} };
             for (Object[] o : g) game.add(new Btn((String) o[0], (Integer) o[1], (Float) o[2], (Float) o[3], 0.045f, 0.075f, false));
@@ -211,6 +235,9 @@ public final class GameActivity extends NativeActivity {
         @Override protected void onDraw(Canvas c) {
             try {
                 float r = radius(), w = getWidth(), h = getHeight();
+                if (dbg && !stats.isEmpty()) { p.setStyle(Paint.Style.FILL); p.setTextAlign(Paint.Align.CENTER); p.setTextSize(h * 0.034f);
+                    float tw = p.measureText(stats); p.setColor(0x99000000); c.drawRect(w * 0.5f - tw / 2 - 12, h * 0.012f, w * 0.5f + tw / 2 + 12, h * 0.012f + h * 0.05f, p);
+                    p.setColor(0xFF7CFC00); c.drawText(stats, w * 0.5f, h * 0.012f + h * 0.038f, p); }
                 for (Btn b : active()) drawBtn(c, b, w, h, b.ptr >= 0 || b.on);
                 drawBtn(c, kbToggle, w, h, kbToggle.on);
                 if (!kbToggle.on) {
