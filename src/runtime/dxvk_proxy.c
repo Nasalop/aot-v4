@@ -23,7 +23,7 @@ static void *g_hdev; static int g_flush_slot = -1;
 #define E_NOTIMPL_ 0x80004001u
 #define E_NOINTF_ 0x80004002u
 #define MAGIC 0x50583130u
-typedef struct { void *g, *h; size_t sz; uint32_t sub, type; void *spare; size_t spcap, gcap; } Shadow;   /* spare: a retained low-memory block reused by the next Map (no allocator round trip per Map/Unmap) */
+typedef struct { void *g, *h; size_t sz; uint32_t sub, type; void *spare; size_t spcap, gcap; int sv; } Shadow;   /* sv: the shadow still mirrors the host for its subresource */   /* spare: a retained low-memory block reused by the next Map (no allocator round trip per Map/Unmap) */
 /* The guest-visible object is only {vtable, magic, id}; everything the host side relies on (host pointer, interface, map shadows) lives in host memory,
    so guest code that scribbles on a COM object (intrusive refcounts at +4/+8, ...) cannot corrupt it. */
 typedef struct { void **vt; uint32_t magic, id; } GO;
@@ -98,6 +98,17 @@ static void conv_scd_in(const uint8_t *g, uint8_t *h) { memset(h, 0, 72); memcpy
 static void conv_wstr(uint8_t *g, const uint8_t *h, int n) { for (int i = 0; i < n; i++) ST(uint16_t, g + 2 * i, LD(uint32_t, h + 4 * i)); }
 static uint32_t sat(uint64_t v) { return v > 0x7fffffffu ? 0x7fffffffu : (uint32_t)v; }
 typedef struct { uint8_t kind; uint8_t ti; uint32_t g; void *tmp; uint32_t n, sub, type; } Post;
+/* Shadow-copy traffic, so the cost of Map/Unmap is a number instead of a guess. */
+static uint64_t m_up, m_down; static uint32_t m_n; static int m_logged;
+static uint64_t px_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u; }
+static void m_report(void) {
+  static uint64_t t0; uint64_t t = px_ms();
+  if (!t0) { t0 = t; return; }
+  if (t - t0 < 1000) return;
+  fprintf(stderr, "[dxvk] maps/s=%u  up=%.1f MB/s  down=%.1f MB/s\n", (unsigned)(m_n * 1000u / (uint32_t)(t - t0)),
+          (double)m_up / 1048576.0 * 1000.0 / (double)(t - t0), (double)m_down / 1048576.0 * 1000.0 / (double)(t - t0));
+  t0 = t; m_n = 0; m_up = m_down = 0;
+}
 static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   static int ntr; PX *o = px_of(A(0));
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
@@ -106,10 +117,16 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   if (first || ntr < 20) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
   if (!o) { const uint32_t *w = (const uint32_t *)(uintptr_t)A(0); fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x [%#x %#x %#x %#x]\n", pi->name, m->name, (unsigned)A(0), w?w[0]:0, w?w[1]:0, w?w[2]:0, w?w[3]:0); return E_NOTIMPL_; }
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
+  /* Anything other than Map/Unmap may make the host contents of this resource differ from the shadow
+     (copies into it, UpdateSubresource, GPU use), so the shadow stops being a usable mirror. */
+  if (!(m->name[0] == 'M' && !strcmp(m->name, "Map")) && !(m->name[0] == 'U' && !strcmp(m->name, "Unmap")))
+    for (int i = 0; i < 4; i++) o->sh[i].sv = 0;
 #define ALLOC(sz) ({ size_t _s = ((sz) + 15) & ~15u; if (ap + _s > sizeof ar) { fprintf(stderr, "[dxvk] %s::%s: argument too large for marshalling arena\n", pi->name, m->name); return E_NOTIMPL_; } void *_p = ar + ap; ap += _s; memset(_p, 0, _s); _p; })
   if (m->name[0] == 'U' && !strcmp(m->name, "Unmap")) {   /* flush a low-memory shadow back into the host mapping */
     uint32_t sub = m->n ? A(1) : 0;
-    for (int i = 0; i < 4; i++) if (o->sh[i].g && o->sh[i].sub == sub) { Shadow *s = &o->sh[i]; if (s->type != 1) memcpy(s->h, s->g, s->sz); if (!s->spare && s->gcap <= (256u << 10)) { s->spare = s->g; s->spcap = s->gcap; } else aot_gfree(s->g); s->g = NULL; break; }
+    for (int i = 0; i < 4; i++) if (o->sh[i].g && o->sh[i].sub == sub) { Shadow *s = &o->sh[i];
+      if (s->type != 1) { memcpy(s->h, s->g, s->sz); m_down += s->sz; }   /* READ maps wrote nothing back */
+      if (!s->spare && s->gcap <= (256u << 10)) { s->spare = s->g; s->spcap = s->gcap; } else aot_gfree(s->g); s->g = NULL; m_n++; m_report(); break; }
   }
   if (m->name[0] == 'C' && !strcmp(m->name, "CreateBuffer") && A(1) && LD(uint32_t, A(1)) == 0) {
     /* The game asks for a zero-size buffer (a shader without constant buffers); native D3D10 drivers tolerated this, DXVK rejects it. Give it the smallest valid buffer instead of a NULL the game does not check. */
@@ -181,8 +198,17 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
       int si = -1; for (int i = 0; i < 4; i++) if (!o->sh[i].g) { si = i; break; }
       if (si < 0) { fprintf(stderr, "[dxvk] too many concurrent maps on one resource\n"); break; }
       Shadow *sp_ = &o->sh[si]; void *g = NULL; size_t gcap = sz; if (sp_->spare && sp_->spcap >= sz) { g = sp_->spare; gcap = sp_->spcap; sp_->spare = NULL; sp_->spcap = 0; } else { if (sp_->spare) { aot_gfree(sp_->spare); sp_->spare = NULL; sp_->spcap = 0; } g = aot_gmalloc(sz); } if (!g) { fprintf(stderr, "[dxvk] Map: out of low memory for %zu bytes\n", sz); break; }
-      if (q->type != 4) memcpy(g, hp, sz); else memset(g, 0, sz);
-      sp_->g = g; sp_->h = hp; sp_->sz = sz; sp_->sub = q->sub; sp_->type = q->type; sp_->gcap = gcap;
+      /* What has to be copied in is decided by the map mode, so only the modes that need it pay:
+           DISCARD (4)  - the contents are undefined, the app writes what it uses: no copy, no zeroing
+                          (zeroing the whole subresource per map was pure traffic for nothing);
+           NO_OVERWRITE (5) - the app cannot read the old contents, and the shadow still mirrors the host
+                          unless something else touched the resource in between (sv);
+           READ/WRITE/READ_WRITE - the app may read, so the current contents must be there. */
+      if (q->type == 4) { }
+      else if (q->type == 5 && sp_->sv && sp_->sub == q->sub) { }
+      else { memcpy(g, hp, sz); m_up += sz; }
+      if (!m_logged) { m_logged = 1; fprintf(stderr, "[dxvk] Map: DISCARD maps are not zero-filled; NO_OVERWRITE maps skip the up-copy while the shadow is current\n"); }
+      sp_->g = g; sp_->h = hp; sp_->sz = sz; sp_->sub = q->sub; sp_->type = q->type; sp_->gcap = gcap; sp_->sv = 1;
       uint32_t *gs = (uint32_t *)(uintptr_t)q->g; if (q->kind == 'M') gs[0] = (uint32_t)(uintptr_t)g; else { gs[0] = (uint32_t)(uintptr_t)g; gs[1] = LD(uint32_t, h + 8); if (q->kind == 'U') gs[2] = LD(uint32_t, h + 12); }
       break; }
     }
