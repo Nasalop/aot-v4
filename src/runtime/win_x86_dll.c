@@ -100,15 +100,25 @@ S(waveOutGetDevCapsA) { return 6; }                                   /* MMSYSER
  * backend): that is announced once on stderr. 3D buffers / IKsPropertySet (EAX) are not offered: QueryInterface answers E_NOINTERFACE. */
 void aot_thunk_set_pop(uint64_t addr, int pop);
 typedef struct { uint32_t vt; int ref; } DSObj;
-typedef struct { uint32_t vt; int ref; uint8_t *data; uint32_t size, flags, pos, freq, align; int playing, looping; int32_t vol, pan; uint64_t t0; uint8_t wfx[18]; void *out; } DSBuf;
+typedef struct { uint32_t vt; int ref; uint8_t *data; uint32_t size, flags, pos, freq, align; int playing, looping; int32_t vol, pan; uint64_t t0; uint8_t wfx[18]; float p3x, p3y, p3z, min3, max3; int is3d; void *out; } DSBuf;
 /* The audio backend that turns a playing DS buffer into sound (win_audio.c mixes the guest buffers and feeds OpenSLES).
    Desktop builds have no audio device, so they link against the no-ops below. */
 #if defined(__ANDROID__)
 void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int channels, int bits, int looping);
-void aot_ds_stop(void *handle);
+void aot_ds_stop(void *key);
+void aot_ds_halt(void *key);
+void aot_ds_seek(void *key, uint32_t pos);
+void aot_ds_setvol(void *key, int32_t cb, int32_t pan);
+void aot_ds_3d(void *key, float x, float y, float z, float min_d, float max_d);
+void aot_ds_listener(float px, float py, float pz, float fx, float fy, float fz, float tx, float ty, float tz, float rolloff);
 #else
 static void *aot_ds_play(void *k, const void *d, uint32_t n, uint32_t f, int ch, int b, int l) { (void)k; (void)d; (void)n; (void)f; (void)ch; (void)b; (void)l; return NULL; }
-static void aot_ds_stop(void *h) { (void)h; }
+static void aot_ds_stop(void *k) { (void)k; }
+static void aot_ds_halt(void *k) { (void)k; }
+static void aot_ds_seek(void *k, uint32_t p) { (void)k; (void)p; }
+static void aot_ds_setvol(void *k, int32_t c, int32_t p) { (void)k; (void)c; (void)p; }
+static void aot_ds_3d(void *k, float x, float y, float z, float a, float b) { (void)k; (void)x; (void)y; (void)z; (void)a; (void)b; }
+static void aot_ds_listener(float a, float b, float c, float d, float e, float f, float g, float h, float i, float j) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; (void)i; (void)j; }
 #endif
 #define DS_CH(b) (*(const uint16_t *)((b)->wfx + 2))
 #define DS_BITS(b) (*(const uint16_t *)((b)->wfx + 14))
@@ -161,18 +171,69 @@ DSD(DuplicateSoundBuffer) { DSBuf *s = (DSBuf *)P(1); uint32_t *out = P(2); if (
 DSD(Ok) { return 0; }
 DSD(GetSpeakerConfig) { uint32_t *o = P(1); if (!o) return DS_E_PARAM; *o = 3; return 0; }   /* DSSPEAKER_STEREO */
 DSD(Unsupported) { return DS_E_UNSUPPORTED; }
+typedef struct { DSObj o; DSBuf *b; float px, py, pz, min_d, max_d; uint32_t mode; } DS3DObj;
+typedef struct { DSObj o; float px, py, pz, fx, fy, fz, tx, ty, tz, rolloff; } DSLisObj;
+#define THIS_3D ((DS3DObj *)(uintptr_t)(uint32_t)A(0))
+#define THIS_LIS ((DSLisObj *)(uintptr_t)(uint32_t)A(0))
+static float ds_af(uint32_t v) { float f; memcpy(&f, &v, 4); return f; }
+#define AF(n) ds_af((uint32_t)A(n))
+/* The 3D objects carry real state now: the mixer attenuates each voice by its distance from the listener
+   and pans it by its offset along the listener's right axis, so a car behind you is heard behind you. */
+static void ds3d_push(DS3DObj *o) {
+  DSBuf *b = o->b; if (!b) return;
+  b->p3x = o->px; b->p3y = o->py; b->p3z = o->pz;
+  b->min3 = o->min_d > 0.01f ? o->min_d : 1.0f; b->max3 = o->max_d > 1.0f ? o->max_d : 1e9f; b->is3d = 1;
+  if (b->out) aot_ds_3d(b, b->p3x, b->p3y, b->p3z, b->min3, b->max3);
+}
+static void lis_push(DSLisObj *o) {
+  aot_ds_listener(o->px, o->py, o->pz, o->fx, o->fy, o->fz, o->tx, o->ty, o->tz, o->rolloff > 0.01f ? o->rolloff : 0.01f);
+}
+DSD(DbSetAll) { DS3DObj *o = THIS_3D; const uint8_t *p = P(1); if (!p) return DS_E_PARAM;
+  o->px = *(const float *)p; o->py = *(const float *)(p + 4); o->pz = *(const float *)(p + 8);
+  o->min_d = *(const float *)(p + 48); o->max_d = *(const float *)(p + 52); o->mode = *(const uint32_t *)(p + 56);
+  ds3d_push(o); return 0; }
+DSD(DbGetAll) { DS3DObj *o = THIS_3D; uint8_t *p = P(1); if (!p) return DS_E_PARAM; memset(p, 0, 60);
+  *(float *)p = o->px; *(float *)(p + 4) = o->py; *(float *)(p + 8) = o->pz;
+  *(float *)(p + 48) = o->min_d; *(float *)(p + 52) = o->max_d; *(uint32_t *)(p + 56) = o->mode; return 0; }
+DSD(DbSetPos) { DS3DObj *o = THIS_3D; o->px = AF(1); o->py = AF(2); o->pz = AF(3); ds3d_push(o); return 0; }
+DSD(DbGetPos) { DS3DObj *o = THIS_3D; float *f = P(1); if (f) { f[0] = o->px; f[1] = o->py; f[2] = o->pz; } return 0; }
+DSD(DbSetMin) { DS3DObj *o = THIS_3D; o->min_d = AF(1); ds3d_push(o); return 0; }
+DSD(DbSetMax) { DS3DObj *o = THIS_3D; o->max_d = AF(1); ds3d_push(o); return 0; }
+DSD(DbGetMin) { DS3DObj *o = THIS_3D; float *f = P(1); if (f) *f = o->min_d; return 0; }
+DSD(DbGetMax) { DS3DObj *o = THIS_3D; float *f = P(1); if (f) *f = o->max_d; return 0; }
+DSD(DbSetMode) { DS3DObj *o = THIS_3D; o->mode = (uint32_t)A(1); return 0; }
+DSD(DbGetMode) { DS3DObj *o = THIS_3D; uint32_t *p = P(1); if (p) *p = o->mode; return 0; }
+DSD(LisSetAll) { DSLisObj *o = THIS_LIS; const uint8_t *p = P(1); if (!p) return DS_E_PARAM;
+  o->px = *(const float *)p; o->py = *(const float *)(p + 4); o->pz = *(const float *)(p + 8);
+  o->fx = *(const float *)(p + 24); o->fy = *(const float *)(p + 28); o->fz = *(const float *)(p + 32);
+  o->tx = *(const float *)(p + 36); o->ty = *(const float *)(p + 40); o->tz = *(const float *)(p + 44);
+  o->rolloff = *(const float *)(p + 52); lis_push(o); return 0; }
+DSD(LisGetAll) { DSLisObj *o = THIS_LIS; uint8_t *p = P(1); if (!p) return DS_E_PARAM; memset(p, 0, 60);
+  *(float *)p = o->px; *(float *)(p + 4) = o->py; *(float *)(p + 8) = o->pz;
+  *(float *)(p + 24) = o->fx; *(float *)(p + 28) = o->fy; *(float *)(p + 32) = o->fz;
+  *(float *)(p + 36) = o->tx; *(float *)(p + 40) = o->ty; *(float *)(p + 44) = o->tz;
+  *(float *)(p + 48) = 1.0f; *(float *)(p + 52) = o->rolloff; *(float *)(p + 56) = 1.0f; return 0; }
+DSD(LisSetPos) { DSLisObj *o = THIS_LIS; o->px = AF(1); o->py = AF(2); o->pz = AF(3); lis_push(o); return 0; }
+DSD(LisSetOrient) { DSLisObj *o = THIS_LIS; o->fx = AF(1); o->fy = AF(2); o->fz = AF(3); o->tx = AF(4); o->ty = AF(5); o->tz = AF(6); lis_push(o); return 0; }
+DSD(LisSetRolloff) { DSLisObj *o = THIS_LIS; o->rolloff = AF(1); lis_push(o); return 0; }
+DSD(LisGetPos) { DSLisObj *o = THIS_LIS; float *f = P(1); if (f) { f[0] = o->px; f[1] = o->py; f[2] = o->pz; } return 0; }
+DSD(LisGetOrient) { DSLisObj *o = THIS_LIS; float *f = P(1), *g = P(2); if (f) { f[0] = o->fx; f[1] = o->fy; f[2] = o->fz; } if (g) { g[0] = o->tx; g[1] = o->ty; g[2] = o->tz; } return 0; }
+DSD(LisCommit) { lis_push(THIS_LIS); return 0; }
 DSD(DbQI) { return ds_qi((uint32_t)A(0), P(1), P(2), 3); }
 DSD(LisQI) { return ds_qi((uint32_t)A(0), P(1), P(2), 2); }
 DSB(QueryInterface) {
-  if (P(1) && P(2) && !memcmp(P(1), IID_DS3DB_, 16)) {   /* 3D buffer: positioning parameters are accepted but spatialization is not applied */
-    static int n3; note_once(&n3, "DirectSound: 3D buffer accepts settings but 3D positioning is not applied");
-    DSObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E; l->vt = ds_vt_3db; l->ref = 1; *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; return 0; }
-  if (P(1) && P(2) && !memcmp(P(1), IID_DSL_, 16)) {   /* 3D listener: parameters are accepted but spatialization is not applied */
-    static int n; note_once(&n, "DirectSound: 3D listener accepts settings but 3D positioning is not applied");
-    DSObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E; l->vt = ds_vt_lis; l->ref = 1; *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; return 0; }
+  if (P(1) && P(2) && !memcmp(P(1), IID_DS3DB_, 16)) {   /* 3D buffer: real position state, used by the mixer */
+    DS3DObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E;
+    l->o.vt = ds_vt_3db; l->o.ref = 1; l->b = THIS_B; l->min_d = 1.0f; l->max_d = 1e9f;
+    THIS_B->is3d = 1; THIS_B->min3 = 1.0f; THIS_B->max3 = 1e9f; aot_ds_3d(THIS_B, 0, 0, 0, 1.0f, 1e9f);
+    *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; return 0; }
+  if (P(1) && P(2) && !memcmp(P(1), IID_DSL_, 16)) {   /* 3D listener: where the camera is and which way it faces */
+    DSLisObj *l = aot_gcalloc(1, sizeof *l); if (!l) return 0x8007000E;
+    l->o.vt = ds_vt_lis; l->o.ref = 1; l->ty = 1.0f; l->fz = 1.0f; l->rolloff = 1.0f;
+    *(uint32_t *)P(2) = (uint32_t)(uintptr_t)l; lis_push(l); return 0; }
   return ds_qi((uint32_t)A(0), P(1), P(2), 0);
 }
-DSB(Release) { DSBuf *b = THIS_B; int r = __atomic_sub_fetch(&b->ref, 1, __ATOMIC_RELAXED); if (!r) { if (b->out) aot_ds_stop(b->out); aot_gfree(b->data); aot_gfree(b); } return (uint32_t)r; }
+DSB(Release) { DSBuf *b = THIS_B; int r = __atomic_sub_fetch(&b->ref, 1, __ATOMIC_RELAXED); if (!r) { aot_ds_stop(b); aot_gfree(b->data); aot_gfree(b); } return (uint32_t)r; }
 DSB(GetCaps) { uint32_t *p = P(1); if (!p || p[0] < 20) return DS_E_PARAM; DSBuf *b = THIS_B; p[1] = b->flags; p[2] = b->size; p[3] = 0; p[4] = 0; return 0; }
 DSB(GetCurrentPosition) { DSBuf *b = THIS_B; uint32_t pl = ds_cursor(b), *pp = P(1), *pw = P(2); if (pp) *pp = pl; if (pw) *pw = (pl + b->freq * b->align / 50) % b->size / b->align * b->align; return 0; }   /* write cursor ~20 ms ahead */
 DSB(GetFormat) { DSBuf *b = THIS_B; uint8_t *f = P(1); uint32_t n = (uint32_t)A(2), *w = P(3); if (f) memcpy(f, b->wfx, n < 18 ? n : 18); if (w) *w = 18; return 0; }
@@ -191,20 +252,20 @@ DSB(Lock) {
 DSB(Play) {
   DSBuf *b = THIS_B;
   ds_cursor(b); b->looping = (A(3) & 1) != 0; if (!b->playing) { b->playing = 1; b->t0 = ds_now(); }
-  /* Hand the buffer to the audio backend, so Play is audible and not only a timed cursor. */
-  if (b->out) { aot_ds_stop(b->out); b->out = NULL; }
+  /* Hand the buffer to the audio backend. Calling Play again on a buffer that is already playing keeps its
+     position: restarting from the top on every call is a discontinuity the mixer would play as a click. */
   b->out = aot_ds_play(b, b->data, b->size, b->freq, DS_CH(b), DS_BITS(b), b->looping);
+  if (b->out) { aot_ds_setvol(b, b->vol, b->pan); if (b->is3d) aot_ds_3d(b, b->p3x, b->p3y, b->p3z, b->min3, b->max3); }
   return 0;
 }
 DSB(SetCurrentPosition) { DSBuf *b = THIS_B; uint32_t p = (uint32_t)A(1); if (p >= b->size) return DS_E_PARAM; b->pos = p; b->t0 = ds_now();
-  if (b->out) { /* the backend reads from the top of the buffer, so re-seat it where the guest is now writing */
-    aot_ds_stop(b->out); b->out = aot_ds_play(b, b->data, b->size, b->freq, DS_CH(b), DS_BITS(b), b->looping); }
+  if (b->out) aot_ds_seek(b, p);   /* seek the running source instead of restarting it from the top */
   return 0; }
 DSB(SetFormat) { DSBuf *b = THIS_B; const uint8_t *f = P(1); if (!f) return DS_E_PARAM; memcpy(b->wfx, f, 16); b->freq = *(uint32_t *)(b->wfx + 4); b->align = *(uint16_t *)(b->wfx + 12); if (!b->freq) b->freq = 44100; if (!b->align) b->align = 4; return 0; }
-DSB(SetVolume) { THIS_B->vol = (int32_t)A(1); return 0; }
-DSB(SetPan) { THIS_B->pan = (int32_t)A(1); return 0; }
+DSB(SetVolume) { DSBuf *b = THIS_B; b->vol = (int32_t)A(1); aot_ds_setvol(b, b->vol, b->pan); return 0; }
+DSB(SetPan) { DSBuf *b = THIS_B; b->pan = (int32_t)A(1); aot_ds_setvol(b, b->vol, b->pan); return 0; }
 DSB(SetFrequency) { DSBuf *b = THIS_B; uint32_t f = (uint32_t)A(1); b->pos = ds_cursor(b); b->t0 = ds_now(); b->freq = f ? f : *(uint32_t *)(b->wfx + 4); return 0; }
-DSB(Stop) { DSBuf *b = THIS_B; b->pos = ds_cursor(b); b->playing = 0; if (b->out) { aot_ds_stop(b->out); b->out = NULL; } return 0; }
+DSB(Stop) { DSBuf *b = THIS_B; b->pos = ds_cursor(b); b->playing = 0; if (b->out) { aot_ds_halt(b); b->out = NULL; } return 0; }
 DSB(Ok) { return 0; }
 DSB(Unsupported) { return DS_E_UNSUPPORTED; }
 typedef struct { int idx; const char *name; uint64_t (*fn)(CPU *); int argc; } DSSlot;
@@ -222,14 +283,14 @@ static void ds_init_tables(void) {
     {5,"GetFormat",dsb_GetFormat,4}, {6,"GetVolume",dsb_GetVolume,2}, {7,"GetPan",dsb_GetPan,2}, {8,"GetFrequency",dsb_GetFrequency,2}, {9,"GetStatus",dsb_GetStatus,2}, {10,"Initialize",dsb_Ok,3},
     {11,"Lock",dsb_Lock,8}, {12,"Play",dsb_Play,4}, {13,"SetCurrentPosition",dsb_SetCurrentPosition,2}, {14,"SetFormat",dsb_SetFormat,2}, {15,"SetVolume",dsb_SetVolume,2}, {16,"SetPan",dsb_SetPan,2},
     {17,"SetFrequency",dsb_SetFrequency,2}, {18,"Stop",dsb_Stop,1}, {19,"Unlock",dsb_Ok,5}, {20,"Restore",dsb_Ok,1}, {21,"SetFX",dsb_Unsupported,4}, {22,"AcquireResources",dsb_Unsupported,4}, {23,"GetObjectInPath",dsb_Unsupported,5}, {0,0,0,0} };
-  static const DSSlot lis[] = { {0,"QueryInterface",dsd_LisQI,3}, {1,"AddRef",dsd_AddRef,1}, {2,"Release",dsd_Release,1}, {3,"GetAllParameters",dsd_Unsupported,2}, {4,"GetDistanceFactor",dsd_Unsupported,2},
-    {5,"GetDopplerFactor",dsd_Unsupported,2}, {6,"GetOrientation",dsd_Unsupported,3}, {7,"GetPosition",dsd_Unsupported,2}, {8,"GetRolloffFactor",dsd_Unsupported,2}, {9,"GetVelocity",dsd_Unsupported,2},
-    {10,"SetAllParameters",dsd_Ok,3}, {11,"SetDistanceFactor",dsd_Ok,3}, {12,"SetDopplerFactor",dsd_Ok,3}, {13,"SetOrientation",dsd_Ok,8}, {14,"SetPosition",dsd_Ok,5}, {15,"SetRolloffFactor",dsd_Ok,3},
-    {16,"SetVelocity",dsd_Ok,5}, {17,"CommitDeferredSettings",dsd_Ok,1}, {0,0,0,0} };
-  static const DSSlot db3[] = { {0,"QueryInterface",dsd_DbQI,3}, {1,"AddRef",dsd_AddRef,1}, {2,"Release",dsd_Release,1}, {3,"GetAllParameters",dsd_Unsupported,2}, {4,"GetConeAngles",dsd_Unsupported,3},
-    {5,"GetConeOrientation",dsd_Unsupported,2}, {6,"GetConeOutsideVolume",dsd_Unsupported,2}, {7,"GetMaxDistance",dsd_Unsupported,2}, {8,"GetMinDistance",dsd_Unsupported,2}, {9,"GetMode",dsd_Unsupported,2},
-    {10,"GetPosition",dsd_Unsupported,2}, {11,"GetVelocity",dsd_Unsupported,2}, {12,"SetAllParameters",dsd_Ok,3}, {13,"SetConeAngles",dsd_Ok,4}, {14,"SetConeOrientation",dsd_Ok,5}, {15,"SetConeOutsideVolume",dsd_Ok,3},
-    {16,"SetMaxDistance",dsd_Ok,3}, {17,"SetMinDistance",dsd_Ok,3}, {18,"SetMode",dsd_Ok,3}, {19,"SetPosition",dsd_Ok,5}, {20,"SetVelocity",dsd_Ok,5}, {0,0,0,0} };
+  static const DSSlot lis[] = { {0,"QueryInterface",dsd_LisQI,3}, {1,"AddRef",dsd_AddRef,1}, {2,"Release",dsd_Release,1}, {3,"GetAllParameters",dsd_LisGetAll,2}, {4,"GetDistanceFactor",dsd_Unsupported,2},
+    {5,"GetDopplerFactor",dsd_Unsupported,2}, {6,"GetOrientation",dsd_LisGetOrient,3}, {7,"GetPosition",dsd_LisGetPos,2}, {8,"GetRolloffFactor",dsd_Unsupported,2}, {9,"GetVelocity",dsd_Unsupported,2},
+    {10,"SetAllParameters",dsd_LisSetAll,3}, {11,"SetDistanceFactor",dsd_Ok,3}, {12,"SetDopplerFactor",dsd_Ok,3}, {13,"SetOrientation",dsd_LisSetOrient,8}, {14,"SetPosition",dsd_LisSetPos,5}, {15,"SetRolloffFactor",dsd_LisSetRolloff,3},
+    {16,"SetVelocity",dsd_Ok,5}, {17,"CommitDeferredSettings",dsd_LisCommit,1}, {0,0,0,0} };
+  static const DSSlot db3[] = { {0,"QueryInterface",dsd_DbQI,3}, {1,"AddRef",dsd_AddRef,1}, {2,"Release",dsd_Release,1}, {3,"GetAllParameters",dsd_DbGetAll,2}, {4,"GetConeAngles",dsd_Unsupported,3},
+    {5,"GetConeOrientation",dsd_Unsupported,2}, {6,"GetConeOutsideVolume",dsd_Unsupported,2}, {7,"GetMaxDistance",dsd_DbGetMax,2}, {8,"GetMinDistance",dsd_DbGetMin,2}, {9,"GetMode",dsd_DbGetMode,2},
+    {10,"GetPosition",dsd_DbGetPos,2}, {11,"GetVelocity",dsd_Unsupported,2}, {12,"SetAllParameters",dsd_DbSetAll,3}, {13,"SetConeAngles",dsd_Ok,4}, {14,"SetConeOrientation",dsd_Ok,5}, {15,"SetConeOutsideVolume",dsd_Ok,3},
+    {16,"SetMaxDistance",dsd_DbSetMax,3}, {17,"SetMinDistance",dsd_DbSetMin,3}, {18,"SetMode",dsd_DbSetMode,3}, {19,"SetPosition",dsd_DbSetPos,5}, {20,"SetVelocity",dsd_Ok,5}, {0,0,0,0} };
   if (!ds_vt_dev) { ds_vt_3db = ds_build("IDirectSound3DBuffer", 21, db3); ds_vt_lis = ds_build("IDirectSound3DListener", 18, lis); ds_vt_dev = ds_build("IDirectSound8", 12, dev); ds_vt_buf = ds_build("IDirectSoundBuffer8", 24, buf); }
 }
 S(dsound_enum) {   /* DirectSoundEnumerateA(callback, ctx): one default device, as on a normal system */

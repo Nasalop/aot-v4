@@ -119,6 +119,9 @@ JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeKey0(JNIEnv *env, jc
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeMouse0(JNIEnv *env, jclass cls, jint kind, jfloat x, jfloat y) { (void)env; (void)cls; { static int n; if (n++ < 200) LOG("overlay mouse kind=%d at (%d,%d)", kind, (int)x, (int)y); } aot_input_mouse(kind, x, y); }
 /* A physical gamepad delivers its events to the Activity, not to this native input queue, so GameActivity
    forwards them here: the same AotPad the native path fills, so XInputGetState sees one device either way. */
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativePadPresent0(JNIEnv *env, jclass cls, jint on) {
+  (void)env; (void)cls; aot_input_pad_present(on != 0);
+}
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativePad0(JNIEnv *env, jclass cls, jint buttons, jint lt, jint rt, jint lx, jint ly, jint rx, jint ry) {
   (void)env; (void)cls;
   AotPad p; memset(&p, 0, sizeof p);

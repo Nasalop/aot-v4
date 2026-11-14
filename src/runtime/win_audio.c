@@ -74,46 +74,106 @@ static SLObjectItf output_mix_object;
    first buffer that plays; sources with any other format are left silent rather than resampled, and the
    first such mismatch is reported once. ---- */
 static int audio_engine_init(void);
-#define AOT_DS_SRC 16
+#define AOT_DS_SRC 24
 #define AOT_DS_FRAMES 1024
-typedef struct { void *key; const uint8_t *data; uint32_t size, pos; int looping, playing; } DsSrc;
+#define AOT_DS_QSZ 3
+#define AOT_DS_FADE 128
+/* Volume, pan and 3D distance are applied per source: a crowded street mixes dozens of voices and summing
+   them all at full scale clipped, which is what the constant crackle was. A voice also fades in and out
+   over ~3 ms, because starting or ending one on a non-zero sample clicks and the game does that constantly. */
+typedef struct {
+  void *key; const uint8_t *data; uint32_t size, pos; int looping, playing, ch;
+  int32_t fadev, fstep;              /* 0..256 gain ramp; fstep < 0 while fading out, 0 when steady */
+  float gain, pan;                   /* SetVolume (centibels) and SetPan (-1..1) */
+  float x, y, z, min_d, max_d; int is3d;
+} DsSrc;
 static DsSrc ds_src[AOT_DS_SRC];
 static pthread_mutex_t ds_mu = PTHREAD_MUTEX_INITIALIZER;
 static SLObjectItf ds_obj; static SLPlayItf ds_play; static SLAndroidSimpleBufferQueueItf ds_queue;
 static int ds_freq = 44100, ds_ch = 2, ds_warned;
 static int16_t ds_mix[AOT_DS_FRAMES * 2];
-static int16_t ds_out[2][AOT_DS_FRAMES * 2];
+static int16_t ds_out[AOT_DS_QSZ][AOT_DS_FRAMES * 2];
 static int ds_flip;
+/* Listener (IDirectSound3DListener): where the camera is and which way it faces; "right" is derived. */
+static float lis_px, lis_py, lis_pz, lis_fx, lis_fy, lis_fz = 1.0f, lis_tx, lis_ty = 1.0f, lis_tz, lis_rolloff = 1.0f;
 
-static void ds_feed(void) {   /* 16-bit stereo at ds_freq, saturating add of every playing source */
-  memset(ds_mix, 0, sizeof ds_mix);
-  int n = (int)(sizeof ds_mix / sizeof ds_mix[0]);
-  for (int i = 0; i < AOT_DS_SRC; i++) {
-    DsSrc *s = &ds_src[i];
-    if (!s->key || !s->playing || !s->data || s->size < 4) continue;
-    for (int k = 0; k < n; k++) {
-      uint32_t at = s->pos;
-      if (at + 2 > s->size) { if (!s->looping) { s->playing = 0; break; } s->pos = at = 0; }
-      int16_t v = (int16_t)(uint16_t)(s->data[at] | (s->data[at + 1] << 8));
-      int32_t m = (int32_t)ds_mix[k] + v;
-      ds_mix[k] = (int16_t)(m > 32767 ? 32767 : m < -32768 ? -32768 : m);
-      s->pos = at + 2; if (s->pos >= s->size) s->pos = s->looping ? 0 : s->size;
+static DsSrc *ds_find(void *key) {
+  for (int i = 0; i < AOT_DS_SRC; i++) if (ds_src[i].key == key) return &ds_src[i];
+  return NULL;
+}
+static float ds_lin(int32_t cb) {   /* DirectSound volume is centibels of attenuation: 0 = full, -10000 = off */
+  if (cb >= 0) return 1.0f;
+  if (cb <= -6000) return 0.0f;
+  float oct = (float)(-cb) * 0.001660964f;   /* -db / 6.0206 dB per octave */
+  int ip = (int)oct; float fp = oct - (float)ip, r = 1.0f;
+  for (int i = 0; i < ip && i < 32; i++) r *= 0.5f;
+  return r * (1.0f - 0.34657f * fp + 0.06178f * fp * fp - 0.00723f * fp * fp * fp);
+}
+static void ds_gains(DsSrc *s, int32_t *gl, int32_t *gr) {   /* 8.8 fixed point gain per channel */
+  float g = s->gain, pan = s->pan;
+  if (s->is3d) {
+    float dx = s->x - lis_px, dy = s->y - lis_py, dz = s->z - lis_pz;
+    float d = __builtin_sqrtf(dx * dx + dy * dy + dz * dz);
+    float md = s->min_d > 0.01f ? s->min_d : 1.0f;
+    float att = d <= md ? 1.0f : md / (md + lis_rolloff * (d - md));
+    if (att > 1.0f) att = 1.0f;
+    g *= att;
+    if (d > 0.0001f) {   /* lateral offset along the listener's right axis, scaled to -1..1 */
+      float rx = lis_ty * lis_fz - lis_tz * lis_fy, ry = lis_tz * lis_fx - lis_tx * lis_fz, rz = lis_tx * lis_fy - lis_ty * lis_fx;
+      float p = (dx * rx + dy * ry + dz * rz) / d * 1.6f;
+      if (p > 1.0f) p = 1.0f; if (p < -1.0f) p = -1.0f;
+      pan = p;
     }
   }
+  float l = g * (pan > 0 ? 1.0f - pan : 1.0f), r = g * (pan < 0 ? 1.0f + pan : 1.0f);
+  *gl = (int32_t)(l * 256.0f); *gr = (int32_t)(r * 256.0f);
+}
+
+static void ds_feed(void) {   /* 16-bit stereo at ds_freq: every source at its own gain, then saturate */
+  static int32_t acc[AOT_DS_FRAMES * 2];
+  memset(acc, 0, sizeof acc);
+  for (int i = 0; i < AOT_DS_SRC; i++) {
+    DsSrc *s = &ds_src[i];
+    if (!s->key || !s->data || !s->size) continue;
+    if (!s->playing && s->fstep >= 0) { s->key = NULL; continue; }
+    int ch = s->ch == 1 ? 1 : 2; uint32_t frame = (uint32_t)(ch * 2);
+    uint32_t sz = s->size - s->size % frame; if (!sz) { s->key = NULL; continue; }
+    int32_t gl, gr; ds_gains(s, &gl, &gr);
+    for (int k = 0; k < AOT_DS_FRAMES; k++) {
+      if (s->pos + frame > sz) {
+        if (!s->looping) { s->key = NULL; break; }   /* nothing audible left: free the slot right away */
+        s->pos = 0;
+      }
+      const uint8_t *p = s->data + s->pos;
+      int32_t l = (int16_t)(uint16_t)(p[0] | (p[1] << 8));
+      int32_t r = ch == 2 ? (int16_t)(uint16_t)(p[2] | (p[3] << 8)) : l;   /* mono duplicated into both ears */
+      s->pos += frame;
+      if (s->fstep) {
+        s->fadev += s->fstep;
+        if (s->fadev < 0) s->fadev = 0; else if (s->fadev > 256) { s->fadev = 256; s->fstep = 0; }
+        if (!s->playing && s->fadev <= 0) { s->key = NULL; break; }
+      }
+      l = (l * gl >> 8) * s->fadev >> 8; r = (r * gr >> 8) * s->fadev >> 8;
+      acc[2 * k] += l; acc[2 * k + 1] += r;
+    }
+  }
+  for (int k = 0; k < AOT_DS_FRAMES * 2; k++) { int32_t v = acc[k]; ds_mix[k] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
 }
 static void ds_queue_cb(SLAndroidSimpleBufferQueueItf q, void *ctx) {
   (void)q; (void)ctx;
   pthread_mutex_lock(&ds_mu);
   ds_feed();
-  int16_t *b = ds_out[ds_flip]; memcpy(b, ds_mix, sizeof ds_mix); ds_flip ^= 1;
+  int16_t *b = ds_out[ds_flip]; memcpy(b, ds_mix, sizeof ds_mix); ds_flip = (ds_flip + 1) % AOT_DS_QSZ;
   pthread_mutex_unlock(&ds_mu);
-  (*ds_queue)->Enqueue(ds_queue, b, sizeof ds_mix);
+  if ((*ds_queue)->Enqueue(ds_queue, b, sizeof ds_mix) != SL_RESULT_SUCCESS) {
+    static int n; if (!n++) fprintf(stderr, "[audio] DirectSound: the output queue refused a buffer; sound stops here\n");
+  }
 }
 static int ds_open(int freq, int ch) {
   if (ds_obj) return 0;
   ds_freq = freq > 0 ? freq : 44100; ds_ch = ch == 1 ? 1 : 2;
   if (audio_engine_init() != 0) return -1;
-  SLDataLocator_AndroidSimpleBufferQueue loc = { SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 2 };
+  SLDataLocator_AndroidSimpleBufferQueue loc = { SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, AOT_DS_QSZ };
   SLDataFormat_PCM pcm = { SL_DATAFORMAT_PCM, (SLuint32)ds_ch, (SLuint32)ds_freq * 1000, SL_PCMSAMPLEFORMAT_FIXED_16, 16,
                            ds_ch == 1 ? SL_SPEAKER_FRONT_CENTER : (SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT), SL_BYTEORDER_LITTLEENDIAN };
   SLDataSource src = { &loc, &pcm };
@@ -128,8 +188,7 @@ static int ds_open(int freq, int ch) {
   if ((*ds_queue)->RegisterCallback(ds_queue, ds_queue_cb, NULL) != SL_RESULT_SUCCESS) goto bad;
   if ((*ds_play)->SetPlayState(ds_play, SL_PLAYSTATE_PLAYING) != SL_RESULT_SUCCESS) goto bad;
   memset(ds_out, 0, sizeof ds_out);
-  (*ds_queue)->Enqueue(ds_queue, ds_out[0], sizeof ds_out[0]);
-  (*ds_queue)->Enqueue(ds_queue, ds_out[1], sizeof ds_out[1]);
+  for (int i = 0; i < AOT_DS_QSZ; i++) (*ds_queue)->Enqueue(ds_queue, ds_out[i], sizeof ds_out[i]);
   ds_flip = 0;
   fprintf(stderr, "[audio] DirectSound output %d Hz %d ch 16-bit (OpenSLES)\n", ds_freq, ds_ch);
   return 0;
@@ -147,18 +206,60 @@ void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int
     if (!ds_warned++) fprintf(stderr, "[audio] DirectSound buffer at %u Hz %d ch is not mixed (output is %d Hz %d ch)\n", freq, channels, ds_freq, ds_ch);
     pthread_mutex_unlock(&ds_mu); return NULL;
   }
-  int slot = -1, spare = -1;
-  for (int i = 0; i < AOT_DS_SRC; i++) { if (ds_src[i].key == key) { slot = i; break; } if (spare < 0 && !ds_src[i].key) spare = i; }
-  if (slot < 0) slot = spare;
-  if (slot < 0) { pthread_mutex_unlock(&ds_mu); return NULL; }
-  ds_src[slot].key = key; ds_src[slot].data = data; ds_src[slot].size = size; ds_src[slot].pos = 0;
-  ds_src[slot].looping = looping; ds_src[slot].playing = 1;
+  DsSrc *s = ds_find(key);
+  int fresh = 0;
+  if (!s) {
+    for (int i = 0; i < AOT_DS_SRC; i++) if (!ds_src[i].key) { s = &ds_src[i]; break; }
+    if (!s) { pthread_mutex_unlock(&ds_mu); return NULL; }
+    memset(s, 0, sizeof *s); s->key = key; s->gain = 1.0f; fresh = 1;
+  }
+  s->data = data; s->size = size; s->ch = channels == 1 ? 1 : 2; s->looping = looping; s->playing = 1;
+  if (s->fstep < 0) s->fstep = 256 / AOT_DS_FADE;   /* Play on a voice still fading out: bring it back */
+  else if (!s->fstep) s->fadev = 256;
+  /* A buffer the game calls Play on every frame must keep playing where it is, not restart from the top. */
+  if (fresh) { s->pos = 0; s->fadev = 0; s->fstep = 256 / AOT_DS_FADE; }
   pthread_mutex_unlock(&ds_mu);
-  return &ds_src[slot];
+  return s;
 }
-void aot_ds_stop(void *h) {
-  DsSrc *s = (DsSrc *)h; if (!s) return;
-  pthread_mutex_lock(&ds_mu); s->playing = 0; s->key = NULL; pthread_mutex_unlock(&ds_mu);
+void aot_ds_stop(void *key) {   /* Release: the buffer memory is about to go away, so drop the source now */
+  if (!key) return;
+  pthread_mutex_lock(&ds_mu);
+  DsSrc *s = ds_find(key); if (s) { s->key = NULL; s->playing = 0; s->fstep = 0; s->fadev = 0; }
+  pthread_mutex_unlock(&ds_mu);
+}
+void aot_ds_halt(void *key) {   /* Stop: fade over ~3 ms so ending a voice does not click */
+  if (!key) return;
+  pthread_mutex_lock(&ds_mu);
+  DsSrc *s = ds_find(key);
+  if (s) { s->playing = 0; s->fstep = -(256 / AOT_DS_FADE); if (s->fadev <= 0) s->key = NULL; }
+  pthread_mutex_unlock(&ds_mu);
+}
+void aot_ds_seek(void *key, uint32_t pos) {   /* SetCurrentPosition: jump, faded in, instead of restarting */
+  if (!key) return;
+  pthread_mutex_lock(&ds_mu);
+  DsSrc *s = ds_find(key);
+  if (s) { uint32_t frame = (uint32_t)((s->ch == 1 ? 2 : 4)); s->pos = pos < s->size ? pos - pos % frame : 0; s->fadev = 0; s->fstep = 256 / AOT_DS_FADE; }
+  pthread_mutex_unlock(&ds_mu);
+}
+void aot_ds_setvol(void *key, int32_t cb, int32_t pan) {   /* SetVolume / SetPan */
+  if (!key) return;
+  pthread_mutex_lock(&ds_mu);
+  DsSrc *s = ds_find(key);
+  if (s) { s->gain = ds_lin(cb); s->pan = pan <= -10000 ? -1.0f : pan >= 10000 ? 1.0f : (float)pan / 10000.0f; }
+  pthread_mutex_unlock(&ds_mu);
+}
+void aot_ds_3d(void *key, float x, float y, float z, float min_d, float max_d) {   /* IDirectSound3DBuffer */
+  if (!key) return;
+  pthread_mutex_lock(&ds_mu);
+  DsSrc *s = ds_find(key);
+  if (s) { s->x = x; s->y = y; s->z = z; s->min_d = min_d; s->max_d = max_d; s->is3d = 1; }
+  pthread_mutex_unlock(&ds_mu);
+}
+void aot_ds_listener(float px, float py, float pz, float fx, float fy, float fz, float tx, float ty, float tz, float rolloff) {
+  pthread_mutex_lock(&ds_mu);
+  lis_px = px; lis_py = py; lis_pz = pz; lis_fx = fx; lis_fy = fy; lis_fz = fz;
+  lis_tx = tx; lis_ty = ty; lis_tz = tz; lis_rolloff = rolloff > 0.01f ? rolloff : 0.01f;
+  pthread_mutex_unlock(&ds_mu);
 }
 
 static int audio_engine_init(void) {

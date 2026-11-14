@@ -228,30 +228,38 @@ void aot_input_dimouse(int32_t *dx, int32_t *dy, uint8_t b[3]) {
       x, y, *dx, *dy, b[0], b[1], b[2]); }
 }
 /* ---- XInput ---- */
-static AotPad pad; static int pad_on; static uint32_t pad_packet;
+static AotPad pad; static int pad_on, pad_present, pad_enabled = 1; static uint32_t pad_packet;
+/* A pad is reported as connected as soon as the platform sees one attached, even before it is touched: the
+   game decides whether to enable controller support from its very first XInputGetState call. */
+void aot_input_pad_present(int on) { pad_present = on != 0; }
 void aot_input_pad(const AotPad *p) {
   if (!p) { pad_on = 0; return; }
   if (!pad_on || memcmp(&pad, p, sizeof pad)) pad_packet++;
-  pad = *p; pad_on = 1;
-  /* Right stick = look. The guest reads the pointer as a look offset, so feed it the same kind of delta the
-     touch drag path feeds, scaled from the 32767 range; ~5 px per event at full deflection, nothing inside
-     the dead zone. Buttons stay on the pad, so looking around never presses anything. */
-  { int dx = p->rx / 6000, dy = p->ry / 6000;
-    if (dx || dy) { mx += dx; my += dy;
-      uint64_t lp = (uint64_t)(uint16_t)mx | ((uint64_t)(uint16_t)my << 16); post(HWND_BASE, WM_MOUSEMOVE, 0, lp); } }
+  pad = *p; pad_on = 1; pad_present = 1;
 }
-SYS(XInputGetState) {
-  if ((uint32_t)A(0) != 0 || !pad_on) return 1167;
-  uint64_t o = A(1); memset((void *)(uintptr_t)o, 0, 16); ST(uint32_t, o, pad_packet); ST(uint16_t, o + 4, pad.buttons); ST(uint8_t, o + 6, pad.lt); ST(uint8_t, o + 7, pad.rt);
-  ST(int16_t, o + 8, pad.lx); ST(int16_t, o + 10, pad.ly); ST(int16_t, o + 12, pad.rx); ST(int16_t, o + 14, pad.ry); return 0;
+SYS(XInputGetState) {   /* the game reads the sticks itself: this is a real XInput pad, not a mouse */
+  if ((uint32_t)A(0) != 0 || (!pad_on && !pad_present)) return 1167;
+  uint64_t o = A(1); if (!o) return 160;
+  memset((void *)(uintptr_t)o, 0, 16); ST(uint32_t, o, pad_packet);
+  if (pad_on && pad_enabled) {
+    ST(uint16_t, o + 4, pad.buttons); ST(uint8_t, o + 6, pad.lt); ST(uint8_t, o + 7, pad.rt);
+    ST(int16_t, o + 8, pad.lx); ST(int16_t, o + 10, pad.ly); ST(int16_t, o + 12, pad.rx); ST(int16_t, o + 14, pad.ry);
+  }
+  return 0;
 }
-SYS(XInputSetState) { return (uint32_t)A(0) == 0 && pad_on ? 0 : 1167; }
+SYS(XInputSetState) { return (uint32_t)A(0) == 0 && (pad_on || pad_present) ? 0 : 1167; }
 SYS(XInputGetCapabilities) {
-  if ((uint32_t)A(0) != 0 || !pad_on) return 1167;
-  uint64_t o = A(2); memset((void *)(uintptr_t)o, 0, 20); ST(uint8_t, o, 1); ST(uint8_t, o + 1, 1); ST(uint16_t, o + 4, 0xF3FF); ST(uint8_t, o + 6, 255); ST(uint8_t, o + 7, 255);
+  if ((uint32_t)A(0) != 0 || (!pad_on && !pad_present)) return 1167;
+  uint64_t o = A(2); if (!o) return 160;
+  memset((void *)(uintptr_t)o, 0, 20); ST(uint8_t, o, 1); ST(uint8_t, o + 1, 1); ST(uint16_t, o + 4, 0xF3FF); ST(uint8_t, o + 6, 255); ST(uint8_t, o + 7, 255);
   ST(int16_t, o + 8, 32767); ST(int16_t, o + 10, 32767); ST(int16_t, o + 12, 32767); ST(int16_t, o + 14, 32767); return 0;
 }
-SYS(XInputGetBatteryInformation) { return 1167; }
+SYS(XInputGetBatteryInformation) {   /* XINPUT_BATTERY_INFORMATION: wired, full */
+  if ((uint32_t)A(0) != 0 || (!pad_on && !pad_present)) return 1167;
+  uint64_t o = A(2); if (o) { uint8_t *q = (uint8_t *)(uintptr_t)o; q[0] = 0; q[1] = 3; } return 0;
+}
+SYS(XInputEnable) { pad_enabled = (uint32_t)A(0) != 0; return 0; }
+SYS(XInputGetKeystroke) { return 1167; }   /* ERROR_EMPTY: keys arrive as button state, not as keystrokes */
 
 const ShimEnt aot_shim_table_input[] = {
   E(RegisterClassExA), E(RegisterClassExW), E(RegisterClassA), E(RegisterClassW), E(CreateWindowExA), E(CreateWindowExW), E(ShowWindow), E(DestroyWindow), E(IsWindow),
@@ -264,6 +272,6 @@ const ShimEnt aot_shim_table_input[] = {
   EA("MapVirtualKeyA", MapVirtualKey), EA("MapVirtualKeyW", MapVirtualKey), EA("RegisterWindowMessageA", RegisterWindowMessage), EA("RegisterWindowMessageW", RegisterWindowMessage), E(GetMessageTime),
   EA("SetCapture", hwnd), EA("ReleaseCapture", one), EA("SetCursor", zero), EA("GetFocus", hwnd), EA("IsWindowVisible", one), EA("GetParent", zero), EA("InvalidateRect", one), EA("ValidateRect", one),
   E(BeginPaint), EA("EndPaint", one), EA("SetTimer", one), EA("KillTimer", one), EA("EnableWindow", one), EA("IsZoomed", zero), EA("GetDesktopWindow", hwnd), EA("GetCapture", zero), EA("TrackMouseEvent", one),
-  E(XInputGetState), E(XInputSetState), E(XInputGetCapabilities), E(XInputGetBatteryInformation), EA("XInputEnable", zero),
+  E(XInputGetState), E(XInputSetState), E(XInputGetCapabilities), E(XInputGetBatteryInformation), E(XInputEnable), E(XInputGetKeystroke),
   { 0, 0 }
 };

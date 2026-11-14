@@ -6,6 +6,7 @@ void aot_input_view(uint32_t w, uint32_t h);               /* size of the physic
 void aot_input_mouse(int kind, float x, float y);          /* 0 move,1 L down,2 L up,3 R down,4 R up */
 void aot_input_key(int vk, int down);
 void aot_input_pad(const AotPad *p);                       /* NULL = disconnected */
+void aot_input_pad_present(int on);                        /* the platform sees a pad attached */
 void aot_input_quit(void);
 void aot_input_dik(uint8_t out[256]);                       /* DirectInput keyboard state (DIK scancodes, 0x80 = down) */
 void aot_input_dimouse(int32_t *dx, int32_t *dy, uint8_t b[3]); /* DirectInput relative mouse: delta since last call + buttons */

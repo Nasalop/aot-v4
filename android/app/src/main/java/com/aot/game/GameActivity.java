@@ -81,11 +81,13 @@ public final class GameActivity extends NativeActivity {
     private static void nativeView(int w, int h) { if (nativesOk) try { nativeView0(w, h); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
 
     /* Physical gamepad. Its key/motion events are delivered to this Activity, not to the native input
-       queue, so a real pad used to be invisible to the guest. Forward buttons and sticks to the guest's
-       XInput device (buttons as the XINPUT_GAMEPAD bitmask); the right stick is turned into mouse look
-       in win_input.c, so aiming works the same way it does with a finger drag. */
+       queue, so a real pad used to be invisible to the guest. Forward buttons, both sticks and both
+       triggers to the guest's XInput device (buttons as the XINPUT_GAMEPAD bitmask) and let the game
+       drive the camera from the right stick itself, the way it does with an Xbox 360 pad on Windows. */
     private static native void nativePad0(int buttons, int lt, int rt, int lx, int ly, int rx, int ry);
+    private static native void nativePadPresent0(int on);
     private int padButtons, padLx, padLy, padRx, padRy, padLt, padRt;
+    private int padPresent = -1;
     private static int padAxis(android.view.MotionEvent e, int a) {
         float v = e.getAxisValue(a); if (v > 1f) v = 1f; if (v < -1f) v = -1f; return (int) (v * 32767f); }
     private void sendPad() {
@@ -267,8 +269,37 @@ public final class GameActivity extends NativeActivity {
     private boolean bundledMode, gateOpen;
 
     @Override
+    /* Tell the guest a pad is attached as soon as one is: it decides whether to offer controller support
+       on its very first XInput query, long before the stick is touched. */
+    private void scanPads() {
+        boolean any = false;
+        int[] ids = android.view.InputDevice.getDeviceIds();
+        for (int id : ids) {
+            android.view.InputDevice d = android.view.InputDevice.getDevice(id);
+            if (d != null && (d.getSources() & android.view.InputDevice.SOURCE_GAMEPAD) != 0
+                    || d != null && (d.getSources() & android.view.InputDevice.SOURCE_JOYSTICK) != 0) any = true;
+        }
+        int v = any ? 1 : 0;
+        if (v == padPresent) return;
+        padPresent = v;
+        if (!nativesOk) return;
+        try { nativePadPresent0(v); }
+        catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); }
+    }
+    private boolean padListenerRegistered;
+
     protected void onResume() {
         super.onResume();
+        scanPads();
+        if (!padListenerRegistered) {
+            padListenerRegistered = true;
+            android.hardware.input.InputManager im = (android.hardware.input.InputManager) getSystemService(INPUT_SERVICE);
+            if (im != null) im.registerInputDeviceListener(new android.hardware.input.InputManager.InputDeviceListener() {
+                @Override public void onInputDeviceAdded(int id) { scanPads(); }
+                @Override public void onInputDeviceRemoved(int id) { scanPads(); }
+                @Override public void onInputDeviceChanged(int id) { scanPads(); }
+            }, null);
+        }
         if (bundledMode) ensureGameAccess();
     }
 
