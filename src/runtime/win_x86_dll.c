@@ -108,6 +108,7 @@ void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int
 void aot_ds_stop(void *key);
 void aot_ds_halt(void *key);
 void aot_ds_seek(void *key, uint32_t pos);
+int aot_ds_getpos(void *key, uint32_t *pos);
 void aot_ds_setvol(void *key, int32_t cb, int32_t pan);
 void aot_ds_3d(void *key, float x, float y, float z, float min_d, float max_d);
 void aot_ds_listener(float px, float py, float pz, float fx, float fy, float fz, float tx, float ty, float tz, float rolloff);
@@ -116,6 +117,7 @@ static void *aot_ds_play(void *k, const void *d, uint32_t n, uint32_t f, int ch,
 static void aot_ds_stop(void *k) { (void)k; }
 static void aot_ds_halt(void *k) { (void)k; }
 static void aot_ds_seek(void *k, uint32_t p) { (void)k; (void)p; }
+static int aot_ds_getpos(void *k, uint32_t *p) { (void)k; (void)p; return 0; }
 static void aot_ds_setvol(void *k, int32_t c, int32_t p) { (void)k; (void)c; (void)p; }
 static void aot_ds_3d(void *k, float x, float y, float z, float a, float b) { (void)k; (void)x; (void)y; (void)z; (void)a; (void)b; }
 static void aot_ds_listener(float a, float b, float c, float d, float e, float f, float g, float h, float i, float j) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; (void)i; (void)j; }
@@ -133,6 +135,7 @@ static const uint8_t IID_IUnknown_[16] = {0,0,0,0,0,0,0,0,0xC0,0,0,0,0,0,0,0x46}
 static uint64_t ds_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static uint32_t ds_cursor(DSBuf *b) {
   if (!b->playing) return b->pos;
+  if (b->out) { uint32_t mp; if (aot_ds_getpos(b, &mp)) { b->pos = mp; b->t0 = ds_now(); return mp; } }   /* the mixer's own position, not a wall clock that drifts from it */
   uint64_t raw = b->pos + (ds_now() - b->t0) * ((uint64_t)b->freq * b->align) / 1000000000ull;
   if (b->looping) return (uint32_t)(raw % b->size);
   if (raw >= b->size) { b->playing = 0; b->pos = 0; return 0; }
