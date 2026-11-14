@@ -1,3 +1,5 @@
+#include <time.h>
+#include <unistd.h>
 /* PE32 guest -> 64-bit DXVK D3D10/DXGI proxy. Guest COM objects are PX wrappers whose vtable thunks (generated from the DXVK headers,
    d3d10_proxy_gen.inc) convert the guest stdcall frame (32-bit values, 32-bit pointers, 32-bit-layout structs) into a call on the real
    host COM object loaded from libdxvk_*.so. Guest memory is identity-mapped below 4 GB, so POD pointers pass through unchanged. */
@@ -21,7 +23,7 @@ static void *g_hdev; static int g_flush_slot = -1;
 #define E_NOTIMPL_ 0x80004001u
 #define E_NOINTF_ 0x80004002u
 #define MAGIC 0x50583130u
-typedef struct { void *g, *h; size_t sz; uint32_t sub, type; } Shadow;
+typedef struct { void *g, *h; size_t sz; uint32_t sub, type; void *spare; size_t spcap, gcap; } Shadow;   /* spare: a retained low-memory block reused by the next Map (no allocator round trip per Map/Unmap) */
 /* The guest-visible object is only {vtable, magic, id}; everything the host side relies on (host pointer, interface, map shadows) lives in host memory,
    so guest code that scribbles on a COM object (intrusive refcounts at +4/+8, ...) cannot corrupt it. */
 typedef struct { void **vt; uint32_t magic, id; } GO;
@@ -107,7 +109,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
 #define ALLOC(sz) ({ size_t _s = ((sz) + 15) & ~15u; if (ap + _s > sizeof ar) { fprintf(stderr, "[dxvk] %s::%s: argument too large for marshalling arena\n", pi->name, m->name); return E_NOTIMPL_; } void *_p = ar + ap; ap += _s; memset(_p, 0, _s); _p; })
   if (m->name[0] == 'U' && !strcmp(m->name, "Unmap")) {   /* flush a low-memory shadow back into the host mapping */
     uint32_t sub = m->n ? A(1) : 0;
-    for (int i = 0; i < 4; i++) if (o->sh[i].g && o->sh[i].sub == sub) { Shadow *s = &o->sh[i]; if (s->type != 1) memcpy(s->h, s->g, s->sz); aot_gfree(s->g); s->g = NULL; break; }
+    for (int i = 0; i < 4; i++) if (o->sh[i].g && o->sh[i].sub == sub) { Shadow *s = &o->sh[i]; if (s->type != 1) memcpy(s->h, s->g, s->sz); if (!s->spare && s->gcap <= (256u << 10)) { s->spare = s->g; s->spcap = s->gcap; } else aot_gfree(s->g); s->g = NULL; break; }
   }
   if (m->name[0] == 'C' && !strcmp(m->name, "CreateBuffer") && A(1) && LD(uint32_t, A(1)) == 0) {
     /* The game asks for a zero-size buffer (a shader without constant buffers); native D3D10 drivers tolerated this, DXVK rejects it. Give it the smallest valid buffer instead of a NULL the game does not check. */
@@ -139,17 +141,16 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   int is_gd = m->name[0] == 'G' && !strcmp(m->name, "GetData") && ni >= 4;
   if (is_gd) iv[3] &= ~1ull;   /* D3D10_ASYNC_GETDATA_DONOTFLUSH: native drivers still make progress on their own, DXVK only submits work on a flush, so the game polls forever */
   uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
-  if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0) {   /* S_FALSE: the query's commands may not have been submitted yet */
+  if (is_gd && hr == 1 && g_hdev && g_flush_slot >= 0) {   /* S_FALSE: submit the query's commands once, then wait for the GPU HERE (short host sleeps) instead of bouncing back to the guest's SwitchToThread spin, which re-flushed on every poll */
     uint64_t fi[1] = { (uint64_t)(uintptr_t)g_hdev }; float z[4] = { 0 }; hcall(g_hdev, g_flush_slot, fi, 1, z);
-    r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r; }
-  if (is_gd) {   /* The game spins on "while (GetData() == S_FALSE) SwitchToThread();" for GPU queries (occlusion / event). On this stack some never complete in a useful
-                  * time, which stalls the whole frame. After 64 consecutive "not ready" answers for one query, report it finished: BOOL/UINT64 = 1 (event done / visible). */
-    static __thread void *lastq; static __thread int nfalse;
-    if (hr == 1) { if (lastq != (void *)o) { lastq = o; nfalse = 0; }
-      if (++nfalse >= 2) {   /* one flush + one retry already happened; do not spin the frame on a GPU round trip */ uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; if (pd && sz >= 8) *(uint64_t *)(uintptr_t)pd = 1; else if (pd && sz >= 4) *(uint32_t *)(uintptr_t)pd = 1;
-        static int warned; if (!warned++) fprintf(stderr, "[dxvk] GPU query still not ready after 2 polls: reporting it as finished (result 1) so the game does not stall\n");
-        hr = 0; r = 0; nfalse = 0; lastq = NULL; } }
-    else { nfalse = 0; lastq = NULL; } } if (m->ret && (int32_t)hr < 0) {
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) { r = hcall(o->host, slot, iv, ni, fv); hr = (uint32_t)r; if (hr != 1) break;
+      clock_gettime(CLOCK_MONOTONIC, &t1); if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 >= 40) break;   /* a query that never completes: fake below */
+      usleep(150); } }
+  if (is_gd && hr == 1) {   /* still not ready after 40 ms of real waiting: report it finished (BOOL/UINT64 = 1) so the game cannot stall forever */
+    uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; if (pd && sz >= 8) *(uint64_t *)(uintptr_t)pd = 1; else if (pd && sz >= 4) *(uint32_t *)(uintptr_t)pd = 1;
+    static int warned; if (!warned++) fprintf(stderr, "[dxvk] GPU query still not ready after 40 ms: reporting it as finished (result 1)\n");
+    hr = 0; r = 0; } if (m->ret && (int32_t)hr < 0) {
     fprintf(stderr, "[dxvk] %s::%s FAILED hr=%#x args:", pi->name, m->name, hr);
     for (int i = 0; i < m->n && i < 6; i++) { uint32_t a = A(i + 1); fprintf(stderr, " %#x", a);
       if (a > 0x10000 && a < 0x80000000u) { const uint32_t *w = (const uint32_t *)(uintptr_t)a; fprintf(stderr, "[%x %x %x %x %x %x]", w[0], w[1], w[2], w[3], w[4], w[5]); } }
@@ -179,9 +180,9 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
       if (!hp || !sz) { fprintf(stderr, "[dxvk] %s::Map: cannot size the mapped region (sz=%zu)\n", pi->name, sz); break; }
       int si = -1; for (int i = 0; i < 4; i++) if (!o->sh[i].g) { si = i; break; }
       if (si < 0) { fprintf(stderr, "[dxvk] too many concurrent maps on one resource\n"); break; }
-      void *g = aot_gmalloc(sz); if (!g) { fprintf(stderr, "[dxvk] Map: out of low memory for %zu bytes\n", sz); break; }
+      Shadow *sp_ = &o->sh[si]; void *g = NULL; size_t gcap = sz; if (sp_->spare && sp_->spcap >= sz) { g = sp_->spare; gcap = sp_->spcap; sp_->spare = NULL; sp_->spcap = 0; } else { if (sp_->spare) { aot_gfree(sp_->spare); sp_->spare = NULL; sp_->spcap = 0; } g = aot_gmalloc(sz); } if (!g) { fprintf(stderr, "[dxvk] Map: out of low memory for %zu bytes\n", sz); break; }
       if (q->type != 4) memcpy(g, hp, sz); else memset(g, 0, sz);
-      o->sh[si] = (Shadow){ g, hp, sz, q->sub, q->type };
+      sp_->g = g; sp_->h = hp; sp_->sz = sz; sp_->sub = q->sub; sp_->type = q->type; sp_->gcap = gcap;
       uint32_t *gs = (uint32_t *)(uintptr_t)q->g; if (q->kind == 'M') gs[0] = (uint32_t)(uintptr_t)g; else { gs[0] = (uint32_t)(uintptr_t)g; gs[1] = LD(uint32_t, h + 8); if (q->kind == 'U') gs[2] = LD(uint32_t, h + 12); }
       break; }
     }
