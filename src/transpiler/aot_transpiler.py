@@ -77,6 +77,8 @@ FAST_IMPORTS = {'EnterCriticalSection', 'LeaveCriticalSection', 'TryEnterCritica
                 'TlsGetValue', 'TlsSetValue', 'GetLastError', 'SetLastError', 'SetEvent', 'ResetEvent', 'WaitForSingleObject', 'ReleaseSemaphore', 'ReleaseMutex',
                 'SwitchToThread', 'GetCurrentThreadId', 'InterlockedIncrement', 'InterlockedDecrement', 'InterlockedExchange', 'InterlockedExchangeAdd', 'InterlockedCompareExchange'}
 
+HDR = '#include "aot_runtime.h"\nextern uint64_t (*aot_x86_resolve(const char*,const char*,int*,int*))(CPU*);\nextern uint64_t aot_x86_thunk(CPU*,uint64_t(*)(CPU*),int,int);\n'
+
 class Rec:
     def __init__(self, path):
         self.pe = pefile.PE(path)
@@ -1057,7 +1059,7 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
     if cur: regions.append(cur)
     owner = {b[0].address: k for k, r in enumerate(regions) for b in r}
     unsup = rec.unsup; nok = 0
-    files = []; buf = ['#include "aot_runtime.h"\nextern uint64_t (*aot_x86_resolve(const char*,const char*,int*,int*))(CPU*);\nextern uint64_t aot_x86_thunk(CPU*,uint64_t(*)(CPU*),int,int);\n']
+    files = []; buf = [HDR]
     for k, reg in enumerate(regions):
         out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;\ndispatch:switch(pc){' % k]
         out += ['case 0x%xULL:goto L_%x;' % (b[0].address, b[0].address) for b in reg]
@@ -1105,7 +1107,7 @@ def emit(rec, outdir, per_region=300, regions_per_file=8):
             with open(fn, 'w', encoding='utf-8') as output:
                 output.write('\n'.join(buf))
             files.append(fn)
-            buf = ['#include "aot_runtime.h"\n']
+            buf = [HDR]
     tab = ['#include "aot_runtime.h"']
     tab += ['uint64_t region_%d(CPU*,uint64_t);' % k for k in range(len(regions))]
     tab.append('const int aot_is_pe32=%d;' % (1 if rec.m32 else 0))
