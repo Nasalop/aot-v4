@@ -18,6 +18,7 @@ typedef struct { const char *name; uint8_t n; char k[17]; uint8_t ci[16], ty[16]
 typedef struct { const char *name; int nm; const PM *m; const fn_t *wf; const uint8_t *guid; } PI;
 static uint64_t px_call(CPU *c, const PI *pi, int slot);
 static void *g_hdev; static int g_flush_slot = -1;
+volatile uint64_t aot_frames;   /* presented frames, for the FPS counter */
 #include "d3d10_proxy_gen.inc"
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
 #define E_NOTIMPL_ 0x80004001u
@@ -161,6 +162,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
   int is_gd = m->name[0] == 'G' && !strcmp(m->name, "GetData") && ni >= 4;
   if (is_gd) iv[3] &= ~1ull;   /* D3D10_ASYNC_GETDATA_DONOTFLUSH: native drivers still make progress on their own, DXVK only submits work on a flush, so the game polls forever */
   uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
+  if (m->name[0] == 'P' && !strcmp(m->name, "Present")) __atomic_add_fetch(&aot_frames, 1, __ATOMIC_RELAXED);   /* read by the debug overlay (GameActivity) */
   int occl = is_gd && (o->qtype == 2 || o->qtype == 6 || o->qtype == 8);   /* OCCLUSION, OCCLUSION_PREDICATE, SO_OVERFLOW_PREDICATE: culling hints, never worth stalling the frame on the GPU */
   if (occl && hr == 1) {   /* not ready: answer "visible" now. Culling is only an optimisation; waiting for it serialised CPU and GPU every frame */
     uint64_t pd = iv[1]; uint32_t sz = (uint32_t)iv[2]; int pred = o->qtype != 2;   /* predicate: BOOL FALSE = not occluded; occlusion: a large sample count */
