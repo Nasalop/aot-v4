@@ -154,7 +154,15 @@ SYS(GetAsyncKeyState) { uint32_t k = (uint32_t)A(0) & 0xff; return keys[k] ? 0x8
 SYS(GetKeyState) { uint32_t k = (uint32_t)A(0) & 0xff; return keys[k] ? 0x8000 : 0; }
 SYS(GetKeyboardState) { uint8_t *o = (uint8_t *)(uintptr_t)A(0); for (int i = 0; i < 256; i++) o[i] = keys[i] ? 0x80 : 0; return 1; }
 SYS(GetCursorPos) { if (A(0)) { ST(int32_t, A(0), mx); ST(int32_t, A(0) + 4, my); } return 1; }
-SYS(SetCursorPos) { mx = (int32_t)A(0); my = (int32_t)A(1); return 1; }
+/* Mouse look. AC1 recentres the cursor with SetCursorPos every frame and then reads GetCursorPos as a
+   look offset, so mapping a touch straight onto absolute coordinates makes that offset equal the
+   finger's distance from the centre: the view keeps turning at a fixed rate while the finger is held
+   still and snaps back when it lifts. After the first warp, report the finger's delta from the
+   anchored cursor instead, so the recentre stays put and dragging turns the view. Presses and
+   releases never count as motion, and until the game warps (menus, front end) the absolute mapping
+   stays exactly as before. */
+static int mx_last, my_last, mx_seen, mx_warp;
+SYS(SetCursorPos) { mx = (int32_t)A(0); my = (int32_t)A(1); mx_warp = 1; return 1; }
 SYS(ScreenToClient) { return 1; }
 SYS(one) { return 1; }
 SYS(zero) { return 0; }
@@ -173,8 +181,12 @@ void aot_input_mouse(int kind, float x, float y) {   /* kind: 0 move, 1 left dow
   uint32_t cw, ch; aot_win_client_size(&cw, &ch);
   /* Without a reported surface size the incoming coordinates are already surface pixels; scaling them
      by client/1 put every tap thousands of pixels off-screen, so a press that should hit a button missed. */
-  if (view_known) { mx = (int32_t)(x * (float)cw / (float)view_w); my = (int32_t)(y * (float)ch / (float)view_h); }
-  else { mx = (int32_t)x; my = (int32_t)y; }
+  int px = view_known ? (int32_t)(x * (float)cw / (float)view_w) : (int32_t)x;
+  int py = view_known ? (int32_t)(y * (float)ch / (float)view_h) : (int32_t)y;
+  if (!mx_seen) { mx_seen = 1; mx_last = px; my_last = py; }
+  if (mx_warp) { if (kind == 0) { mx += px - mx_last; my += py - my_last; } }   /* pointer lock: motion only, position anchored where the game put it */
+  else { mx = px; my = py; }
+  mx_last = px; my_last = py;
   uint64_t lp = (uint64_t)(uint16_t)mx | ((uint64_t)(uint16_t)my << 16), wp = (keys[1] ? 1 : 0) | (keys[2] ? 2 : 0);
   static const uint32_t mm[] = { WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP };
   if (kind == 1) { keys[1] = 1; wp |= 1; } else if (kind == 2) { keys[1] = 0; wp &= ~1ull; } else if (kind == 3) { keys[2] = 1; wp |= 2; } else if (kind == 4) { keys[2] = 0; wp &= ~2ull; }
