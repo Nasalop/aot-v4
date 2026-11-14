@@ -268,7 +268,6 @@ public final class GameActivity extends NativeActivity {
     // ---- bundled-game mode: run in place from a user-selected folder (no copying) ----
     private boolean bundledMode, gateOpen;
 
-    @Override
     /* Tell the guest a pad is attached as soon as one is: it decides whether to offer controller support
        on its very first XInput query, long before the stick is touched. */
     private void scanPads() {
@@ -288,6 +287,7 @@ public final class GameActivity extends NativeActivity {
     }
     private boolean padListenerRegistered;
 
+    @Override
     protected void onResume() {
         super.onResume();
         scanPads();
