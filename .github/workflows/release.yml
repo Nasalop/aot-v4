@@ -1,0 +1,174 @@
+name: release-apk
+# Same pipeline as build-apk (game mode only) but with all logging compiled out, the heap self-check removed and -O2 code.
+on:
+  workflow_dispatch:
+
+jobs:
+  game-translate:
+    runs-on: ubuntu-24.04
+    outputs:
+      key: ${{ steps.k.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Locate game exe and compute cache key (exe + transpiler)
+        id: k
+        run: |
+          if [ ! -f game/game.exe ] && [ -d game ]; then
+            C=$(find game -maxdepth 1 -type f -iname '*.exe' ! -iname 'textured_cube.exe' ! -iname 'stresst_test.exe' ! -iname 'gfx_multi_cube.exe' | head -n 2)
+            if [ "$(echo "$C" | grep -c .)" = 1 ]; then echo "using $C as game/game.exe"; cp "$C" game/game.exe; fi
+          fi
+          test -f game/game.exe || { echo "game/game.exe is missing" >&2; ls -la game; exit 1; }
+          echo "key=$(sha256sum game/game.exe src/transpiler/aot_transpiler.py | sha256sum | cut -c1-16)" >> $GITHUB_OUTPUT
+      - uses: actions/cache@v4
+        id: gen
+        with:
+          path: gen.tar.zst
+          key: gen-${{ steps.k.outputs.key }}
+      - name: Free disk space and add swap (cache miss only)
+        if: steps.gen.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/share/powershell /usr/local/julia* || true
+          sudo swapoff -a || true
+          sudo fallocate -l 13G /mnt/aot.swap && sudo chmod 600 /mnt/aot.swap && sudo mkswap /mnt/aot.swap && sudo swapon /mnt/aot.swap
+          free -h; df -h / /mnt | cat
+      - name: Translate exe to C (cache miss only)
+        if: steps.gen.outputs.cache-hit != 'true'
+        run: |
+          pip install capstone pefile
+          python src/transpiler/aot_transpiler.py game/game.exe gen | tee transpile.log
+          tar -C gen -cf - . | zstd -T0 -3 -o gen.tar.zst
+          ls -la gen.tar.zst; du -sh gen
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-gen
+          path: gen.tar.zst
+          retention-days: 1
+          compression-level: 0
+  game-compile:
+    needs: game-translate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Object cache key (translated code + runtime headers + flags)
+        id: k
+        run: echo "key=${{ needs.game-translate.outputs.key }}-$(cat src/runtime/*.h | sha256sum | cut -c1-12)-O2rel" >> $GITHUB_OUTPUT
+      - uses: actions/cache@v4
+        id: obj
+        with:
+          path: shard.a
+          key: obj-${{ matrix.shard }}-${{ steps.k.outputs.key }}
+      - uses: actions/download-artifact@v4
+        if: steps.obj.outputs.cache-hit != 'true'
+        with:
+          name: game-gen
+      - uses: actions/cache@v4
+        if: steps.obj.outputs.cache-hit != 'true'
+        with:
+          path: /usr/local/lib/android/sdk/ndk/26.1.10909125
+          key: ndk-26.1.10909125
+      - name: Compile this shard with the Android NDK
+        if: steps.obj.outputs.cache-hit != 'true'
+        run: |
+          [ -d "$ANDROID_HOME/ndk/26.1.10909125" ] || $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125" >/dev/null
+          B=$ANDROID_HOME/ndk/26.1.10909125/toolchains/llvm/prebuilt/linux-x86_64/bin
+          mkdir -p g o; tar --zstd -xf gen.tar.zst -C g
+          ls g/aot_part*.c | sort | awk -v n=${{ matrix.shard }} 'NR%8==n' > list
+          echo "shard ${{ matrix.shard }}: $(wc -l < list) files"
+          xargs -a list -P 2 -I{} sh -c "$B/aarch64-linux-android26-clang -O2 -w -fPIC -fno-strict-aliasing -fwrapv -DAOT_ANDROID_APP=1 -DAOT_RELEASE=1 -Isrc/runtime -include src/runtime/aot_release.h -c {} -o o/\$(basename {}).o"
+          rm -f shard.a; if ls o/*.o >/dev/null 2>&1; then $B/llvm-ar rcs shard.a o/*.o; else $B/llvm-ar rcs shard.a; fi
+          ls -la shard.a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard.a
+          retention-days: 1
+          compression-level: 0
+  apk:
+    needs: [game-translate, game-compile]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Locate game exe
+        run: |
+          echo "AOT_MODE=game" >> $GITHUB_ENV
+          if [ ! -f game/game.exe ] && [ -d game ]; then
+            C=$(find game -maxdepth 1 -type f -iname '*.exe' ! -iname 'textured_cube.exe' ! -iname 'stresst_test.exe' ! -iname 'gfx_multi_cube.exe' | head -n 2)
+            if [ "$(echo "$C" | grep -c .)" = 1 ]; then cp "$C" game/game.exe; fi
+          fi
+          test -f game/game.exe || { echo "game/game.exe is missing" >&2; exit 1; }
+      - name: Free disk space (generated C + objects for AC1 are several GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/share/powershell /usr/local/julia* || true
+          sudo apt-get clean || true
+          df -h / /mnt | cat
+      - name: Add swap (AC1-size translations exceed the 7 GB runner RAM)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 13G /mnt/aot.swap && sudo chmod 600 /mnt/aot.swap && sudo mkswap /mnt/aot.swap && sudo swapon /mnt/aot.swap
+          free -h; df -h /mnt | tail -1
+      - name: Fetch prebuilt game code (split pipeline)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '{game-gen,shard-*}'
+          path: dl
+      - name: Stage prebuilt shards
+        run: |
+          mkdir -p prebuilt android/app/src/main/cpp/gen android/app/src/main/assets
+          for d in dl/shard-*; do cp "$d/shard.a" "prebuilt/$(basename $d).a"; done
+          tar --zstd -xf dl/game-gen/gen.tar.zst -C android/app/src/main/cpp/gen ./aot_tab.c
+          cp game/game.exe android/app/src/main/assets/game.exe
+          echo "AOT_PREBUILT_DIR=$PWD/prebuilt" >> $GITHUB_ENV; ls -la prebuilt
+      - name: Android SDK/NDK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.9' }
+      - name: Restore DXVK libs
+        id: dxvkc
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/jniLibs/arm64-v8a
+          key: dxvk-3.1.1-${{ hashFiles('third_party/dxvk-android/**') }}
+      - name: Build DXVK for Android (cache miss only)
+        if: steps.dxvkc.outputs.cache-hit != 'true'
+        run: bash third_party/dxvk-android/build.sh android/app/src/main/jniLibs/arm64-v8a
+      - name: Restore vkd3d-shader (HLSL compiler)
+        id: vkdc
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/jniLibs-vkd3d
+          key: vkd3d-shader-${{ hashFiles('third_party/vkd3d/**') }}
+      - name: Build vkd3d-shader for Android (cache miss only)
+        if: steps.vkdc.outputs.cache-hit != 'true'
+        run: bash third_party/vkd3d/build.sh android/app/src/main/jniLibs-vkd3d
+      - name: Stage vkd3d-shader into jniLibs
+        run: mkdir -p android/app/src/main/jniLibs/arm64-v8a && cp android/app/src/main/jniLibs-vkd3d/libvkd3dshader.so android/app/src/main/jniLibs/arm64-v8a/
+      - name: Release switches (no logging, no heap self-check)
+        run: |
+          cat >> android/app/src/main/cpp/CMakeLists.txt <<'EOF'
+          if(AOT_MODE STREQUAL "game")
+            target_compile_definitions(aotgame PRIVATE AOT_RELEASE=1)
+            target_compile_options(aotgame PRIVATE -include ${RT}/aot_release.h)
+            set_source_files_properties(${RT}/win_sys.c PROPERTIES COMPILE_DEFINITIONS AOT_NO_HEAPCHECK=1)
+          endif()
+          EOF
+      - name: Build APK
+        working-directory: android
+        run: gradle --no-daemon assembleDebug -PaotMode=$AOT_MODE ${AOT_PREBUILT_DIR:+-PaotPrebuilt=$AOT_PREBUILT_DIR}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aotgame-release-apk
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            transpile.log
