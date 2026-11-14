@@ -76,7 +76,7 @@ static SLObjectItf output_mix_object;
 static int audio_engine_init(void);
 #define AOT_DS_SRC 64
 #define AOT_DS_FRAMES 1024
-#define AOT_DS_QSZ 3
+#define AOT_DS_QSZ 4
 #define AOT_DS_FADE 128
 /* Volume, pan and 3D distance are applied per source: a crowded street mixes dozens of voices and summing
    them all at full scale clipped, which is what the constant crackle was. A voice also fades in and out
@@ -85,6 +85,7 @@ typedef struct {
   void *key; const uint8_t *data; uint32_t size, pos; int looping, playing, ch;
   int32_t fadev, fstep;              /* 0..256 gain ramp; fstep < 0 while fading out, 0 when steady */
   float gain, pan;                   /* SetVolume (centibels) and SetPan (-1..1) */
+  int32_t pgl, pgr; int ginit;       /* gains at the end of the previous buffer: ramped to the new ones so a volume/pan/3D change is not a step (a step is a click) */
   float x, y, z, min_d, max_d; int is3d;
 } DsSrc;
 static DsSrc ds_src[AOT_DS_SRC];
@@ -142,6 +143,8 @@ static void ds_feed(void) {   /* 16-bit stereo at ds_freq: every source at its o
     int ch = s->ch == 1 ? 1 : 2; uint32_t frame = (uint32_t)(ch * 2);
     uint32_t sz = s->size - s->size % frame; if (!sz) { s->key = NULL; continue; }
     int32_t gl, gr; ds_gains(s, &gl, &gr);
+    if (!s->ginit) { s->pgl = gl; s->pgr = gr; s->ginit = 1; }
+    int32_t gl0 = s->pgl, gr0 = s->pgr;
     for (int k = 0; k < AOT_DS_FRAMES; k++) {
       if (s->pos + frame > sz) {
         if (!s->looping) { s->key = NULL; break; }   /* nothing audible left: free the slot right away */
@@ -156,9 +159,11 @@ static void ds_feed(void) {   /* 16-bit stereo at ds_freq: every source at its o
         if (s->fadev < 0) s->fadev = 0; else if (s->fadev > 256) { s->fadev = 256; s->fstep = 0; }
         if (!s->playing && s->fadev <= 0) { s->key = NULL; break; }
       }
-      l = (l * gl >> 8) * s->fadev >> 8; r = (r * gr >> 8) * s->fadev >> 8;
+      int32_t cgl = gl0 + (gl - gl0) * k / AOT_DS_FRAMES, cgr = gr0 + (gr - gr0) * k / AOT_DS_FRAMES;
+      l = (l * cgl >> 8) * s->fadev >> 8; r = (r * cgr >> 8) * s->fadev >> 8;
       acc[2 * k] += l; acc[2 * k + 1] += r;
     }
+    s->pgl = gl; s->pgr = gr;
   }
   for (int k = 0; k < AOT_DS_FRAMES * 2; k++) { int32_t v = acc[k]; ds_mix[k] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
 }
@@ -225,6 +230,12 @@ void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int
   if (fresh) { s->pos = 0; s->fadev = 0; s->fstep = 256 / AOT_DS_FADE; }
   pthread_mutex_unlock(&ds_mu);
   return s;
+}
+int aot_ds_getpos(void *key, uint32_t *pos) {   /* where the mixer has read up to: the play cursor the game must see, so its streaming refills never land on data not yet mixed */
+  if (!key) return 0;
+  pthread_mutex_lock(&ds_mu);
+  DsSrc *s = ds_find(key); int ok = s && s->data && s->playing; if (ok) *pos = s->pos;
+  pthread_mutex_unlock(&ds_mu); return ok;
 }
 void aot_ds_stop(void *key) {   /* Release: the buffer memory is about to go away, so drop the source now */
   if (!key) return;
