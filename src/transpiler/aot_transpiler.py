@@ -1050,6 +1050,71 @@ class FOp:
     def __init__(self, reg, size): self.reg = reg; self.size = size
 REGOP_RAX = {1: FOp(X86_REG_AL, 1), 2: FOp(X86_REG_AX, 2), 4: FOp(X86_REG_EAX, 4), 8: FOp(X86_REG_RAX, 8)}
 
+CROSS_BLOCK_FLAGS = True   # False = every block start is treated as needing all five flags (the old behaviour)
+
+def flagrw(i):
+    """(flags written, flags read, count dynamic) for one instruction, with the capstone 5.0 corrections.
+    This is the same logic the emission loop uses; keeping it in one place means the liveness fixpoint below
+    and the emitted code can never disagree about what an instruction does to the flags."""
+    mn = i.mnemonic.split()[-1]
+    w = {f for f in F5 if i.eflags & WMASK[f]}; r = {f for f in F5 if i.eflags & TMASK[f]}
+    if mn in ('fcomi', 'fucomi', 'fcompi', 'fucompi', 'fcomip', 'fucomip'): w = set(F5)
+    elif mn.startswith('f') and not mn.startswith('fcmov'): w = set()   # capstone 5.0 lists CF as modified by every x87 op (really FPU C0-C3): it dropped the CF of a preceding cmp before `jb`
+    if mn.startswith('fcmov'): r = {'cf', 'zf', 'pf'}
+    if mn in ('lahf', 'pushfd', 'pushf', 'pushfq'): r = set(F5)   # capstone lists no flag reads for these
+    if mn not in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest', 'pcmpestri', 'pcmpestrm', 'pcmpistri', 'pcmpistrm', 'vcomiss', 'vucomiss', 'vcomisd', 'vucomisd', 'vptest') and any(o.type == X86_OP_REG and i.reg_name(o.reg).startswith(('xmm', 'ymm', 'mm')) for o in i.operands): w = set(); r = set()   # SSE/MMX moves and arithmetic never touch EFLAGS; capstone mis-reports some, which made the liveness pass drop the ZF of a `test` before a `je` 30 SSE ops later (AC1 0x557d5f: je took the wrong side -> call with null this)
+    if mn == 'test': w = set(F5)   # capstone 5.0 reports no eflags for `test r/m, r` with a memory operand (1665 sites in AC1): the branch that follows then read stale flags
+    if mn == 'cmc': r = r | {'cf'}   # capstone omits the CF read of cmc (38 sites in AC1)
+    if mn in ('loope', 'loopz', 'loopne', 'loopnz'): r = r | {'zf'}
+    if mn in ('rcl', 'rcr'): r = r | {'cf'}   # capstone omits the CF read on rotate-through-carry
+    varcnt = (mn in ('shl', 'sal', 'shr', 'sar', 'rol', 'ror') and len(i.operands) > 1 and i.operands[1].type != X86_OP_IMM) or \
+             mn in ('bsf', 'bsr', 'shld', 'shrd', 'bt', 'bts', 'btr', 'btc', 'cmpxchg') or (0xF3 in i.prefix or 0xF2 in i.prefix)
+    return w, r, varcnt
+
+def _block_succ(a, b, k, owner):
+    """Block addresses reachable from block b (in region k) with no SAVES() in between, or None when the
+    transfer can leave through SAVES/JMPREG/EXIT/dispatch, which stores all five flags."""
+    last = b[-1]; mn = last.mnemonic.split()[-1]; nxt = last.address + last.size
+    imm = [o.imm for o in last.operands if o.type == X86_OP_IMM]
+    if mn != 'jmp' and (mn.startswith('j') or mn in ('loop', 'loope', 'loopne', 'loopz', 'loopnz', 'jecxz', 'jrcxz')):
+        if not imm or owner.get(imm[0]) != k or owner.get(nxt) != k: return None
+        return [imm[0], nxt]
+    if mn == 'jmp':
+        if not imm or owner.get(imm[0]) != k: return None
+        return [imm[0]]
+    if mn in ('ret', 'retf', 'iret', 'iretd', 'call', 'syscall', 'int', 'int3', 'ud2', 'cpuid'): return None
+    return [nxt] if owner.get(nxt) == k else None   # straight-line fall-through into the next block
+
+def flag_live_out(blk, blkreg, owner, cross_block=None):
+    """For every block, the flags that still have to be materialised when it hands control on.
+
+    Liveness fixpoint over block edges: live_out[b] is the union of the successors' live_in, where live_in is
+    computed backwards through the block with the same flag rules the emitter uses. Starting from the empty set
+    and iterating upwards is the standard sound direction for a may-be-live analysis (a flag is only omitted
+    when nothing downstream can read it before writing it). Blocks whose transfer is not a plain branch inside
+    the same region -- return, indirect jump, call, cross-region jump, EXIT -- keep all five, because those go
+    through SAVES(), which stores every flag."""
+    if cross_block is None: cross_block = CROSS_BLOCK_FLAGS
+    if not cross_block: return {a: set(F5) for a in blk}
+    succs = {a: _block_succ(a, b, blkreg[a], owner) for a, b in blk.items()}
+    live_out = {a: (set(F5) if s is None else set()) for a, s in succs.items()}
+    live_in = {a: set() for a in blk}
+    for _ in range(64):
+        changed = False
+        for a, b in blk.items():
+            li = set(live_out[a])
+            for i in reversed(b):
+                w, r, varcnt = flagrw(i)
+                if varcnt: li = li | r; continue   # dynamic flag effects: assume the old value survives
+                li = (li - w) | r
+            if li != live_in[a]: live_in[a] = li; changed = True
+        if not changed: break
+        for a, s in succs.items():
+            if s is not None: live_out[a] = set().union(*[live_in[x] for x in s])
+    else:
+        return {a: set(F5) for a in blk}   # never settled: fall back to the fully conservative behaviour
+    return live_out
+
 def emit(rec, outdir, per_region=3000, regions_per_file=8):
     g = Gen(rec); blocks = rec.blocks(); os.makedirs(outdir, exist_ok=True)
     regions = []; cur = []; cnt = 0
@@ -1058,6 +1123,16 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
         if cnt >= per_region: regions.append(cur); cur = []; cnt = 0
     if cur: regions.append(cur)
     owner = {b[0].address: k for k, r in enumerate(regions) for b in r}
+    # ---- which flags really have to be materialised where a block hands control on ----
+    # Emission below walks each block backwards assuming all five flags are live at its end, so the first
+    # flag-writing instruction of every block computes all five even when the branch that follows reads one.
+    # The live-out is computed here instead, as a liveness fixpoint over block edges. Any edge that is not a
+    # plain branch to another block of the same region -- return, indirect jump, call, cross-region jump, EXIT,
+    # or an address that is not a block entry -- passes through SAVES(), which stores all five flags, so those
+    # blocks keep the fully conservative set and behave exactly as before.
+    blk = {b[0].address: b for reg in regions for b in reg}
+    blkreg = {b[0].address: k for k, reg in enumerate(regions) for b in reg}
+    live_out = flag_live_out(blk, blkreg, owner)
     protos = ''.join('uint64_t region_%d(CPU*,uint64_t);\n' % q for q in range(len(regions)))   # direct region-to-region tail calls need the prototypes in every part file
     unsup = rec.unsup; nok = 0
     files = []; buf = [HDR + protos]
@@ -1072,21 +1147,9 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
             if a in owner: return 'JMPREG(%d,0x%xULL);' % (owner[a], a)   # known entry of another region: tail-call it, skip run()
             return 'EXIT(0x%xULL);' % a
         for b in reg:
-            live = set(F5); needs = []
+            live = set(live_out[b[0].address]); needs = []   # computed above: only the flags a successor can still read
             for i in reversed(b):
-                mn = i.mnemonic.split()[-1]
-                w = {f for f in F5 if i.eflags & WMASK[f]}; r = {f for f in F5 if i.eflags & TMASK[f]}
-                if mn in ('fcomi', 'fucomi', 'fcompi', 'fucompi', 'fcomip', 'fucomip'): w = set(F5)
-                elif mn.startswith('f') and not mn.startswith('fcmov'): w = set()   # capstone 5.0 lists CF as modified by every x87 op (really FPU C0-C3): it dropped the CF of a preceding cmp before `jb`
-                if mn.startswith('fcmov'): r = {'cf', 'zf', 'pf'}
-                if mn in ('lahf', 'pushfd', 'pushf', 'pushfq'): r = set(F5)   # capstone lists no flag reads for these
-                if mn not in ('comiss', 'ucomiss', 'comisd', 'ucomisd', 'ptest', 'pcmpestri', 'pcmpestrm', 'pcmpistri', 'pcmpistrm', 'vcomiss', 'vucomiss', 'vcomisd', 'vucomisd', 'vptest') and any(o.type == X86_OP_REG and i.reg_name(o.reg).startswith(('xmm', 'ymm', 'mm')) for o in i.operands): w = set(); r = set()   # SSE/MMX moves and arithmetic never touch EFLAGS; capstone mis-reports some, which made the liveness pass drop the ZF of a `test` before a `je` 30 SSE ops later (AC1 0x557d5f: je took the wrong side -> call with null this)
-                if mn == 'test': w = set(F5)   # capstone 5.0 reports no eflags for `test r/m, r` with a memory operand (1665 sites in AC1): the branch that follows then read stale flags
-                if mn == 'cmc': r = r | {'cf'}   # capstone omits the CF read of cmc (38 sites in AC1)
-                if mn in ('loope', 'loopz', 'loopne', 'loopnz'): r = r | {'zf'}
-                if mn in ('rcl', 'rcr'): r = r | {'cf'}   # capstone omits the CF read on rotate-through-carry
-                varcnt = (mn in ('shl', 'sal', 'shr', 'sar', 'rol', 'ror') and len(i.operands) > 1 and i.operands[1].type != X86_OP_IMM) or \
-                         mn in ('bsf', 'bsr', 'shld', 'shrd', 'bt', 'bts', 'btr', 'btc', 'cmpxchg') or (0xF3 in i.prefix or 0xF2 in i.prefix)
+                w, r, varcnt = flagrw(i)   # one definition of flag read/write, shared with the liveness fixpoint
                 if varcnt: needs.append(set(F5)); live |= r; continue
                 needs.append(live & w); live = (live - w) | r
             needs.reverse()
