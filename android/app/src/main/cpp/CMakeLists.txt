@@ -6,7 +6,10 @@ add_link_options(-Wl,-Bsymbolic-functions)
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../../..)
 set(RT ${ROOT}/src/runtime)
 set(GLUE ${ANDROID_NDK}/sources/android/native_app_glue)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -fno-strict-aliasing -fwrapv")
+# Native (not emulated) TLS: emulated TLS turns every __thread read into a call into __emutls_get_address, and
+# the runtime reads TLS on hot paths (watchdog slot, guest entry depth). initial-exec is valid here because the
+# library is loaded at start-up, and reduces a read to one thread-pointer-relative load.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -fno-strict-aliasing -fwrapv -fno-emulated-tls -ftls-model=initial-exec")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT DEFINED AOT_MODE)

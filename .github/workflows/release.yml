@@ -1,5 +1,5 @@
 name: release-apk
-# Same pipeline as build-apk (game mode only) but with all logging compiled out, the heap self-check removed and -O2 code.
+# Same pipeline as build-apk (game mode only) but with all logging compiled out, the heap self-check removed and -O3 code.
 on:
   workflow_dispatch:
 
@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Object cache key (translated code + runtime headers + flags)
         id: k
-        run: echo "key=${{ needs.game-translate.outputs.key }}-$(cat src/runtime/*.h | sha256sum | cut -c1-12)-O2rel" >> $GITHUB_OUTPUT
+        run: echo "key=${{ needs.game-translate.outputs.key }}-$(cat src/runtime/*.h | sha256sum | cut -c1-12)-O3rel" >> $GITHUB_OUTPUT
       - uses: actions/cache@v4
         id: obj
         with:
@@ -80,7 +80,7 @@ jobs:
           mkdir -p g o; tar --zstd -xf gen.tar.zst -C g
           ls g/aot_part*.c | sort | awk -v n=${{ matrix.shard }} 'NR%8==n' > list
           echo "shard ${{ matrix.shard }}: $(wc -l < list) files"
-          xargs -a list -P 2 -I{} sh -c "$B/aarch64-linux-android26-clang -O2 -w -fPIC -fno-plt -fvisibility=hidden -fno-strict-aliasing -fwrapv -DAOT_ANDROID_APP=1 -DAOT_RELEASE=1 -Isrc/runtime -include src/runtime/aot_release.h -c {} -o o/\$(basename {}).o"
+          xargs -a list -P 2 -I{} sh -c "$B/aarch64-linux-android26-clang -O3 -w -fPIC -fno-plt -fvisibility=hidden -fno-emulated-tls -mtune=cortex-a76 -fno-strict-aliasing -fwrapv -DAOT_ANDROID_APP=1 -DAOT_RELEASE=1 -Isrc/runtime -include src/runtime/aot_release.h -c {} -o o/\$(basename {}).o"
           rm -f shard.a; if ls o/*.o >/dev/null 2>&1; then $B/llvm-ar rcs shard.a o/*.o; else $B/llvm-ar rcs shard.a; fi
           ls -la shard.a
       - uses: actions/upload-artifact@v4
