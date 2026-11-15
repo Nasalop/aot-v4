@@ -1058,14 +1058,16 @@ def emit(rec, outdir, per_region=1200, regions_per_file=8):
         if cnt >= per_region: regions.append(cur); cur = []; cnt = 0
     if cur: regions.append(cur)
     owner = {b[0].address: k for k, r in enumerate(regions) for b in r}
+    protos = ''.join('uint64_t region_%d(CPU*,uint64_t);\n' % q for q in range(len(regions)))   # direct region-to-region tail calls need the prototypes in every part file
     unsup = rec.unsup; nok = 0
-    files = []; buf = [HDR]
+    files = []; buf = [HDR + protos]
     for k, reg in enumerate(regions):
-        out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;\ndispatch:switch(pc){' % k]
+        out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;uint64_t pc0=pc;\ndispatch:switch(pc){' % k]
         out += ['case 0x%xULL:goto L_%x;' % (b[0].address, b[0].address) for b in reg]
-        out.append('default:EXIT(pc);}')
+        out.append('default:AOT_TAILDISP(pc,pc0);}')
         def tgt(a, k=k):
             if owner.get(a) == k: return 'goto L_%x;' % a
+            if a in owner: return 'JMPREG(%d,0x%xULL);' % (owner[a], a)   # known entry of another region: tail-call it, skip run()
             return 'EXIT(0x%xULL);' % a
         for b in reg:
             live = set(F5); needs = []
@@ -1107,7 +1109,7 @@ def emit(rec, outdir, per_region=1200, regions_per_file=8):
             with open(fn, 'w', encoding='utf-8') as output:
                 output.write('\n'.join(buf))
             files.append(fn)
-            buf = [HDR]
+            buf = [HDR + protos]
     tab = ['#include "aot_runtime.h"']
     tab += ['uint64_t region_%d(CPU*,uint64_t);' % k for k in range(len(regions))]
     tab.append('const int aot_is_pe32=%d;' % (1 if rec.m32 else 0))

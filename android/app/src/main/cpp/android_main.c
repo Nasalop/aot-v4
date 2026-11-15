@@ -19,8 +19,26 @@ static struct android_app *g_app;
 /* A finished or crashed guest must end the process: parking the thread here leaves the activity alive with a dead renderer, which is the white screen. */
 void aot_exit(int code) { fflush(stdout); dprintf(2, "\n[aot] program exited with code %d\n", code); LOG("exit %d", code); _exit(code); }
 
+/* Android performance hint session (ADPF, API 33+, looked up at run time because the app's minSdk is lower). Without it the governor sees one thread at ~60% load and keeps
+   the cores at a modest clock; with it the system knows this thread has a 16.6 ms deadline and raises the frequency whenever frames run long. */
+#include <dlfcn.h>
+#include <time.h>
+#include <sys/syscall.h>
+typedef void *(*hint_mgr_fn)(void); typedef void *(*hint_new_fn)(void *, const int32_t *, size_t, int64_t); typedef int (*hint_rep_fn)(void *, int64_t);
+static void *g_hint; static hint_rep_fn g_hint_rep; static uint64_t g_hint_last;
+static void hint_start(void) {
+  hint_mgr_fn gm = (hint_mgr_fn)dlsym(RTLD_DEFAULT, "APerformanceHint_getManager"); hint_new_fn cs = (hint_new_fn)dlsym(RTLD_DEFAULT, "APerformanceHint_createSession");
+  g_hint_rep = (hint_rep_fn)dlsym(RTLD_DEFAULT, "APerformanceHint_reportActualWorkDuration");
+  if (!gm || !cs || !g_hint_rep) { LOG("performance hint API not available"); return; }
+  void *mgr = gm(); if (!mgr) return; int32_t tid = (int32_t)syscall(SYS_gettid);
+  g_hint = cs(mgr, &tid, 1, 16666666); LOG("performance hint session %s", g_hint ? "created" : "refused");
+}
+void aot_present_tick(void) {   /* once per presented frame, from the game thread */
+  if (!g_hint) return; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); uint64_t now = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+  if (g_hint_last) g_hint_rep(g_hint, (int64_t)(now - g_hint_last)); g_hint_last = now;
+}
 static void *game_thread(void *arg) {
-  (void)arg;
+  (void)arg; hint_start();
   static int started; if (__atomic_exchange_n(&started, 1, __ATOMIC_SEQ_CST)) return NULL;   /* activity re-creation must not start a second game (it would fail to map the image again) */
   const char *ext = g_app->activity->externalDataPath; char dir[512], exe[600], lg[600];
   snprintf(dir, sizeof dir, "%s/game", ext); mkdir(ext, 0777); mkdir(dir, 0777);
@@ -129,6 +147,9 @@ JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativePad0(JNIEnv *env, jc
   p.lx = (int16_t)lx; p.ly = (int16_t)ly; p.rx = (int16_t)rx; p.ry = (int16_t)ry;
   pad = p; aot_input_pad(&pad);
 }
+extern volatile uint64_t aot_frames, aot_ns[4];
+JNIEXPORT jlong JNICALL Java_com_aot_game_GameActivity_nativeNs0(JNIEnv *env, jclass cls, jint k) { (void)env; (void)cls; return k >= 0 && k < 4 ? (jlong)aot_ns[k] : 0; }
+JNIEXPORT jlong JNICALL Java_com_aot_game_GameActivity_nativeFrames0(JNIEnv *env, jclass cls) { (void)env; (void)cls; return (jlong)aot_frames; }
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeView0(JNIEnv *env, jclass cls, jint w, jint h) { (void)env; (void)cls; LOG("overlay view size %dx%d", w, h); aot_input_view((uint32_t)w, (uint32_t)h); }
 static void on_cmd(struct android_app *app, int32_t cmd) {
   if (cmd == APP_CMD_INIT_WINDOW) aot_android_set_window(app->window);
