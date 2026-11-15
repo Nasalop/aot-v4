@@ -155,6 +155,32 @@ static void m_report(void) {
   t0 = t; m_n = 0; m_up = m_down = 0;
 }
 static uint64_t px_call_inner(CPU *c, const PI *pi, int slot) {
+  /* IDXGIOutput::GetDisplayModeList (slot 8) and FindClosestMatchingMode (slot 9) are answered here instead of
+     being forwarded. The Vulkan surface reports only its own size, so the in-game resolution setting had exactly
+     one choice; advertising a normal mode list lets a lower resolution be picked, and DXVK scales that backbuffer
+     up to the surface when presenting. Any other slot still goes to the real DXGI. */
+  if (pi == &PIS[6] && (slot == 8 || slot == 9)) {
+    static const uint16_t dm[][2] = { { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 720 }, { 1280, 800 }, { 1366, 768 }, { 1600, 900 }, { 1920, 1080 }, { 2560, 1440 } };
+    if (slot == 9) {   /* FindClosestMatchingMode(want, *got, unused): echo the requested mode, so a size that is not the surface's is still accepted */
+      const uint8_t *want = (const uint8_t *)(uintptr_t)A(1); uint8_t *got = (uint8_t *)(uintptr_t)A(2);
+      if (want && got) { memcpy(got, want, 28); if (!LD(uint32_t, got + 8)) { ST(uint32_t, got + 8, 60); ST(uint32_t, got + 12, 1); } }
+      return 0;
+    }
+    uint32_t fmt = A(1), *cnt = (uint32_t *)(uintptr_t)A(3), out = A(4);
+    if (!cnt) return 0x80070057u;   /* E_INVALIDARG */
+    if (fmt != 28 && fmt != 87 && fmt != 24 && fmt != 10) { *cnt = 0; return 0; }   /* only 32-bit RGB scanout formats */
+    uint32_t n = (uint32_t)(sizeof dm / sizeof dm[0]);
+    if (!out) { *cnt = n; return 0; }
+    uint32_t k = *cnt < n ? *cnt : n;
+    for (uint32_t i = 0; i < k; i++) {   /* DXGI_MODE_DESC: 28 bytes */
+      uint8_t *e = (uint8_t *)(uintptr_t)(out + 28 * i);
+      ST(uint32_t, e, dm[i][0]); ST(uint32_t, e + 4, dm[i][1]);
+      ST(uint32_t, e + 8, 60); ST(uint32_t, e + 12, 1);   /* RefreshRate 60/1 */
+      ST(uint32_t, e + 16, fmt); ST(uint32_t, e + 20, 0); ST(uint32_t, e + 24, 0);
+    }
+    *cnt = k;
+    return k < n ? 0x887A0003u : 0;   /* DXGI_ERROR_MORE_DATA when the buffer was too small */
+  }
   static int ntr; PX *o = px_of(A(0));
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
   const PM *m = &pi->m[slot];
