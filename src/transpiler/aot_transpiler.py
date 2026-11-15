@@ -63,6 +63,21 @@ RESERVE_PROBE = ('{static int n_=0;uint32_t w_=LD(uint32_t,(uint32_t)r1+4u);'
 # call), and add 25%% headroom only where that stays inside the 14-bit field, so a vector whose
 # capacity wrapped costs two reallocs instead of one per push. Nothing is written but the
 # caller's own scratch argument slot; reserve still grows only when the capacity is smaller.
+# Native replacements for the statically linked MSVC C-runtime string/memory routines of the AC1 exe (cdecl, 32-bit). The translated versions are
+# SSE/rep loops with all vector state in memory, several times slower than the host's own; ~450 call sites each for memset and memmove. A replacement is
+# applied ONLY when the function's first bytes match exactly (so another game, or another build of this one, is never hooked by address alone).
+# Registers other than eax are left alone: the originals only clobber eax/ecx/edx/flags, which no caller may rely on.
+_NRET = 'pc=POP32(); goto dispatch;}'
+NATIVE_CRT = {
+    0x9bbea0: (bytes.fromhex('558bec57568b750c8b4d108b7d088bc18bd103c63bfe7608'),   # memmove/memcpy(dst, src, n) -> dst; the CRT one handles overlap
+               '{uint32_t d_=LD(uint32_t,r4+4),s_=LD(uint32_t,r4+8),n_=LD(uint32_t,r4+12);if(n_)memmove((void*)(uintptr_t)d_,(const void*)(uintptr_t)s_,n_);r0=d_;' + _NRET),
+    0x9bc5d0: (bytes.fromhex('8b54240c8b4c240485d2'),                                # memset(dst, c, n) -> dst
+               '{uint32_t d_=LD(uint32_t,r4+4),c_=LD(uint32_t,r4+8),n_=LD(uint32_t,r4+12);if(n_)memset((void*)(uintptr_t)d_,(int)(c_&0xff),n_);r0=d_;' + _NRET),
+    0x9c1e60: (bytes.fromhex('8b4c2404f7c10300000074'),                              # strlen(s)
+               '{r0=(uint32_t)strlen((const char*)(uintptr_t)LD(uint32_t,r4+4));' + _NRET),
+    0x9cb690: (bytes.fromhex('8b5424048b4c2408f7c203000000'),                        # strcmp(a, b) -> -1 / 0 / 1 exactly like the CRT (callers compare with -1)
+               '{int r_=strcmp((const char*)(uintptr_t)LD(uint32_t,r4+4),(const char*)(uintptr_t)LD(uint32_t,r4+8));r0=(uint32_t)(r_<0?-1:r_>0?1:0);' + _NRET),
+}
 RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=LD(uint32_t,(uint32_t)r4+4u),need_=sz_+1u;'
                  'if(nc_>((w_>>0xe)&0x3fffu)&&nc_<need_){uint32_t ask_=need_+(need_>>2);'
                  'if(ask_>0x3fffu||ask_<need_)ask_=(need_<=0x3fffu)?0x3fffu:need_;'
@@ -1135,6 +1150,7 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
     live_out = flag_live_out(blk, blkreg, owner)
     protos = ''.join('uint64_t region_%d(CPU*,uint64_t);\n' % q for q in range(len(regions)))   # direct region-to-region tail calls need the prototypes in every part file
     unsup = rec.unsup; nok = 0
+    native_hooks = []
     files = []; buf = [HDR + protos]
     for k, reg in enumerate(regions):
         out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;uint64_t pc0=pc;\n' % k,
@@ -1157,6 +1173,8 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
             for i, nd in zip(b, needs):
                 try:
                     s = g.tr(i, nd, tgt); nok += 1
+                    nat = NATIVE_CRT.get(i.address) if g.m32 else None
+                    if nat is not None and i is b[0] and b''.join(x.bytes for x in b).startswith(nat[0]): s = nat[1]; native_hooks.append(i.address)
                     # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
                     # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
                     if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
@@ -1184,6 +1202,7 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
     tab.append('uint64_t (*const aot_region_fn[])(CPU*,uint64_t)={%s};' % ','.join('region_%d' % k for k in range(len(regions))))
     with open(os.path.join(outdir, 'aot_tab.c'), 'w', encoding='utf-8') as output:
         output.write('\n'.join(tab) + '\n')
+    if native_hooks: print('[native-crt] replaced %d C-runtime functions: %s' % (len(native_hooks), ' '.join('0x%x' % a for a in native_hooks)))
     return len(rec.insns), len(blocks), len(regions), unsup
 
 if __name__ == '__main__':
