@@ -383,6 +383,23 @@ void aot_heap_crash_dump(void) {
   heap_overlap_check("crash");
 }
 
+/* Cross-region tail dispatch (JMPREG / AOT_TAILDISP in aot_runtime.h). Anything that is not a plain translated entry (import thunks, the return
+   thunk, unknown addresses, a region that does not enter at pc) is handed back to run() as the return value, exactly like EXIT(pc). */
+static __thread struct { uint64_t pc; int k; } rcache[4096];
+uint64_t aot_tail(CPU *c, uint64_t pc) {
+  if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) return pc;
+  unsigned rh = (unsigned)((pc * 0x9E3779B1u) >> 8) & 4095; int k = -1;
+  if (rcache[rh].pc == pc && rcache[rh].k > 0) k = rcache[rh].k - 1;
+  else {
+    int lo = 0, hi = aot_nregions - 1;
+    while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
+    if (k < 0) return pc;
+    rcache[rh].pc = pc; rcache[rh].k = k + 1;
+  }
+  aot_last_pc = pc;
+  AOT_MUSTTAIL return aot_region_fn[k](c, pc);
+}
+
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
   CPU *prev_cpu = cur_cpu; cur_cpu = c;
   for (;;) {
@@ -396,7 +413,7 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
       c->r[0] = t->fn(c);
       pc = LD(uint64_t, c->r[4]); c->r[4] += 8; continue;
     }
-    static __thread struct { uint64_t pc; int k; } rcache[4096]; unsigned rh = (unsigned)((pc * 0x9E3779B1u) >> 8) & 4095; int lo = 0, hi = aot_nregions - 1, k = -1;
+    unsigned rh = (unsigned)((pc * 0x9E3779B1u) >> 8) & 4095; int lo = 0, hi = aot_nregions - 1, k = -1;
     if (rcache[rh].pc == pc && rcache[rh].k > 0) k = rcache[rh].k - 1; else
     while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
     if (k >= 0) { rcache[rh].pc = pc; rcache[rh].k = k + 1; }
