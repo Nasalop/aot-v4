@@ -114,6 +114,25 @@ extern uint64_t (*const aot_region_fn[])(CPU *, uint64_t);
 void aot_unimpl(uint64_t addr, const char *text) __attribute__((noreturn));
 uint64_t aot_call(CPU *c, uint64_t fn, int nargs, ...);   /* call guest function from a shim */
 uint64_t aot_rdtsc(void);
+/* Profiling clock: clock_gettime() costs about as much as the D3D proxy calls being measured, so read the
+   hardware counter instead (EL0 access to cntvct/cntfrq is enabled by Linux on ARM64). */
+static inline uint64_t aot_perf_ticks(void) {
+#if defined(__aarch64__)
+  uint64_t v; __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v)); return v;
+#elif defined(__x86_64__)
+  uint32_t lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo;
+#else
+  return aot_rdtsc();
+#endif
+}
+static inline uint64_t aot_perf_hz(void) {
+#if defined(__aarch64__)
+  uint64_t v; __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(v)); return v ? v : 24000000ull;
+#else
+  return 3000000000ull;   /* nominal x86 host TSC */
+#endif
+}
+extern volatile uint64_t aot_perf_guest;   /* ticks spent inside translated code (proxy calls nested) */
 void aot_heap_check(const char *where);
 void aot_heap_crash_dump(void);
 uint64_t aot_register_thunk(aot_host_fn fn, const char *name);

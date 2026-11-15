@@ -24,6 +24,46 @@ extern void aot_present_tick(void);   /* android_main.c: frame pacing hint for t
 static inline uint64_t px_now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 #include "d3d10_proxy_gen.inc"
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
+/* ---- where the game thread's time goes: time inside translated code vs time in the D3D proxy ---- */
+static uint64_t pf_proxy_ticks, pf_calls, pf_if_calls[64], pf_if_ticks[64];
+static void pf_report(void) {
+  static uint64_t last_ns, last_g, last_p, last_c, last_f; static int started;
+  uint64_t now = px_now_ns();
+  if (!started) { started = 1; last_ns = now; last_g = aot_perf_guest; last_p = pf_proxy_ticks; last_c = pf_calls; last_f = aot_frames; return; }
+  if (now - last_ns < 1000000000ull) return;
+  double to_ms = 1000.0 / (double)aot_perf_hz(), win = (double)(now - last_ns) / 1e6;
+  uint64_t dg = aot_perf_guest - last_g, dp = pf_proxy_ticks - last_p, dc = pf_calls - last_c, df = aot_frames - last_f;
+  double gms = (double)dg * to_ms, pms = (double)dp * to_ms, n = df ? (double)df : 1.0;
+  fprintf(stderr, "[perf] %.0f ms, %llu frames (%.1f fps) | translated code %.2f ms/frame (%.0f%% of wall, D3D inside)"
+                  " | D3D proxy %.2f ms/frame, %llu calls (%.0f ns/call)\n",
+          win, (unsigned long long)df, 1000.0 * (double)df / win, gms / n, win > 0 ? gms / win * 100.0 : 0.0,
+          pms / n, (unsigned long long)dc, dc ? pms * 1e6 / (double)dc : 0.0);
+  int top[3] = { -1, -1, -1 };
+  for (int i = 0; i < 64; i++) {
+    uint64_t t = pf_if_ticks[i]; if (!t) continue;
+    if (top[0] < 0 || t > pf_if_ticks[top[0]]) { top[2] = top[1]; top[1] = top[0]; top[0] = i; }
+    else if (top[1] < 0 || t > pf_if_ticks[top[1]]) { top[2] = top[1]; top[1] = i; }
+    else if (top[2] < 0 || t > pf_if_ticks[top[2]]) top[2] = i;
+  }
+  if (top[0] >= 0) {
+    fprintf(stderr, "[perf]   hottest interfaces:");
+    for (int k = 0; k < 3; k++) { int i = top[k]; if (i < 0) continue;
+      fprintf(stderr, " %s %.2f ms %llu calls;", PIS[i].name, (double)pf_if_ticks[i] * to_ms / n, (unsigned long long)pf_if_calls[i]); }
+    fprintf(stderr, "\n");
+  }
+  memset(pf_if_calls, 0, sizeof pf_if_calls); memset(pf_if_ticks, 0, sizeof pf_if_ticks);
+  last_ns = now; last_g = aot_perf_guest; last_p = pf_proxy_ticks; last_c = pf_calls; last_f = aot_frames;
+}
+static uint64_t px_call_inner(CPU *c, const PI *pi, int slot);
+static uint64_t px_call(CPU *c, const PI *pi, int slot) {   /* timed wrapper around every guest->D3D call */
+  uint64_t t0 = aot_perf_ticks();
+  uint64_t r = px_call_inner(c, pi, slot);
+  uint64_t dt = aot_perf_ticks() - t0;
+  pf_proxy_ticks += dt; pf_calls++;
+  int ti = (int)(pi - PIS); if (ti >= 0 && ti < 64) { pf_if_ticks[ti] += dt; pf_if_calls[ti]++; }
+  pf_report();
+  return r;
+}
 #define E_NOTIMPL_ 0x80004001u
 #define E_NOINTF_ 0x80004002u
 #define MAGIC 0x50583130u
@@ -114,7 +154,7 @@ static void m_report(void) {
           (double)m_up / 1048576.0 * 1000.0 / (double)(t - t0), (double)m_down / 1048576.0 * 1000.0 / (double)(t - t0));
   t0 = t; m_n = 0; m_up = m_down = 0;
 }
-static uint64_t px_call(CPU *c, const PI *pi, int slot) {
+static uint64_t px_call_inner(CPU *c, const PI *pi, int slot) {
   static int ntr; PX *o = px_of(A(0));
   if (slot < 0 || slot >= pi->nm) { fprintf(stderr, "[dxvk] %s: bad slot %d (table has %d)\n", pi->name, slot, pi->nm); return E_NOTIMPL_; }
   const PM *m = &pi->m[slot];

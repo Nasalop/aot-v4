@@ -400,13 +400,17 @@ uint64_t aot_tail(CPU *c, uint64_t pc) {
   AOT_MUSTTAIL return aot_region_fn[k](c, pc);
 }
 
+volatile uint64_t aot_perf_guest;   /* profiling: ticks spent inside translated code, see aot_perf_ticks() */
+
+static __thread int aot_guest_depth;   /* > 0 when a shim re-entered the guest (callback): count the time once */
+
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
-  CPU *prev_cpu = cur_cpu; cur_cpu = c;
+  CPU *prev_cpu = cur_cpu; cur_cpu = c; int _outer = (aot_guest_depth++ == 0);
   for (;;) {
     if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
       if (idx == EXIT_IDX) { fflush(stdout); exit((int)c->r[0]); }
-      if (idx == RET_IDX) { cur_cpu = prev_cpu; return c->r[0]; }
+      if (idx == RET_IDX) { aot_guest_depth--; cur_cpu = prev_cpu; return c->r[0]; }
       Thunk *t = &thunks[idx]; { WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx; }
 #ifndef AOT_RELEASE
       recent[recent_n++ % 32] = idx;   /* diagnostic rings are shared globals: keep them out of release builds */
@@ -425,7 +429,9 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
     aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc;   /* shared ring: written on every region transition */
 #endif
     { WdThread *w = wd_self(); w->pc = pc; w->n++; w->cpu = c; }
+    uint64_t _pt0 = aot_perf_ticks();
     uint64_t np = aot_region_fn[k](c, pc);
+    if (_outer) aot_perf_guest += aot_perf_ticks() - _pt0;   /* includes any proxy work nested inside the guest code */
     if (np == pc) {   /* regions overlap: the binary search may land on one that does not enter at pc, so try every region covering pc */
       for (int m = 0; m < aot_nregions && np == pc; m++) if (m != k && pc >= aot_region_lo[m] && pc < aot_region_hi[m]) np = aot_region_fn[m](c, pc);
     }
