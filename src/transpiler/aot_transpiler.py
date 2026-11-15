@@ -1050,7 +1050,7 @@ class FOp:
     def __init__(self, reg, size): self.reg = reg; self.size = size
 REGOP_RAX = {1: FOp(X86_REG_AL, 1), 2: FOp(X86_REG_AX, 2), 4: FOp(X86_REG_EAX, 4), 8: FOp(X86_REG_RAX, 8)}
 
-def emit(rec, outdir, per_region=1200, regions_per_file=8):
+def emit(rec, outdir, per_region=3000, regions_per_file=8):
     g = Gen(rec); blocks = rec.blocks(); os.makedirs(outdir, exist_ok=True)
     regions = []; cur = []; cnt = 0
     for b in blocks:
@@ -1062,7 +1062,9 @@ def emit(rec, outdir, per_region=1200, regions_per_file=8):
     unsup = rec.unsup; nok = 0
     files = []; buf = [HDR + protos]
     for k, reg in enumerate(regions):
-        out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;uint64_t pc0=pc;\ndispatch:switch(pc){' % k]
+        out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;uint64_t pc0=pc;\n' % k,
+               'if(pc==0x%xULL)goto L_%x;' % (reg[0][0].address, reg[0][0].address),   # enter at the region start without touching the switch: the common case
+               'dispatch:switch(pc){']
         out += ['case 0x%xULL:goto L_%x;' % (b[0].address, b[0].address) for b in reg]
         out.append('default:AOT_TAILDISP(pc,pc0);}')
         def tgt(a, k=k):
