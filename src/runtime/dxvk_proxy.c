@@ -61,7 +61,7 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {   /* timed wrapper aro
   uint64_t dt = aot_perf_ticks() - t0;
   pf_proxy_ticks += dt; pf_calls++;
   int ti = (int)(pi - PIS); if (ti >= 0 && ti < 64) { pf_if_ticks[ti] += dt; pf_if_calls[ti]++; }
-  pf_report();
+  if ((pf_calls & 255) == 0) pf_report();   /* the clock read inside costs about as much as a proxy call */
   return r;
 }
 #define E_NOTIMPL_ 0x80004001u
