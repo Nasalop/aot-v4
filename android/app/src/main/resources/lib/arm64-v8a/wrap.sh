@@ -1,3 +1,5 @@
 #!/system/bin/sh
-# Intentionally a plain pass-through (the image-range pre-reservation helper was removed: it only added a start-up hop).
+# Debuggable builds only: reserve the guest image address range before ART starts (see src/runtime/aot_reserve.c)
+HERE="$(cd "$(dirname "$0")" && pwd)"
+export LD_PRELOAD="$HERE/libaotreserve.so${LD_PRELOAD:+:$LD_PRELOAD}"
 exec "$@"
