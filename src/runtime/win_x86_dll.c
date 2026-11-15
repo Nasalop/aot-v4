@@ -319,9 +319,10 @@ DIO(Ok) { return 0; }
  * of this era usually decides whether a controller exists from EnumDevices, long before it polls anything. ---- */
 static const uint16_t di_bm[10] = { 0x1000, 0x2000, 0x4000, 0x8000, 0x100, 0x200, 0x20, 0x10, 0x40, 0x80 };   /* A B X Y LB RB Back Start LS RS */
 static void di_joy_fill(uint8_t *o, const AotPad *p) {   /* DIJOYSTATE: 6 axes, 2 sliders, 4 POVs, 32 buttons */
-  ST(int32_t, o + 0, p->lx); ST(int32_t, o + 4, p->ly);
+  /* AotPad is in XINPUT_GAMEPAD layout, where the vertical axes grow upwards; DIJOYSTATE's lY and lRy grow downwards. */
+  ST(int32_t, o + 0, p->lx); ST(int32_t, o + 4, -(int32_t)p->ly);
   ST(int32_t, o + 8, ((int32_t)p->rt - (int32_t)p->lt) * 128);
-  ST(int32_t, o + 12, p->rx); ST(int32_t, o + 16, p->ry); ST(int32_t, o + 20, 0);
+  ST(int32_t, o + 12, p->rx); ST(int32_t, o + 16, -(int32_t)p->ry); ST(int32_t, o + 20, 0);
   ST(int32_t, o + 24, (int32_t)p->lt * 257 - 32767); ST(int32_t, o + 28, (int32_t)p->rt * 257 - 32767);
   uint32_t pov = 0xFFFFFFFFu;
   switch (p->buttons & 0xF) { case 1: pov = 0; break; case 2: pov = 18000; break; case 4: pov = 27000; break; case 8: pov = 9000; break;

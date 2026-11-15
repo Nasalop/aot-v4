@@ -125,8 +125,11 @@ public final class GameActivity extends NativeActivity {
     @Override public boolean onGenericMotionEvent(android.view.MotionEvent e) {
         int src = e.getSource();
         if ((src & android.view.InputDevice.SOURCE_JOYSTICK) != 0 || (src & android.view.InputDevice.SOURCE_GAMEPAD) != 0) {
-            padLx = padAxis(e, android.view.MotionEvent.AXIS_X); padLy = padAxis(e, android.view.MotionEvent.AXIS_Y);
-            padRx = padAxis(e, android.view.MotionEvent.AXIS_Z); padRy = padAxis(e, android.view.MotionEvent.AXIS_RZ);
+            /* Android's vertical stick axes grow downwards, XINPUT_GAMEPAD's grow upwards and the native side keeps
+               the pad in XInput layout, so the two vertical axes are negated here: without this both sticks were
+               reported inverted (push forward read as pull back, look up read as look down). */
+            padLx = padAxis(e, android.view.MotionEvent.AXIS_X); padLy = -padAxis(e, android.view.MotionEvent.AXIS_Y);
+            padRx = padAxis(e, android.view.MotionEvent.AXIS_Z); padRy = -padAxis(e, android.view.MotionEvent.AXIS_RZ);
             padLt = (int) (e.getAxisValue(android.view.MotionEvent.AXIS_LTRIGGER) * 255f);
             padRt = (int) (e.getAxisValue(android.view.MotionEvent.AXIS_RTRIGGER) * 255f);
             sendPad(); return true;
