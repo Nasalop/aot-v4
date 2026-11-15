@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 project(aotgame C CXX)
+# Bind intra-library calls directly: the recompiled image calls the runtime and the shims thousands of times per
+# frame, and every one of those went through the PLT.
+add_link_options(-Wl,-Bsymbolic-functions)
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../../..)
 set(RT ${ROOT}/src/runtime)
 set(GLUE ${ANDROID_NDK}/sources/android/native_app_glue)

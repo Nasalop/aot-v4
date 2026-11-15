@@ -88,7 +88,8 @@ static void *hostof(uint32_t g) {
 typedef uint64_t (*GF)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, float, float, float, float,
                        uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static uint64_t hcall(void *o, int slot, const uint64_t *iv, int ni, const float *fv) {   /* iv[0] is the object */
-  uint64_t a[32] = { 0 }; memcpy(a, iv, ni * 8); (void)o;
+  /* Only the argument slots the callee reads matter; zeroing all 256 bytes on every D3D call was dead work. */
+  uint64_t a[24]; memcpy(a, iv, (size_t)ni * 8); if (ni < 24) memset(a + ni, 0, (size_t)(24 - ni) * 8); (void)o;
   void **hvt = *(void ***)iv[0];
   if (!hvt) { fprintf(stderr, "[dxvk] host object %#llx has no vtable (slot %d)\n", (unsigned long long)iv[0], slot); return 0x80004005u; }
   GF f = (GF)hvt[slot];
@@ -188,7 +189,11 @@ static uint64_t px_call(CPU *c, const PI *pi, int slot) {
     case 'w': { uint8_t *g = (uint8_t *)(uintptr_t)q->g; conv_wstr(g, h, 32); memcpy(g + 64, h + 128, 16); memcpy(g + 80, h + 144, 8); ST(uint32_t, g + 88, LD(uint64_t, h + 152)); break; }
     case 'M': case 'T': case 'U': {
       if ((int32_t)hr < 0) break;
-      void *hp = *(void **)h; size_t sz = 0; uint8_t d[160] = { 0 }; int gd = slot_by_name(pi, "GetDesc"); uint64_t gi[2] = { (uint64_t)(uintptr_t)o->host, (uint64_t)(uintptr_t)d }; float z[4] = { 0 };
+      void *hp = *(void **)h; size_t sz = 0; uint8_t d[160]; memset(d, 0, sizeof d);
+      static int16_t gd_of[64]; static uint8_t gd_known[64];   /* GetDesc slot: was a string scan per Map */
+      int ti_ = (int)(pi - PIS); if (ti_ >= 0 && ti_ < 64 && !gd_known[ti_]) { gd_of[ti_] = (int16_t)slot_by_name(pi, "GetDesc"); gd_known[ti_] = 1; }
+      int gd = (ti_ >= 0 && ti_ < 64) ? gd_of[ti_] : slot_by_name(pi, "GetDesc");
+      uint64_t gi[2] = { (uint64_t)(uintptr_t)o->host, (uint64_t)(uintptr_t)d }; float z[4] = { 0 };
       if (gd >= 0) hcall(o->host, gd, gi, 2, z);
       if (q->kind == 'M') sz = LD(uint32_t, d);
       else { uint32_t w = LD(uint32_t, d), ht = LD(uint32_t, d + 4), dp = q->kind == 'U' ? LD(uint32_t, d + 8) : 1, ml = LD(uint32_t, d + (q->kind == 'U' ? 12 : 8)), fmt = LD(uint32_t, d + 16), mip = ml ? q->sub % ml : 0; (void)w;

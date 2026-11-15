@@ -35,20 +35,40 @@ static inline aot_f80 aot_ld80(uint64_t a) {
 #if defined(__x86_64__) && !defined(AOT_FPU_DOUBLE)
   aot_f80 v = 0; memcpy(&v, (const void *)(uintptr_t)a, 10); return v;
 #else
+  /* Extended -> double straight out of the IEEE fields. This runs on every 80-bit x87 load in a 32-bit
+     game, and ldexp() there was a libm call for what is three shifts and a mask. The rare shapes
+     (unnormal, out of range) keep the exact ldexp path. */
   uint64_t m; uint16_t se; memcpy(&m, (const void *)(uintptr_t)a, 8); memcpy(&se, (const void *)(uintptr_t)(a + 8), 2);
-  int e = se & 0x7fff, sg = se >> 15; double r;
-  if (e == 0 && m == 0) r = 0.0; else if (e == 0x7fff) r = (m << 1) ? NAN : INFINITY; else r = ldexp((double)m, e - 16383 - 63);
-  return sg ? -r : r;
+  int e = se & 0x7fff; uint64_t sg = (uint64_t)(se >> 15) << 63;
+  if (e == 0 && m == 0) { double z; uint64_t b = sg; memcpy(&z, &b, 8); return z; }
+  if (e == 0x7fff) { uint64_t b = sg | 0x7ff0000000000000ull; if (m != 0x8000000000000000ull) b |= (m >> 11) | 0x8000000000000ull; double d; memcpy(&d, &b, 8); return d; }
+  int ex = e - 16383;
+  if ((m >> 63) == 0) { double r = ldexp((double)m, ex - 63); return sg ? -r : r; }   /* unnormal */
+  /* The mantissa must round to double, so convert the integer (the hardware rounds to nearest) and then
+     rescale by a power of two in the exponent field: exact, and no libm call. */
+  double dm = (double)m; uint64_t db; memcpy(&db, &dm, 8);
+  int ne = (int)((db >> 52) & 0x7ff) + ex - 63;
+  if (ne <= 0 || ne >= 0x7ff) { double r = ldexp(dm, ex - 63); return sg ? -r : r; }   /* subnormal / overflow */
+  db = (db & ~(0x7ffull << 52)) | ((uint64_t)ne << 52) | sg;
+  { double d; memcpy(&d, &db, 8); return d; }
 #endif
 }
 static inline void aot_st80(uint64_t a, aot_f80 v) {
 #if defined(__x86_64__) && !defined(AOT_FPU_DOUBLE)
   memcpy((void *)(uintptr_t)a, &v, 10);
 #else
-  uint64_t m = 0; uint16_t se = signbit(v) ? 0x8000 : 0; double d = fabs(v);
-  if (d != d) { se |= 0x7fff; m = 0xC000000000000000ULL; } else if (d == INFINITY) { se |= 0x7fff; m = 0x8000000000000000ULL; }
-  else if (d != 0) { int e; double f = frexp(d, &e); m = (uint64_t)ldexp(f, 64); se |= (uint16_t)(e - 1 + 16383); }
-  memcpy((void *)(uintptr_t)a, &m, 8); memcpy((void *)(uintptr_t)(a + 8), &se, 2);
+  /* double -> extended without frexp/ldexp, which used to cost four libm calls per x87 store. Only a
+     subnormal double needs the exact (and here almost never taken) libm path. */
+  double d = (double)v; uint64_t b; memcpy(&b, &d, 8);
+  uint64_t sg = (b >> 63) << 15; int se = (int)((b >> 52) & 0x7ff); uint64_t fr = b & 0xfffffffffffffull;
+  uint64_t m; uint16_t e80;
+  if (se == 0x7ff) { e80 = 0x7fff; m = fr ? 0xC000000000000000ull : 0x8000000000000000ull; }
+  else if (se == 0) {
+    if (!fr) { e80 = 0; m = 0; }
+    else { int e2; double f2 = frexp(d < 0 ? -d : d, &e2); m = (uint64_t)ldexp(f2, 64); e80 = (uint16_t)(e2 - 1 + 16383); }
+  } else { m = 0x8000000000000000ull | (fr << 11); e80 = (uint16_t)(se - 1023 + 16383); }
+  uint16_t se80 = (uint16_t)(e80 | sg);
+  memcpy((void *)(uintptr_t)a, &m, 8); memcpy((void *)(uintptr_t)(a + 8), &se80, 2);
 #endif
 }
 /* NaN guard for x87 stores: the game's grid-walk loops spin forever on NaN. First sites are logged; NaN is stored as 0. */
@@ -71,7 +91,7 @@ static inline aot_f80 aot_nanck(aot_f80 v, uint32_t pc) {
 static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int trunc_) {
   int rc = trunc_ ? 3 : (fcw >> 10) & 3; aot_f80 r;
   if (v != v) goto bad;
-  r = rc == 0 ? F80(nearbyint)(v) : rc == 1 ? F80(floor)(v) : rc == 2 ? F80(ceil)(v) : F80(trunc)(v);
+  r = rc == 0 ? __builtin_nearbyint(v) : rc == 1 ? __builtin_floor(v) : rc == 2 ? __builtin_ceil(v) : __builtin_trunc(v);
   if (bits == 16) { if (r > 32767 || r < -32768) goto bad; return (int16_t)r; }
   if (bits == 32) { if (r > 2147483647.0 || r < -2147483648.0) goto bad; return (int32_t)r; }
   if (r >= 9223372036854775808.0 || r < -9223372036854775808.0) goto bad; return (int64_t)r;
@@ -80,7 +100,7 @@ bad: return bits == 16 ? INT16_MIN : bits == 32 ? INT32_MIN : INT64_MIN;
 /* FRNDINT: round to integral value per FCW rounding control, staying in floating point (inf/NaN pass through). */
 static inline aot_f80 aot_fist_r(aot_f80 v, uint16_t fcw) {
   int rc = (fcw >> 10) & 3;
-  return rc == 0 ? F80(nearbyint)(v) : rc == 1 ? F80(floor)(v) : rc == 2 ? F80(ceil)(v) : F80(trunc)(v);
+  return rc == 0 ? __builtin_nearbyint(v) : rc == 1 ? __builtin_floor(v) : rc == 2 ? __builtin_ceil(v) : __builtin_trunc(v);
 }
 typedef uint64_t (*aot_host_fn)(CPU *);
 

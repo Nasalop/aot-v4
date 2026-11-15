@@ -390,7 +390,10 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
       if (idx == EXIT_IDX) { fflush(stdout); exit((int)c->r[0]); }
       if (idx == RET_IDX) { cur_cpu = prev_cpu; return c->r[0]; }
-      Thunk *t = &thunks[idx]; recent[recent_n++ % 32] = idx; { WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx; } { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
+      Thunk *t = &thunks[idx]; { WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx; }
+#ifndef AOT_RELEASE
+      recent[recent_n++ % 32] = idx;   /* diagnostic rings are shared globals: keep them out of release builds */
+#endif { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
       if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
       if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); { static int8_t iocls[MAXTHUNK]; int8_t k_ = iocls[idx]; if (!k_) { const char *dt = strchr(t->name, '!'); const char *nn = dt ? dt + 1 : t->name; static const char *const io_names[] = { "ReadFile", "GetOverlappedResult", "LockFileEx", "UnlockFileEx", "GetFileSizeEx", "SetFilePointerEx", "WriteFile", "SetEndOfFile", "SetFilePointer", "GetFileSize", NULL }; k_ = 1; for (int q = 0; io_names[q]; q++) if (!strcmp(nn, io_names[q])) k_ = 2; iocls[idx] = k_; } if (k_ == 2) io_fail_note(t->name, (uint32_t)c->r[0]); } continue; }
       c->r[0] = t->fn(c);
@@ -401,7 +404,10 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
     while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
     if (k >= 0) { rcache[rh].pc = pc; rcache[rh].k = k + 1; }
     if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
-    aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc; { WdThread *w = wd_self(); w->pc = pc; w->n++; w->cpu = c; }
+#ifndef AOT_RELEASE
+    aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc;   /* shared ring: written on every region transition */
+#endif
+    { WdThread *w = wd_self(); w->pc = pc; w->n++; w->cpu = c; }
     uint64_t np = aot_region_fn[k](c, pc);
     if (np == pc) {   /* regions overlap: the binary search may land on one that does not enter at pc, so try every region covering pc */
       for (int m = 0; m < aot_nregions && np == pc; m++) if (m != k && pc >= aot_region_lo[m] && pc < aot_region_hi[m]) np = aot_region_fn[m](c, pc);
