@@ -70,19 +70,21 @@ static SLEngineItf engine;
 static SLObjectItf output_mix_object;
 
 /* ---- DirectSound output: the DS buffers the x86 DSOUND shim keeps in guest memory are mixed here and
-   handed to OpenSLES, so IDirectSoundBuffer8::Play is actually audible. One player at the format of the
-   first buffer that plays; sources with any other format are left silent rather than resampled, and the
-   first such mismatch is reported once. ---- */
+   handed to OpenSLES, so IDirectSoundBuffer8::Play is actually audible. The output is fixed at 44100 Hz
+   stereo and every source is resampled to it: the game's music and effects are 44.1 kHz stereo while its
+   dialogue voices are 22.05 kHz mono, and refusing the mismatched format used to drop every spoken line. ---- */
 static int audio_engine_init(void);
 #define AOT_DS_SRC 64
 #define AOT_DS_FRAMES 1024
 #define AOT_DS_QSZ 4
 #define AOT_DS_FADE 128
+#define AOT_DS_OUT_HZ 44100   /* fixed output format: sources at any rate/channels are resampled into it */
 /* Volume, pan and 3D distance are applied per source: a crowded street mixes dozens of voices and summing
    them all at full scale clipped, which is what the constant crackle was. A voice also fades in and out
    over ~3 ms, because starting or ending one on a non-zero sample clicks and the game does that constantly. */
 typedef struct {
-  void *key; const uint8_t *data; uint32_t size, pos; int looping, playing, ch;
+  void *key; const uint8_t *data; uint32_t size, pos, frac; int looping, playing, ch;
+  uint32_t rate, step;               /* source rate and source frames per output frame in 16.16 */
   int32_t fadev, fstep;              /* 0..256 gain ramp; fstep < 0 while fading out, 0 when steady */
   float gain, pan;                   /* SetVolume (centibels) and SetPan (-1..1) */
   int32_t pgl, pgr; int ginit;       /* gains at the end of the previous buffer: ramped to the new ones so a volume/pan/3D change is not a step (a step is a click) */
@@ -91,7 +93,7 @@ typedef struct {
 static DsSrc ds_src[AOT_DS_SRC];
 static pthread_mutex_t ds_mu = PTHREAD_MUTEX_INITIALIZER;
 static SLObjectItf ds_obj; static SLPlayItf ds_play; static SLAndroidSimpleBufferQueueItf ds_queue;
-static int ds_freq = 44100, ds_ch = 2, ds_warned;
+static int ds_freq = 44100, ds_ch = 2, ds_bits_warned;
 static int16_t ds_mix[AOT_DS_FRAMES * 2];
 static int16_t ds_out[AOT_DS_QSZ][AOT_DS_FRAMES * 2];
 static int ds_flip;
@@ -133,7 +135,7 @@ static void ds_gains(DsSrc *s, int32_t *gl, int32_t *gr) {   /* 8.8 fixed point 
   *gl = (int32_t)(l * 256.0f); *gr = (int32_t)(r * 256.0f);
 }
 
-static void ds_feed(void) {   /* 16-bit stereo at ds_freq: every source at its own gain, then saturate */
+static void ds_feed(void) {   /* 16-bit stereo at ds_freq; every source resampled to that rate, summed, saturated */
   static int32_t acc[AOT_DS_FRAMES * 2];
   memset(acc, 0, sizeof acc);
   for (int i = 0; i < AOT_DS_SRC; i++) {
@@ -145,15 +147,23 @@ static void ds_feed(void) {   /* 16-bit stereo at ds_freq: every source at its o
     int32_t gl, gr; ds_gains(s, &gl, &gr);
     if (!s->ginit) { s->pgl = gl; s->pgr = gr; s->ginit = 1; }
     int32_t gl0 = s->pgl, gr0 = s->pgr;
+    uint32_t step = s->step ? s->step : 65536;
     for (int k = 0; k < AOT_DS_FRAMES; k++) {
       if (s->pos + frame > sz) {
         if (!s->looping) { s->key = NULL; break; }   /* nothing audible left: free the slot right away */
-        s->pos = 0;
+        s->pos = 0; s->frac = 0;
       }
       const uint8_t *p = s->data + s->pos;
       int32_t l = (int16_t)(uint16_t)(p[0] | (p[1] << 8));
       int32_t r = ch == 2 ? (int16_t)(uint16_t)(p[2] | (p[3] << 8)) : l;   /* mono duplicated into both ears */
-      s->pos += frame;
+      if (s->frac) {   /* linear interpolation towards the next frame: the source rate is not the output rate */
+        const uint8_t *q = s->pos + 2 * frame <= sz ? p + frame : p;
+        int32_t l1 = (int16_t)(uint16_t)(q[0] | (q[1] << 8));
+        int32_t r1 = ch == 2 ? (int16_t)(uint16_t)(q[2] | (q[3] << 8)) : l1;
+        l += ((l1 - l) * (int32_t)s->frac) >> 16; r += ((r1 - r) * (int32_t)s->frac) >> 16;
+      }
+      s->frac += step;
+      while (s->frac >= 65536) { s->frac -= 65536; s->pos += frame; }
       if (s->fstep) {
         s->fadev += s->fstep;
         if (s->fadev < 0) s->fadev = 0; else if (s->fadev > 256) { s->fadev = 256; s->fstep = 0; }
@@ -207,13 +217,14 @@ bad:
   return -1;
 }
 void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int channels, int bits, int looping) {
-  if (!key || !data || size < 4 || bits != 16) return NULL;
-  pthread_mutex_lock(&ds_mu);
-  if (ds_open((int)freq, channels) != 0) { pthread_mutex_unlock(&ds_mu); return NULL; }
-  if ((int)freq != ds_freq || (channels == 1 ? 1 : 2) != ds_ch) {
-    if (!ds_warned++) fprintf(stderr, "[audio] DirectSound buffer at %u Hz %d ch is not mixed (output is %d Hz %d ch)\n", freq, channels, ds_freq, ds_ch);
-    pthread_mutex_unlock(&ds_mu); return NULL;
+  if (!key || !data || size < 4) return NULL;
+  if (bits != 16) {   /* the mixer reads 16-bit PCM: say so instead of going quiet */
+    if (!ds_bits_warned++) fprintf(stderr, "[audio] DirectSound buffer with %d-bit samples is not mixed (16-bit only)\n", bits);
+    return NULL;
   }
+  pthread_mutex_lock(&ds_mu);
+  if (ds_open(AOT_DS_OUT_HZ, 2) != 0) { pthread_mutex_unlock(&ds_mu); return NULL; }
+  if (!freq) freq = (uint32_t)ds_freq;
   DsSrc *s = ds_find(key);
   int fresh = 0;
   if (!s) {
@@ -224,10 +235,12 @@ void *aot_ds_play(void *key, const void *data, uint32_t size, uint32_t freq, int
     memset(s, 0, sizeof *s); s->key = key; s->gain = 1.0f; fresh = 1;
   }
   s->data = data; s->size = size; s->ch = channels == 1 ? 1 : 2; s->looping = looping; s->playing = 1;
+  s->rate = freq; s->step = freq == (uint32_t)ds_freq ? 65536 : (uint32_t)(((uint64_t)freq << 16) / (uint32_t)ds_freq);
+  if (!s->step) s->step = 65536;
   if (s->fstep < 0) s->fstep = 256 / AOT_DS_FADE;   /* Play on a voice still fading out: bring it back */
   else if (!s->fstep) s->fadev = 256;
   /* A buffer the game calls Play on every frame must keep playing where it is, not restart from the top. */
-  if (fresh) { s->pos = 0; s->fadev = 0; s->fstep = 256 / AOT_DS_FADE; }
+  if (fresh) { s->pos = 0; s->frac = 0; s->fadev = 0; s->fstep = 256 / AOT_DS_FADE; }
   pthread_mutex_unlock(&ds_mu);
   return s;
 }
@@ -254,7 +267,7 @@ void aot_ds_seek(void *key, uint32_t pos) {   /* SetCurrentPosition: jump, faded
   if (!key) return;
   pthread_mutex_lock(&ds_mu);
   DsSrc *s = ds_find(key);
-  if (s) { uint32_t frame = (uint32_t)((s->ch == 1 ? 2 : 4)); s->pos = pos < s->size ? pos - pos % frame : 0; s->fadev = 0; s->fstep = 256 / AOT_DS_FADE; }
+  if (s) { uint32_t frame = (uint32_t)((s->ch == 1 ? 2 : 4)); s->pos = pos < s->size ? pos - pos % frame : 0; s->frac = 0; s->fadev = 0; s->fstep = 256 / AOT_DS_FADE; }
   pthread_mutex_unlock(&ds_mu);
 }
 void aot_ds_setvol(void *key, int32_t cb, int32_t pan) {   /* SetVolume / SetPan */
