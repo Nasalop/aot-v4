@@ -6,10 +6,10 @@ add_link_options(-Wl,-Bsymbolic-functions)
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../../..)
 set(RT ${ROOT}/src/runtime)
 set(GLUE ${ANDROID_NDK}/sources/android/native_app_glue)
-# Native (not emulated) TLS: emulated TLS turns every __thread read into a call into __emutls_get_address, and
-# the runtime reads TLS on hot paths (watchdog slot, guest entry depth). initial-exec is valid here because the
-# library is loaded at start-up, and reduces a read to one thread-pointer-relative load.
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -fno-strict-aliasing -fwrapv -fno-emulated-tls -ftls-model=initial-exec")
+# minSdk 29 already gives native ELF TLS (no emulated __emutls_get_address). Do NOT force -ftls-model=initial-exec here: this
+# library is loaded with dlopen by NativeActivity/System.loadLibrary after the process started, and Android's linker cannot give
+# a dlopen'ed library static TLS, so the library fails to load and the app dies before its first screen.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -fno-strict-aliasing -fwrapv")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT DEFINED AOT_MODE)
@@ -57,7 +57,6 @@ else()
   set_source_files_properties(${GEN} PROPERTIES COMPILE_FLAGS "-O2 -fwrapv -fno-strict-aliasing")   # same flags the release.yml shards use for these files
   add_library(aotgame SHARED android_main.c ${GLUE}/android_native_app_glue.c ${RT}/runtime.c ${RT}/win_resolver.c ${RT}/shims.c ${RT}/win_compat.c ${RT}/win_file.c ${RT}/win_file_async.c ${RT}/win_audio.c ${RT}/win_d3d10.c ${RT}/win_sys.c ${RT}/win_x86.c ${RT}/win_x86_dll.c ${RT}/win_input.c ${RT}/win_gfx.c ${RT}/dxvk_proxy.c ${RT}/hlsl_compile.c ${RT}/gfx_backend.c ${RT}/gfx_draw_batch.c ${GEN})
   target_sources(aotgame PRIVATE ${RT}/aot_prof.c)   # sampling profiler (compiles to nothing with -DAOT_RELEASE)
-  add_library(aotreserve SHARED ${RT}/aot_reserve.c)   # LD_PRELOADed by wrap.sh to reserve the PE32 image range before ART starts
   target_include_directories(aotgame PRIVATE ${RT} ${GLUE} ${RT}/../../third_party/vkd3d/include)
   target_compile_definitions(aotgame PRIVATE AOT_ANDROID_APP=1)
   target_link_options(aotgame PRIVATE -Wl,-u,ANativeActivity_onCreate)
