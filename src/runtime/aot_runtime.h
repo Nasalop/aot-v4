@@ -142,6 +142,25 @@ extern const int aot_is_pe32;   /* 1 when the recompiled image is a 32-bit PE32 
   c->r[8] = r8; c->r[9] = r9; c->r[10] = r10; c->r[11] = r11; c->r[12] = r12; c->r[13] = r13; c->r[14] = r14; c->r[15] = r15; \
   c->cf = cf; c->zf = zf; c->sf = sf; c->of = of; c->pf = pf; } while (0)
 #define EXIT(a) do { SAVES(); return (a); } while (0)
+/* Cross-region transfers. A region that leaves through a direct call/jump/fall-through (JMPREG) or a return/indirect target it does not contain
+   (AOT_TAILDISP) tail-calls the next region instead of returning to run(): no region lookup and no per-dispatch bookkeeping in the dispatcher loop, and
+   the host stack stays flat because the call is a guaranteed tail call. Imports/thunks and unknown addresses still come back to run() as the return value.
+   Build with -DAOT_NO_TAIL (or a compiler without musttail) to get the old EXIT() behaviour everywhere. */
+#if !defined(AOT_NO_TAIL) && defined(__clang__) && defined(__has_attribute)
+#if __has_attribute(musttail)
+#define AOT_HAVE_TAIL 1
+#endif
+#endif
+#ifdef AOT_HAVE_TAIL
+#define AOT_MUSTTAIL __attribute__((musttail))
+uint64_t aot_tail(CPU *c, uint64_t pc);
+#define JMPREG(k, a) do { SAVES(); AOT_MUSTTAIL return region_##k(c, (a)); } while (0)
+#define AOT_TAILDISP(p, p0) do { if ((p) == (p0)) EXIT(p); SAVES(); AOT_MUSTTAIL return aot_tail(c, (p)); } while (0)
+#else
+#define AOT_MUSTTAIL
+#define JMPREG(k, a) EXIT(a)
+#define AOT_TAILDISP(p, p0) EXIT(p)
+#endif
 
 static inline int64_t aot_d2i(double v, int bits) {   /* x86 cvtt: "integer indefinite" on overflow/NaN */
   if (v != v) return bits == 64 ? INT64_MIN : INT32_MIN;
