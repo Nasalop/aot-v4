@@ -425,7 +425,8 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
       Thunk *t = &thunks[idx]; { w->imp[w->in++ % 12] = idx; }
 #ifndef AOT_RELEASE
       recent[recent_n++ % 32] = idx;   /* diagnostic rings are shared globals: keep them out of release builds */
-#endif { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
+#endif
+      { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
       if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
       if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); { static int8_t iocls[MAXTHUNK]; int8_t k_ = iocls[idx]; if (!k_) { const char *dt = strchr(t->name, '!'); const char *nn = dt ? dt + 1 : t->name; static const char *const io_names[] = { "ReadFile", "GetOverlappedResult", "LockFileEx", "UnlockFileEx", "GetFileSizeEx", "SetFilePointerEx", "WriteFile", "SetEndOfFile", "SetFilePointer", "GetFileSize", NULL }; k_ = 1; for (int q = 0; io_names[q]; q++) if (!strcmp(nn, io_names[q])) k_ = 2; iocls[idx] = k_; } if (k_ == 2) io_fail_note(t->name, (uint32_t)c->r[0]); } continue; }
       c->r[0] = t->fn(c);
