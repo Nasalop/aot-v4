@@ -20,7 +20,7 @@ static Thunk thunks[MAXTHUNK]; static int nthunks = 2;
 static uint64_t g_stack_top;
 const char *g_exe_path; char g_cmdline[1024] = "game.exe";
 uint64_t g_image_base;
-__thread uint64_t aot_last_pc;
+uint64_t aot_last_pc;   /* last address entered by aot_tail: crash reports only, so a plain global and not TLS */
 uint64_t g_peb_addr, g_tls_s0; size_t g_tls_n, g_tls_total;
 __attribute__((weak)) const uint64_t aot_image_hash = 0;
 
@@ -385,17 +385,27 @@ void aot_heap_crash_dump(void) {
 
 /* Cross-region tail dispatch (JMPREG / AOT_TAILDISP in aot_runtime.h). Anything that is not a plain translated entry (import thunks, the return
    thunk, unknown addresses, a region that does not enter at pc) is handed back to run() as the return value, exactly like EXIT(pc). */
-static __thread struct { uint64_t pc; int k; } rcache[4096];
+/* pc -> region index for indirect branches. One 64-bit word per slot, shared by every thread (they all run the
+   same code), holding (pc << 32) | (region + 1): a hit is a single relaxed load and a miss costs one relaxed
+   store, with no TLS lookup, no lock and no allocation. Emulated TLS made the old per-thread cache a function
+   call on every indirect branch, which showed up as ~7% of CPU in the profile. */
+#define TAILMAP_N 4096
+static uint64_t tailmap[TAILMAP_N];
+static int region_lookup(uint64_t pc) {   /* pc -> region index, or -1; the one path both aot_tail and run() use */
+  uint32_t p32 = (uint32_t)pc;
+  uint64_t *slot = &tailmap[((p32 * 0x9E3779B1u) >> 20) & (TAILMAP_N - 1)];
+  uint64_t e = __atomic_load_n(slot, __ATOMIC_RELAXED);
+  int k = (int)(uint32_t)e - 1;
+  if ((uint32_t)(e >> 32) == p32 && k >= 0 && k < aot_nregions) return k;
+  int lo = 0, hi = aot_nregions - 1; k = -1;
+  while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
+  if (k >= 0) __atomic_store_n(slot, ((uint64_t)p32 << 32) | (uint64_t)(unsigned)(k + 1), __ATOMIC_RELAXED);
+  return k;
+}
 uint64_t aot_tail(CPU *c, uint64_t pc) {
   if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) return pc;
-  unsigned rh = (unsigned)((pc * 0x9E3779B1u) >> 8) & 4095; int k = -1;
-  if (rcache[rh].pc == pc && rcache[rh].k > 0) k = rcache[rh].k - 1;
-  else {
-    int lo = 0, hi = aot_nregions - 1;
-    while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
-    if (k < 0) return pc;
-    rcache[rh].pc = pc; rcache[rh].k = k + 1;
-  }
+  int k = region_lookup(pc);
+  if (k < 0) return pc;
   aot_last_pc = pc;
   AOT_MUSTTAIL return aot_region_fn[k](c, pc);
 }
@@ -406,12 +416,13 @@ static __thread int aot_guest_depth;   /* > 0 when a shim re-entered the guest (
 
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
   CPU *prev_cpu = cur_cpu; cur_cpu = c; int _outer = (aot_guest_depth++ == 0);
+  WdThread *w = wd_self();   /* a thread's watchdog slot never changes: resolve it once, not on every transition */
   for (;;) {
     if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
       if (idx == EXIT_IDX) { fflush(stdout); exit((int)c->r[0]); }
       if (idx == RET_IDX) { aot_guest_depth--; cur_cpu = prev_cpu; return c->r[0]; }
-      Thunk *t = &thunks[idx]; { WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx; }
+      Thunk *t = &thunks[idx]; { w->imp[w->in++ % 12] = idx; }
 #ifndef AOT_RELEASE
       recent[recent_n++ % 32] = idx;   /* diagnostic rings are shared globals: keep them out of release builds */
 #endif { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
@@ -420,15 +431,12 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
       c->r[0] = t->fn(c);
       pc = LD(uint64_t, c->r[4]); c->r[4] += 8; continue;
     }
-    unsigned rh = (unsigned)((pc * 0x9E3779B1u) >> 8) & 4095; int lo = 0, hi = aot_nregions - 1, k = -1;
-    if (rcache[rh].pc == pc && rcache[rh].k > 0) k = rcache[rh].k - 1; else
-    while (lo <= hi) { int m = (lo + hi) / 2; if (pc < aot_region_lo[m]) hi = m - 1; else if (pc >= aot_region_hi[m]) lo = m + 1; else { k = m; break; } }
-    if (k >= 0) { rcache[rh].pc = pc; rcache[rh].k = k + 1; }
+    int k = region_lookup(pc);
     if (k < 0) { fflush(stdout); fprintf(stderr, "\n[aot] jump to untranslated address 0x%llx (indirect target not discovered, or non-code)\n", (unsigned long long)pc); dump_context(c); exit(73); }
 #ifndef AOT_RELEASE
     aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc;   /* shared ring: written on every region transition */
 #endif
-    { WdThread *w = wd_self(); w->pc = pc; w->n++; w->cpu = c; }
+    { w->pc = pc; w->n++; w->cpu = c; }
     uint64_t _pt0 = aot_perf_ticks();
     uint64_t np = aot_region_fn[k](c, pc);
     if (_outer) aot_perf_guest += aot_perf_ticks() - _pt0;   /* includes any proxy work nested inside the guest code */

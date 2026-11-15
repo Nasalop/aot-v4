@@ -26,7 +26,7 @@ extern const char *g_exe_path; extern char g_cmdline[]; extern uint64_t g_image_
 extern __thread uint32_t aot_last_error;
 extern const ShimEnt aot_shim_table_sys[];
 extern const ShimEnt aot_shim_table_input[];
-extern __thread uint64_t aot_last_pc;
+extern uint64_t aot_last_pc;   /* last address entered through aot_tail: crash reports only, not per-thread state */
 extern uint64_t g_peb_addr;
 uint64_t aot_thread_run(uint64_t fn, uint64_t param, size_t ssz, uint32_t tid);
 void aot_sys_init(void);
