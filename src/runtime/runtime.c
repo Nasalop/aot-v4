@@ -396,7 +396,7 @@ int aot_keep(const char *fmt) {
   const char *s = fmt; int nl = 0; if (*s == '\n') { s++; nl = 1; }
   static const char *const keep[] = { "[aot]", "[cpu]", "[gfx]", "[hlsl]", "[winfile]", "[d3d10] Create", "[dxvk] tier", "[dxvk] using", "[dxvk] no DXVK",
     "[dxvk] out of", "[dxvk] missing", "[dxvk] Create", "[dxvk] Enum", "[dxvk] D3D10", "[dxvk] host", "[dxvk] no Android", "[dxvk] %s::%s", "[dxvk] guest", "[audio]",
-    "cannot", "mappings", "executable", "image base", "entry point", "usage", "[heap]", "[in] GetDevice", NULL };
+    "cannot", "mappings", "executable", "image base", "entry point", "usage", "[heap]", "[in] GetDevice", "[ev]", "  T", "    hot T", "    regs T", NULL };
   int ok = 0; for (int i = 0; keep[i]; i++) if (!strncmp(s, keep[i], strlen(keep[i]))) { ok = 1; break; }
   if (!ok) return 0;
   if (nl && !strncmp(s, "[aot]", 5)) { aot_log_all = 1; return 1; }
@@ -540,9 +540,9 @@ static uint64_t g_other[2];
    a thread that was never named reports the process name, so DXVK's unnamed workers would look like guest threads and
    be pushed onto the one core the guest is supposed to have to itself. */
 static volatile int g_gtid[64]; static volatile int g_gn;
-/* AOT_PIN=main: only the main guest thread is kept on the reserved core and the game's own secondary threads are spread
-   like the rest. The default keeps every guest thread there, which is what the x86 total-store-order emulation needs; use
-   the knob when the game's worker threads are heavy enough to starve the main one on a single core. */
+/* Default: only the main guest thread is kept on the reserved core and the game's own secondary threads are spread like the
+   rest. Running EVERY guest thread on one core (AOT_PIN=all) made the game's start-up loading (several worker threads plus
+   the main thread, all busy) crawl or stall on that one core, with the screen black for the whole load. */
 static int g_main_only;
 static void guest_tid_add(void) {
   int tid = (int)syscall(SYS_gettid), n = g_gn;
@@ -568,7 +568,7 @@ static void aot_cpu_init(void) {
   uint64_t m[2] = { 0, 0 };
   for (int i = 0; i < (int)n; i++) if (i != g_pin_cpu) m[i / 64] |= 1ull << (i % 64);
   g_other[0] = m[0]; g_other[1] = m[1];
-  const char *pin = getenv("AOT_PIN"); g_main_only = pin && !strcmp(pin, "main");
+  const char *pin = getenv("AOT_CPU_PIN"); g_main_only = !(pin && !strcmp(pin, "all"));   /* default: only the main guest thread owns the fast core; AOT_PIN=all puts every guest thread there */
   fprintf(stderr, "[cpu] %ld cpus online; fastest is cpu%d%s; %s on it, everything else kept off it\n",
           n, g_pin_cpu, bf > 0 ? " (highest cpufreq)" : " (no cpufreq table)",
           g_main_only ? "the main guest thread" : "guest threads");
@@ -596,8 +596,10 @@ static void *cpu_watcher(void *arg) {
   return NULL;
 }
 static void aot_pin_guest_thread(void) {
-  const char *pin = getenv("AOT_PIN");
-  if (pin && pin[0] == '0') return;   /* AOT_PIN=0: leave placement to the scheduler */
+  /* OFF by default. Pinning the game to one core is opt-in (AOT_CPU_PIN=main or =all): with it on, the game's start-up loading (several busy threads) crawled
+     on one core and the screen stayed black. The scheduler places the threads unless this variable is set. */
+  const char *pin = getenv("AOT_CPU_PIN");
+  if (!pin || pin[0] == '0') return;
   aot_cpu_init();
   static int started;
   if (!__atomic_exchange_n(&started, 1, __ATOMIC_RELAXED)) {
