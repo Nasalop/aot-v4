@@ -70,6 +70,7 @@ static void *game_thread(void *arg) {
   snprintf(lg, sizeof lg, "%s/aot_log.txt", gd);   /* log goes into the game folder so it can be opened from any file manager */
   { int fd2 = open(lg, O_WRONLY | O_CREAT | O_TRUNC, 0666); if (fd2 < 0) { snprintf(lg, sizeof lg, "%s/log.txt", ext); fd2 = open(lg, O_WRONLY | O_CREAT | O_APPEND, 0666); } if (fd2 >= 0) { dup2(fd2, 1); dup2(fd2, 2); } }
   chdir(gd); LOG("starting %s with game data in %s (log: %s)", exe, gd, lg);
+  dprintf(2, "[boot] game folder %s, log %s: entering the runtime\n", gd, lg);   /* dprintf is not silenced in release builds */
   char *av[] = { "aotgame", exe, NULL };
   int rc = aot_main(2, av);
   dprintf(2, "\n[aot] game returned %d\n", rc); LOG("game returned %d", rc);
