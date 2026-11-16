@@ -153,27 +153,16 @@ SYS(PostThreadMessage) { post(0, (uint32_t)A(1), A(2), A(3)); return 1; }
 SYS(GetAsyncKeyState) { uint32_t k = (uint32_t)A(0) & 0xff; return keys[k] ? 0x8000 : 0; }
 SYS(GetKeyState) { uint32_t k = (uint32_t)A(0) & 0xff; return keys[k] ? 0x8000 : 0; }
 SYS(GetKeyboardState) { uint8_t *o = (uint8_t *)(uintptr_t)A(0); for (int i = 0; i < 256; i++) o[i] = keys[i] ? 0x80 : 0; return 1; }
-/* Mouse look. AC1 recentres the cursor with SetCursorPos every frame and reads GetCursorPos as a look offset,
-   so a touch has to arrive as a delta and not as a position: mapping the finger onto absolute coordinates
-   makes the offset its distance from the centre, which keeps turning the view while the finger is held still
-   and snaps the view back when it lifts.
-   After the game first warps the cursor (pointer lock), the touch's travel is accumulated and handed over as
-   an offset from the point the game chose, and GetCursorPos consumes it: the offset is returned once and the
-   cursor drops back to that point, so every event turns the view exactly once, a finger held still turns it
-   no further, and lifting leaves nothing behind to snap the next gesture. A gesture starts and ends on its
-   own (kinds 5 and 6) so the jump from where the last swipe ended to where the next one begins is never
-   reported as motion. Until the game warps (menus, front end) the absolute mapping stays as it was, and a
-   drag is never a click: presses come only from the on-screen buttons and from a pad. */
-#define AOT_LOOK_GAIN 1.5f   /* finger travel -> look travel; 1.0 = the view follows the finger exactly */
-#define AOT_LOOK_STEP 600    /* largest motion one event may carry, so a re-seated finger cannot spin the view */
-static int mx_anchor_x, mx_anchor_y, look_dx, look_dy, mx_warp;
-SYS(GetCursorPos) {
-  if (A(0)) { ST(int32_t, A(0), mx); ST(int32_t, A(0) + 4, my); }
-  if (mx_warp) { look_dx = look_dy = 0; mx = mx_anchor_x; my = mx_anchor_y; }   /* the game has read the offset: nothing is left pending */
-  return 1;
-}
-static int mx_last, my_last, mx_seen;
-SYS(SetCursorPos) { mx_anchor_x = mx = (int32_t)A(0); mx_anchor_y = my = (int32_t)A(1); mx_warp = 1; look_dx = look_dy = 0; return 1; }
+SYS(GetCursorPos) { if (A(0)) { ST(int32_t, A(0), mx); ST(int32_t, A(0) + 4, my); } return 1; }
+/* Mouse look. AC1 recentres the cursor with SetCursorPos every frame and then reads GetCursorPos as a
+   look offset, so mapping a touch straight onto absolute coordinates makes that offset equal the
+   finger's distance from the centre: the view keeps turning at a fixed rate while the finger is held
+   still and snaps back when it lifts. After the first warp, report the finger's delta from the
+   anchored cursor instead, so the recentre stays put and dragging turns the view. Presses and
+   releases never count as motion, and until the game warps (menus, front end) the absolute mapping
+   stays exactly as before. */
+static int mx_last, my_last, mx_seen, mx_warp;
+SYS(SetCursorPos) { mx = (int32_t)A(0); my = (int32_t)A(1); mx_warp = 1; return 1; }
 SYS(ScreenToClient) { return 1; }
 SYS(one) { return 1; }
 SYS(zero) { return 0; }
@@ -187,32 +176,18 @@ void aot_input_view(uint32_t w, uint32_t h) {
   static int logged; view_w = w ? w : 1; view_h = h ? h : 1; view_known = (w && h) != 0;
   if (view_known && !logged++) fprintf(stderr, "[in] surface size %ux%u (touch coordinates are scaled into the client area)\n", w, h);
 }
-void aot_input_mouse(int kind, float x, float y) {   /* kind: 0 move, 1 left down, 2 left up, 3 right down, 4 right up, 5 gesture start, 6 gesture end */
-  if (kind < 0 || kind > 6) { fprintf(stderr, "[in] mouse: rejected event kind %d\n", kind); return; }
+void aot_input_mouse(int kind, float x, float y) {   /* kind: 0 move, 1 left down, 2 left up, 3 right down, 4 right up */
+  if (kind < 0 || kind > 4) { fprintf(stderr, "[in] mouse: rejected event kind %d\n", kind); return; }
   uint32_t cw, ch; aot_win_client_size(&cw, &ch);
   /* Without a reported surface size the incoming coordinates are already surface pixels; scaling them
      by client/1 put every tap thousands of pixels off-screen, so a press that should hit a button missed. */
   int px = view_known ? (int32_t)(x * (float)cw / (float)view_w) : (int32_t)x;
   int py = view_known ? (int32_t)(y * (float)ch / (float)view_h) : (int32_t)y;
-  if (kind == 6) {   /* gesture over: no look offset survives it, and the cursor stays where the game put it */
-    look_dx = look_dy = 0;
-    if (mx_warp) { mx = mx_anchor_x; my = mx_anchor_y; }   /* before the first warp the absolute position is the game's cursor: leave it */
-    return;
-  }
   if (!mx_seen) { mx_seen = 1; mx_last = px; my_last = py; }
-  if (mx_warp) {
-    if (kind == 0) {   /* pointer lock: travel only, measured from where the game last put the cursor */
-      int dx = (int)((px - mx_last) * AOT_LOOK_GAIN), dy = (int)((py - my_last) * AOT_LOOK_GAIN);
-      if (dx > AOT_LOOK_STEP) dx = AOT_LOOK_STEP; else if (dx < -AOT_LOOK_STEP) dx = -AOT_LOOK_STEP;
-      if (dy > AOT_LOOK_STEP) dy = AOT_LOOK_STEP; else if (dy < -AOT_LOOK_STEP) dy = -AOT_LOOK_STEP;
-      look_dx += dx; look_dy += dy;
-      mx = mx_anchor_x + look_dx; my = mx_anchor_y + look_dy;
-    }
-  }
+  if (mx_warp) { if (kind == 0) { mx += px - mx_last; my += py - my_last; } }   /* pointer lock: motion only, position anchored where the game put it */
   else { mx = px; my = py; }
   mx_last = px; my_last = py;
   uint64_t lp = (uint64_t)(uint16_t)mx | ((uint64_t)(uint16_t)my << 16), wp = (keys[1] ? 1 : 0) | (keys[2] ? 2 : 0);
-  if (kind == 5) { mx_last = px; my_last = py; return; }   /* a gesture begins where the finger lands: not motion */
   static const uint32_t mm[] = { WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP };
   if (kind == 1) { keys[1] = 1; wp |= 1; } else if (kind == 2) { keys[1] = 0; wp &= ~1ull; } else if (kind == 3) { keys[2] = 1; wp |= 2; } else if (kind == 4) { keys[2] = 0; wp &= ~2ull; }
   post(HWND_BASE, mm[kind], wp, lp);
