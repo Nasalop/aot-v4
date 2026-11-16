@@ -500,18 +500,95 @@ uint64_t aot_call(CPU *c, uint64_t fn, int nargs, ...) {
 /* x86 guests rely on total store order; ARM reorders plain loads/stores between cores, so lock-free hand-offs in the game
    (job flags, refcounts, lock-free queues) can see stale data and corrupt its allocator.  Running every guest thread on ONE core
    gives the same ordering guarantees a single-core x86 has, and thread switches are full barriers.  AOT_NOPIN=1 disables it. */
+#include <dirent.h>
+#include <time.h>
+/* ---- CPU placement ---------------------------------------------------------------------------------------
+   The fastest core in the chip is found from the cpufreq tables (highest max frequency among the online CPUs;
+   no assumption about how many clusters a phone has), the guest runs there, and every other thread of the
+   process is kept off it: DXVK's submission/compute threads, the audio mixer, the file IO workers, the watchdog
+   and the profiler. Guest threads still share that one core with each other, which is what the x86 total-store-
+   order emulation above needs, and the other cores stay free for everything else.
+   The placement is redone by a watcher thread rather than left to inheritance: DXVK creates its threads lazily
+   and would otherwise inherit the guest's single-core mask from whoever called into it. A mask is only written
+   when it actually differs, so this does not migrate threads that are already in the right place.
+   AOT_PIN=0 turns all of it off; AOT_PIN=1 (or unset) leaves it on. */
 static int g_pin_cpu = -2;
+static uint64_t g_other[2];
+/* Which threads are guest threads, recorded where a guest thread starts. Matching on the thread name would be wrong:
+   a thread that was never named reports the process name, so DXVK's unnamed workers would look like guest threads and
+   be pushed onto the one core the guest is supposed to have to itself. */
+static volatile int g_gtid[64]; static volatile int g_gn;
+/* AOT_PIN=main: only the main guest thread is kept on the reserved core and the game's own secondary threads are spread
+   like the rest. The default keeps every guest thread there, which is what the x86 total-store-order emulation needs; use
+   the knob when the game's worker threads are heavy enough to starve the main one on a single core. */
+static int g_main_only;
+static void guest_tid_add(void) {
+  int tid = (int)syscall(SYS_gettid), n = g_gn;
+  for (int i = 0; i < n && i < 64; i++) if (g_gtid[i] == tid) return;
+  int i = __atomic_fetch_add(&g_gn, 1, __ATOMIC_RELAXED); if (i < 64) g_gtid[i] = tid;
+}
+static int guest_tid_is(int tid) { int n = g_gn; for (int i = 0; i < n && i < 64; i++) if (g_gtid[i] == tid) return 1; return 0; }
+static long cpu_max_freq(int i) {
+  char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+  FILE *f = fopen(p, "r"); if (!f) return -1; long v = -1; if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); return v;
+}
+static int cpu_online(int i) {
+  char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/online", i);
+  FILE *f = fopen(p, "r"); if (!f) return 1;   /* cpu0 usually has no online file and is always up */
+  int v = 1; if (fscanf(f, "%d", &v) != 1) v = 1; fclose(f); return v != 0;
+}
+static void aot_cpu_init(void) {
+  if (g_pin_cpu != -2) return;
+  long n = sysconf(_SC_NPROCESSORS_ONLN); if (n < 1) n = 1; if (n > 64) n = 64;
+  int best = -1; long bf = -1;
+  for (int i = 0; i < (int)n; i++) { long f = cpu_max_freq(i); if (f > bf && cpu_online(i)) { bf = f; best = i; } }
+  g_pin_cpu = best >= 0 ? best : (int)n - 1;   /* no cpufreq tables: assume the last core is the big one */
+  uint64_t m[2] = { 0, 0 };
+  for (int i = 0; i < (int)n; i++) if (i != g_pin_cpu) m[i / 64] |= 1ull << (i % 64);
+  g_other[0] = m[0]; g_other[1] = m[1];
+  const char *pin = getenv("AOT_PIN"); g_main_only = pin && !strcmp(pin, "main");
+  fprintf(stderr, "[cpu] %ld cpus online; fastest is cpu%d%s; %s on it, everything else kept off it\n",
+          n, g_pin_cpu, bf > 0 ? " (highest cpufreq)" : " (no cpufreq table)",
+          g_main_only ? "the main guest thread" : "guest threads");
+}
+static void *cpu_watcher(void *arg) {
+  (void)arg;
+  for (int round = 0; round < 600; round++) {   /* for the first ten minutes, once a second: cheap, and threads appear over time */
+    struct timespec ts = { 1, 0 }; nanosleep(&ts, NULL);
+    DIR *d = opendir("/proc/self/task"); if (!d) continue;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+      if (e->d_name[0] == '.') continue;
+      int tid = atoi(e->d_name); if (tid <= 0) continue;
+      uint64_t want[2];
+      int on_fast = guest_tid_is(tid) && (!g_main_only || tid == (int)g_gtid[0]);   /* the main guest thread, and by default its siblings too */
+      if (on_fast) { want[0] = g_pin_cpu < 64 ? 1ull << g_pin_cpu : 0; want[1] = 0; }
+      else { want[0] = g_other[0]; want[1] = g_other[1]; }
+      uint64_t have[2] = { 0, 0 };
+      if (syscall(SYS_sched_getaffinity, tid, sizeof have, have) != 0) continue;
+      if (have[0] == want[0] && have[1] == want[1]) continue;   /* already placed: no migration, no resched IPI */
+      syscall(SYS_sched_setaffinity, tid, sizeof want, want);
+    }
+    closedir(d);
+  }
+  return NULL;
+}
 static void aot_pin_guest_thread(void) {
-  if (!getenv("AOT_PIN")) return;   /* off by default: pinning did not change the crash */
-  if (g_pin_cpu == -2) {
-    int best = -1; long bf = -1;
-    for (int i = 0; i < 16; i++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
-      FILE *f = fopen(p, "r"); if (!f) continue; long v = 0; if (fscanf(f, "%ld", &v) == 1 && v > bf) { bf = v; best = i; } fclose(f); }
-    g_pin_cpu = best >= 0 ? best : 7;
-    fprintf(stderr, "[aot] guest threads pinned to cpu %d (single-core ordering, x86 TSO emulation)\n", g_pin_cpu);
+  const char *pin = getenv("AOT_PIN");
+  if (pin && pin[0] == '0') return;   /* AOT_PIN=0: leave placement to the scheduler */
+  aot_cpu_init();
+  static int started;
+  if (!__atomic_exchange_n(&started, 1, __ATOMIC_RELAXED)) {
+    pthread_t t; if (!pthread_create(&t, NULL, cpu_watcher, NULL)) pthread_detach(t);
+  }
+  int first = g_gn == 0;
+  guest_tid_add();
+  if (!first && g_main_only) {   /* a secondary guest thread: spread, like everything that is not the main one */
+    uint64_t other[2] = { g_other[0], g_other[1] };
+    syscall(SYS_sched_setaffinity, 0, sizeof other, other); return;
   }
   uint64_t mask[2] = { g_pin_cpu < 64 ? 1ull << g_pin_cpu : 0, 0 };
-  if (syscall(SYS_sched_setaffinity, 0, sizeof mask, mask) != 0) { static int w; if (!w++) fprintf(stderr, "[aot] pinning failed: %s\\n", strerror(errno)); }
+  if (syscall(SYS_sched_setaffinity, 0, sizeof mask, mask) != 0) { static int w; if (!w++) fprintf(stderr, "[aot] pinning failed: %s\n", strerror(errno)); }
 }
 /* ---- guest stacks: reserved in full, committed on demand (Windows grows a stack inside its reserve) ---- */
 #define GST_MAX 64
