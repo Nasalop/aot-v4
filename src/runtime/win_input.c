@@ -194,7 +194,11 @@ void aot_input_mouse(int kind, float x, float y) {   /* kind: 0 move, 1 left dow
      by client/1 put every tap thousands of pixels off-screen, so a press that should hit a button missed. */
   int px = view_known ? (int32_t)(x * (float)cw / (float)view_w) : (int32_t)x;
   int py = view_known ? (int32_t)(y * (float)ch / (float)view_h) : (int32_t)y;
-  if (kind == 6) { look_dx = look_dy = 0; mx = mx_anchor_x; my = mx_anchor_y; return; }   /* gesture over: no offset survives it */
+  if (kind == 6) {   /* gesture over: no look offset survives it, and the cursor stays where the game put it */
+    look_dx = look_dy = 0;
+    if (mx_warp) { mx = mx_anchor_x; my = mx_anchor_y; }   /* before the first warp the absolute position is the game's cursor: leave it */
+    return;
+  }
   if (!mx_seen) { mx_seen = 1; mx_last = px; my_last = py; }
   if (mx_warp) {
     if (kind == 0) {   /* pointer lock: travel only, measured from where the game last put the cursor */
