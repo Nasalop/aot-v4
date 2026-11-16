@@ -320,27 +320,23 @@ static void *sym(const char *n) { for (int i = 0; i < 3; i++) if (hd[i]) { void 
 #define NTIER 3
 static const char *const tier_sfx[NTIER] = { "", "_t1", "_t2" };
 static const char *const tier_ver[NTIER] = { "3.1.1", "2.4.1", "1.9.2 (native 1.x line)" };
-static void probe_release(void *o) { if (o) { void **vt = *(void ***)o; ((uint32_t (*)(void *))vt[2])(o); } }
-static int try_tier(int t, void *w) {
+static void *g_win;
+/* Load one tier's three libraries and hand them the window. No device is created here: tier 0 then runs exactly the path it always did, and a
+   newer tier is only given up on if the real factory/adapter/device creation below fails on this phone's driver. */
+static int load_tier(int t) {
   static const char *const base[3] = { "libdxvk_dxgi", "libdxvk_d3d11", "libdxvk_d3d10core" };
-  for (int i = 0; i < 3; i++) hd[i] = NULL;
+  void *h[3];
   for (int i = 0; i < 3; i++) {
     char n[64]; snprintf(n, sizeof n, "%s%s.so", base[i], tier_sfx[t]);
-    hd[i] = dlopen(n, RTLD_NOW | (t == 0 ? RTLD_GLOBAL : RTLD_LOCAL));   /* older tiers stay local so their symbols never bind into another tier */
-    if (!hd[i]) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): %s unavailable: %s\n", t, tier_ver[t], n, dlerror()); return -1; }
+    h[i] = dlopen(n, RTLD_NOW | (t == 0 ? RTLD_GLOBAL : RTLD_LOCAL));   /* older tiers stay local so their symbols never bind into another tier */
+    if (!h[i]) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): %s unavailable: %s\n", t, tier_ver[t], n, dlerror()); return -1; }
   }
-  for (int i = 0; i < 3; i++) { void (*sw)(void *) = dlsym(hd[i], "dxvk_android_set_window"); if (sw) sw(w); }
-  typedef uint32_t (*CF)(const void *, void **); typedef uint32_t (*CD)(void *, void *, uint32_t, uint32_t, void **);
-  CF cf = (CF)sym("CreateDXGIFactory1"); CD cd = (CD)sym("D3D10CoreCreateDevice"); int tf = ti_by_name("IDXGIFactory1");
-  if (!cf || !cd || tf < 0) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): missing entry points\n", t, tier_ver[t]); return -1; }
-  void *fac = NULL, *ad = NULL, *dev = NULL; uint32_t hr = cf(PIS[tf].guid, &fac);
-  if ((int32_t)hr < 0 || !fac) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): CreateDXGIFactory1 failed %#x\n", t, tier_ver[t], hr); return -1; }
-  { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
-  if ((int32_t)hr < 0 || !ad) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): no usable Vulkan adapter (%#x)\n", t, tier_ver[t], hr); probe_release(fac); return -1; }
-  hr = cd(fac, ad, 0, 0xA000, &dev);
-  if ((int32_t)hr < 0 || !dev) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): the driver cannot create a D3D10 device (%#x)\n", t, tier_ver[t], hr); probe_release(ad); probe_release(fac); return -1; }
-  probe_release(dev); probe_release(ad);
-  g_fac = fac; g_tier = t; return 0;
+  for (int i = 0; i < 3; i++) { hd[i] = h[i]; void (*sw)(void *) = dlsym(hd[i], "dxvk_android_set_window"); if (sw) sw(g_win); }
+  g_fac = NULL; g_tier = t; return 0;
+}
+static int next_tier(void) {   /* the current tier failed to produce a device: move to the next older one that is present */
+  for (int t = g_tier + 1; t < NTIER; t++) if (load_tier(t) == 0) { fprintf(stderr, "[dxvk] falling back to DXVK %s (tier %d)\n", tier_ver[t], t); return 1; }
+  return 0;
 }
 static int init_dxvk(void) {
   if (inited) return inited > 0 ? 0 : -1; inited = -1;
@@ -352,14 +348,13 @@ static int init_dxvk(void) {
      explicitly instead of inheriting whatever cwd we were started with. overwrite=0 keeps a user override. */
   { char cd[512]; if (getcwd(cd, sizeof cd)) setenv("DXVK_STATE_CACHE_PATH", cd, 0); }
   setenv("DXVK_STATE_CACHE", "1", 0);
-  void *w = aot_present_window(); if (!w) { fprintf(stderr, "[dxvk] no Android window yet\n"); return -1; }
-  { char b[32]; snprintf(b, sizeof b, "%llx", (unsigned long long)(uintptr_t)w); setenv("AOT_ANDROID_WINDOW", b, 1); }
+  g_win = aot_present_window(); if (!g_win) { fprintf(stderr, "[dxvk] no Android window yet\n"); return -1; }
+  { char b[32]; snprintf(b, sizeof b, "%llx", (unsigned long long)(uintptr_t)g_win); setenv("AOT_ANDROID_WINDOW", b, 1); }
   int t0 = 0; { const char *e = getenv("AOT_DXVK_TIER"); if (e && e[0] >= '0' && e[0] < '0' + NTIER) t0 = e[0] - '0'; }   /* testing: start at an older tier */
-  for (int t = t0; t < NTIER; t++) {
-    if (try_tier(t, w) == 0) { fprintf(stderr, "[dxvk] using DXVK %s (tier %d of %d)%s\n", tier_ver[t], t, NTIER - 1, t > t0 ? " after falling back from a newer tier" : ""); inited = 1; return 0; }
-  }
-  fprintf(stderr, "[dxvk] no DXVK tier works on this device (using the built-in D3D10 emulation)\n");
-  return -1;
+  g_tier = t0 - 1;
+  if (!next_tier()) { fprintf(stderr, "[dxvk] no DXVK tier is available (using the built-in D3D10 emulation)\n"); return -1; }
+  fprintf(stderr, "[dxvk] using DXVK %s (tier %d)\n", tier_ver[g_tier], g_tier);
+  inited = 1; return 0;
 }
 static void *fac_get(void) {
   if (g_fac || init_dxvk() != 0) return g_fac;
@@ -376,14 +371,21 @@ uint64_t aot_dxvk_factory(uint64_t out) {
 uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_desc) {
   if (init_dxvk() != 0) return (uint64_t)-1;
   typedef uint32_t (*CF)(const void *, void **); typedef uint32_t (*CD)(void *, void *, uint32_t, uint32_t, void **);
-  CF cf = (CF)sym("CreateDXGIFactory1"); CD cd = (CD)sym("D3D10CoreCreateDevice");
-  if (!cf || !cd) { fprintf(stderr, "[dxvk] missing entry points\n"); return (uint64_t)-1; }
   int tf = ti_by_name("IDXGIFactory1"), tdev = ti_by_name("ID3D10Device"), tsc = ti_by_name("IDXGISwapChain");
-  void *fac = NULL, *ad = NULL, *dev = NULL, *sc = NULL; uint32_t hr;
-  fac = fac_get(); if (!fac) return (uint64_t)-1; hr = 0;
-  { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
-  if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] EnumAdapters failed %#x\n", hr); return hr; }
-  hr = cd(fac, ad, 0, 0xA000, &dev); if ((int32_t)hr < 0) { fprintf(stderr, "[dxvk] D3D10CoreCreateDevice failed %#x\n", hr); return hr; }
+  void *fac = NULL, *ad = NULL, *dev = NULL, *sc = NULL; uint32_t hr = 0;
+  for (;;) {   /* one pass per tier: the first tier whose driver support is good enough to create the device wins */
+    CF cf = (CF)sym("CreateDXGIFactory1"); CD cd = (CD)sym("D3D10CoreCreateDevice");
+    ad = NULL; dev = NULL; hr = (uint32_t)-1;
+    if (!cf || !cd) fprintf(stderr, "[dxvk] missing entry points in tier %d\n", g_tier);
+    else if (!(fac = fac_get())) fprintf(stderr, "[dxvk] tier %d: no factory\n", g_tier);
+    else {
+      { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
+      if ((int32_t)hr < 0) fprintf(stderr, "[dxvk] EnumAdapters failed %#x\n", hr);
+      else { hr = cd(fac, ad, 0, 0xA000, &dev); if ((int32_t)hr < 0) fprintf(stderr, "[dxvk] D3D10CoreCreateDevice failed %#x\n", hr); }
+    }
+    if ((int32_t)hr >= 0 && dev) break;
+    if (!next_tier()) return (int32_t)hr < 0 ? hr : (uint64_t)-1;
+  }
   if (sc_out) {
     uint8_t d[72]; conv_scd_in((const uint8_t *)(uintptr_t)sc_desc, d);
     uint64_t iv[4] = { (uint64_t)(uintptr_t)fac, (uint64_t)(uintptr_t)dev, (uint64_t)(uintptr_t)d, (uint64_t)(uintptr_t)&sc }; float z[4] = { 0 };
