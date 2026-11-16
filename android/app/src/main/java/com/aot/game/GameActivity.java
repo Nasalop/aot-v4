@@ -231,7 +231,7 @@ public final class GameActivity extends NativeActivity {
                     if (b == kbToggle) { releaseAll(); kbToggle.on = !kbToggle.on; }
                     else if (b != null) { b.ptr = id; if (b.mk != 0) nativeMouse(b.mk, x, y); else if (b.sticky) { b.on = !b.on; nativeKey(b.vk, b.on ? 1 : 0); } else nativeKey(b.vk, 1); }
                     else if (!kbToggle.on && x < getWidth() * 0.30f && y > getHeight() * 0.35f && stickPtr < 0) { stickPtr = id; sx = x; sy = y; stick(x, y); }
-                    else if (mousePtr < 0) { mousePtr = id; nativeMouse(0, x, y); }
+                    else if (mousePtr < 0) { mousePtr = id; nativeMouse(5, x, y); }   // 5 = gesture start: the view does not move until this finger travels
                 } else if (a == MotionEvent.ACTION_MOVE) {
                     for (int k = 0; k < e.getPointerCount(); k++) { int pid = e.getPointerId(k);
                         if (pid == stickPtr) stick(e.getX(k), e.getY(k)); else if (pid == mousePtr) nativeMouse(0, e.getX(k), e.getY(k)); }
@@ -239,7 +239,7 @@ public final class GameActivity extends NativeActivity {
                     float x = e.getX(i), y = e.getY(i); boolean cancel = a == MotionEvent.ACTION_CANCEL;
                     for (java.util.List<Btn> l : java.util.Arrays.asList(game, kb)) for (Btn b : l) if (b.ptr == id || cancel) { if (b.ptr >= 0) { if (b.mk != 0) nativeMouse(b.mk + 1, x, y); else if (!b.sticky) nativeKey(b.vk, 0); } b.ptr = -1; }
                     if (id == stickPtr || cancel) { stickPtr = -1; for (int k = 0; k < 4; k++) setDir(k, false); }
-                    if (id == mousePtr || cancel) { mousePtr = -1; }
+                    if (id == mousePtr || cancel) { nativeMouse(6, x, y); mousePtr = -1; }   // 6 = gesture end: drop the pending look offset so nothing snaps
                 }
                 invalidate();
             } catch (Throwable t) { android.util.Log.w("aotgame", "controls: " + t); }

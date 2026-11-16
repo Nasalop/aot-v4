@@ -114,7 +114,7 @@ static int32_t on_input(struct android_app *app, AInputEvent *e) {
       pad.buttons &= ~0xF; if (hy < -0.5f) pad.buttons |= 1; if (hy > 0.5f) pad.buttons |= 2; if (hx < -0.5f) pad.buttons |= 4; if (hx > 0.5f) pad.buttons |= 8;
       aot_input_pad(&pad); return 1;
     }
-    /* touch -> Win32 mouse: first finger = left button, second finger = right button. */
+    /* touch -> Win32 mouse: a finger is look travel only (no button), so swiping can never click. */
     int a = AMotionEvent_getAction(e), act = a & AMOTION_EVENT_ACTION_MASK, idx = (a & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
     float x = AMotionEvent_getX(e, 0), y = AMotionEvent_getY(e, 0);
     if (g_app->window) aot_input_view((uint32_t)ANativeWindow_getWidth(g_app->window), (uint32_t)ANativeWindow_getHeight(g_app->window));
@@ -122,11 +122,11 @@ static int32_t on_input(struct android_app *app, AInputEvent *e) {
       /* A finger on the surface only moves the pointer: clicks come from the on-screen buttons (the Java
          overlay in GameActivity.ControlsView) and from a physical gamepad, so dragging to look around can
          never fire the weapon, open a door or pick a menu entry. */
-      case AMOTION_EVENT_ACTION_DOWN: case AMOTION_EVENT_ACTION_POINTER_DOWN:
-      case AMOTION_EVENT_ACTION_MOVE:
-      case AMOTION_EVENT_ACTION_UP: case AMOTION_EVENT_ACTION_CANCEL:
-      case AMOTION_EVENT_ACTION_POINTER_UP:
+      case AMOTION_EVENT_ACTION_DOWN: aot_input_mouse(5, x, y); break;   /* gesture start, then travel = look */
+      case AMOTION_EVENT_ACTION_MOVE: case AMOTION_EVENT_ACTION_POINTER_DOWN: case AMOTION_EVENT_ACTION_POINTER_UP:
         aot_input_mouse(0, x, y); break;
+      case AMOTION_EVENT_ACTION_UP: case AMOTION_EVENT_ACTION_CANCEL:
+        aot_input_mouse(6, x, y); break;   /* gesture end: no pending offset is left to snap the view */
     }
     return 1;
   }
