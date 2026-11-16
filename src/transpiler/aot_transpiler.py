@@ -68,6 +68,20 @@ RESERVE_PROBE = ('{static int n_=0;uint32_t w_=LD(uint32_t,(uint32_t)r1+4u);'
 # applied ONLY when the function's first bytes match exactly (so another game, or another build of this one, is never hooked by address alone).
 # Registers other than eax are left alone: the originals only clobber eax/ecx/edx/flags, which no caller may rely on.
 NATIVE_CRT_ON = True   # False = every C-runtime function is translated like any other code (one-line revert of this whole pass)
+# Calls to these are dropped at the call site instead of being redirected to the hooked entry. __security_check_cookie
+# passes unless the guest has already corrupted its own stack, so the check itself is nothing; what it costs is the
+# call and its dispatch round-trip, 1904 times over. Dropping the call drops the push, the region entry, the switch
+# and the return. The entry hook stays as the fallback for any indirect jump straight at the routine.
+NATIVE_ELIDE = {0x9bbe4e: bytes.fromhex('3b0dace88e017502f3c3')}
+NATIVE_ELIDE_ON = True
+
+def native_elided(rec, addr):
+    """True when a call to this address is a /GS cookie check whose bytes match this image exactly."""
+    if not NATIVE_ELIDE_ON or not getattr(rec, 'm32', False): return False
+    want = NATIVE_ELIDE.get(addr & 0xffffffff)
+    if want is None: return False
+    o = (addr & 0xffffffff) - rec.base
+    return o >= 0 and o + len(want) <= len(rec.img) and rec.img[o:o + len(want)] == want
 _NRET = 'pc=POP32(); goto dispatch;}'
 NATIVE_CRT = {
     # __security_check_cookie: every /GS-protected function returns through this routine (1904 direct calls, four
@@ -613,6 +627,7 @@ class Gen:
                 if not m32: raise Unsup(mn)
                 if op.type == X86_OP_IMM: return 'PUSH32(c->sregs[1]);PUSH32(0x%xULL);%s' % (nx, tgt(op.imm))
                 return '{uint64_t a=%s;uint32_t t=LD(uint32_t,a);PUSH32(c->sregs[1]);PUSH32(0x%xULL);pc=t;goto dispatch;}' % (self.addr(op), nx)
+            if op.type == X86_OP_IMM and native_elided(self.rec, op.imm): return ';'   # /GS cookie check: nothing to do, and no stack push at all
             if op.type == X86_OP_IMM: orig = '%s(0x%xULL);%s' % (PU, nx, tgt(op.imm))
             else: orig = '{uint64_t t=%s; %s(0x%xULL); pc=t; goto dispatch;}' % (self.rdop(op, PS), PU, nx)
             if self.m32 and FAST_CALLS:
