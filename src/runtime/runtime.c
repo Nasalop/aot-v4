@@ -383,6 +383,9 @@ void aot_heap_crash_dump(void) {
   heap_overlap_check("crash");
 }
 
+static inline void imp_post(int idx, Thunk *t, CPU *c) {
+   static int8_t iocls[MAXTHUNK]; int8_t k_ = iocls[idx]; if (!k_) { const char *dt = strchr(t->name, '!'); const char *nn = dt ? dt + 1 : t->name; static const char *const io_names[] = { "ReadFile", "GetOverlappedResult", "LockFileEx", "UnlockFileEx", "GetFileSizeEx", "SetFilePointerEx", "WriteFile", "SetEndOfFile", "SetFilePointer", "GetFileSize", NULL }; k_ = 1; for (int q = 0; io_names[q]; q++) if (!strcmp(nn, io_names[q])) k_ = 2; iocls[idx] = k_; } if (k_ == 2) io_fail_note(t->name, (uint32_t)c->r[0]); 
+}
 /* Cross-region tail dispatch (JMPREG / AOT_TAILDISP in aot_runtime.h). Anything that is not a plain translated entry (import thunks, the return
    thunk, unknown addresses, a region that does not enter at pc) is handed back to run() as the return value, exactly like EXIT(pc). */
 /* pc -> region index for indirect branches. One 64-bit word per slot, shared by every thread (they all run the
@@ -402,17 +405,33 @@ static int region_lookup(uint64_t pc) {   /* pc -> region index, or -1; the one 
   if (k >= 0) __atomic_store_n(slot, ((uint64_t)p32 << 32) | (uint64_t)(unsigned)(k + 1), __ATOMIC_RELAXED);
   return k;
 }
+volatile uint64_t aot_perf_guest;   /* profiling: ticks spent inside translated code, see aot_perf_ticks() */
+static __thread int aot_guest_depth;   /* > 0 when a shim re-entered the guest (callback): count the time once */
+/* PE32 import calls are served right here instead of returning to run(): a call into a thunk used to unwind to the dispatcher, which did the
+   thunk check, watchdog bookkeeping, two clock reads and a region lookup per import, then re-entered translated code. Now the shim runs and the
+   return address is tail-dispatched. EXIT/RET thunks, unimplemented imports and AOT_TRACE_IMPORTS runs still go through run(). */
+static int imp_trace = -1;
 uint64_t aot_tail(CPU *c, uint64_t pc) {
-  if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) return pc;
-  int k = region_lookup(pc);
-  if (k < 0) return pc;
-  aot_last_pc = pc;
-  AOT_MUSTTAIL return aot_region_fn[k](c, pc);
+  for (;;) {
+    if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
+      int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
+      if (!aot_is_pe32 || idx <= RET_IDX || idx >= nthunks || !thunks[idx].fn) return pc;
+      if (__builtin_expect(imp_trace < 0, 0)) imp_trace = getenv("AOT_TRACE_IMPORTS") != NULL;
+      if (imp_trace) return pc;
+      Thunk *t = &thunks[idx]; WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx;
+      uint64_t t0 = aot_perf_ticks();
+      pc = aot_x86_thunk(c, t->fn, t->pop, t->fp);
+      imp_post(idx, t, c);
+      if (aot_guest_depth == 1) aot_perf_guest -= aot_perf_ticks() - t0;   /* shim time is not translated-code time */
+      continue;
+    }
+    int k = region_lookup(pc);
+    if (k < 0) return pc;
+    aot_last_pc = pc;
+    AOT_MUSTTAIL return aot_region_fn[k](c, pc);
+  }
 }
 
-volatile uint64_t aot_perf_guest;   /* profiling: ticks spent inside translated code, see aot_perf_ticks() */
-
-static __thread int aot_guest_depth;   /* > 0 when a shim re-entered the guest (callback): count the time once */
 
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
   CPU *prev_cpu = cur_cpu; cur_cpu = c; int _outer = (aot_guest_depth++ == 0);
@@ -428,7 +447,7 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
 #endif
       { static int tr = -1; if (tr < 0) tr = getenv("AOT_TRACE_IMPORTS") != NULL; if (tr) fprintf(stderr, "[imp] %s\n", t->name); }
       if (!t->fn) { fflush(stdout); fprintf(stderr, "\n[aot] call to unimplemented import: %s (rcx=0x%llx rdx=0x%llx)\n", t->name, (unsigned long long)c->r[1], (unsigned long long)c->r[2]); dump_context(c); exit(72); }
-      if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); { static int8_t iocls[MAXTHUNK]; int8_t k_ = iocls[idx]; if (!k_) { const char *dt = strchr(t->name, '!'); const char *nn = dt ? dt + 1 : t->name; static const char *const io_names[] = { "ReadFile", "GetOverlappedResult", "LockFileEx", "UnlockFileEx", "GetFileSizeEx", "SetFilePointerEx", "WriteFile", "SetEndOfFile", "SetFilePointer", "GetFileSize", NULL }; k_ = 1; for (int q = 0; io_names[q]; q++) if (!strcmp(nn, io_names[q])) k_ = 2; iocls[idx] = k_; } if (k_ == 2) io_fail_note(t->name, (uint32_t)c->r[0]); } continue; }
+      if (aot_is_pe32) { pc = aot_x86_thunk(c, t->fn, t->pop, t->fp); imp_post(idx, t, c);  continue; }
       c->r[0] = t->fn(c);
       pc = LD(uint64_t, c->r[4]); c->r[4] += 8; continue;
     }
