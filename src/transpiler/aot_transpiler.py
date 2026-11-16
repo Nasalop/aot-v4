@@ -67,6 +67,7 @@ RESERVE_PROBE = ('{static int n_=0;uint32_t w_=LD(uint32_t,(uint32_t)r1+4u);'
 # SSE/rep loops with all vector state in memory, several times slower than the host's own; ~450 call sites each for memset and memmove. A replacement is
 # applied ONLY when the function's first bytes match exactly (so another game, or another build of this one, is never hooked by address alone).
 # Registers other than eax are left alone: the originals only clobber eax/ecx/edx/flags, which no caller may rely on.
+NATIVE_CRT_ON = True   # False = every C-runtime function is translated like any other code (one-line revert of this whole pass)
 _NRET = 'pc=POP32(); goto dispatch;}'
 NATIVE_CRT = {
     0x9bbea0: (bytes.fromhex('558bec57568b750c8b4d108b7d088bc18bd103c63bfe7608'),   # memmove/memcpy(dst, src, n) -> dst; the CRT one handles overlap
@@ -85,6 +86,12 @@ NATIVE_CRT = {
                '{r0=(uint32_t)strlen((const char*)(uintptr_t)LD(uint32_t,r4+4));' + _NRET),
     0x9ed170: (bytes.fromhex('8b5424088b4c24048a013a02'),                            # second strcmp(a, b): byte-at-a-time, returns the difference
                '{int r_=strcmp((const char*)(uintptr_t)LD(uint32_t,r4+4),(const char*)(uintptr_t)LD(uint32_t,r4+8));r0=(uint32_t)(r_<0?-1:r_>0?1:0);' + _NRET),
+    # __allmul(lo1, hi1, lo2, hi2) -> the low 64 bits of the product in edx:eax. It is stdcall: its own ret 0x10
+    # pops the four argument dwords, so the snippet pops them too, or every caller would find its stack shifted.
+    0x9bbe60: (bytes.fromhex('8b4424088b4c24100bc88b4c240c7509'),                    # 64-bit multiply helper (77 call sites)
+               '{uint32_t l1_=LD(uint32_t,r4+4),h1_=LD(uint32_t,r4+8),l2_=LD(uint32_t,r4+12),h2_=LD(uint32_t,r4+16);'
+               'uint64_t p_=(uint64_t)(((uint64_t)h1_<<32)|l1_)*(uint64_t)(((uint64_t)h2_<<32)|l2_);'
+               'r0=p_&0xffffffff;r1=p_>>32;pc=POP32();r4+=16;goto dispatch;}'),
 }
 RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=LD(uint32_t,(uint32_t)r4+4u),need_=sz_+1u;'
                  'if(nc_>((w_>>0xe)&0x3fffu)&&nc_<need_){uint32_t ask_=need_+(need_>>2);'
@@ -1181,7 +1188,7 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
             for i, nd in zip(b, needs):
                 try:
                     s = g.tr(i, nd, tgt); nok += 1
-                    nat = NATIVE_CRT.get(i.address) if g.m32 else None
+                    nat = NATIVE_CRT.get(i.address) if (NATIVE_CRT_ON and g.m32) else None
                     if nat is not None and i is b[0] and b''.join(x.bytes for x in b).startswith(nat[0]): s = nat[1]; native_hooks.append(i.address)
                     # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
                     # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
