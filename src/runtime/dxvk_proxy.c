@@ -55,6 +55,11 @@ static void pf_report(void) {
   last_ns = now; last_g = aot_perf_guest; last_p = pf_proxy_ticks; last_c = pf_calls; last_f = aot_frames;
 }
 static uint64_t px_call_inner(CPU *c, const PI *pi, int slot);
+/* overlay: cumulative nanoseconds in translated regions (k=2) and inside the D3D proxy (k=3) */
+uint64_t aot_perf_ns(int k) {
+  uint64_t t = k == 2 ? aot_perf_guest : k == 3 ? pf_proxy_ticks : 0, hz = aot_perf_hz();
+  return (uint64_t)((double)t * 1e9 / (double)hz);
+}
 static uint64_t px_call(CPU *c, const PI *pi, int slot) {   /* timed wrapper around every guest->D3D call */
   uint64_t t0 = aot_perf_ticks();
   uint64_t r = px_call_inner(c, pi, slot);
@@ -306,9 +311,37 @@ static uint64_t px_call_inner(CPU *c, const PI *pi, int slot) {
   return m->ret ? (uint32_t)r : 0;
 }
 /* ---- creation: D3D10CreateDeviceAndSwapChain -> real DXVK ---- */
-static void *hd[3]; static int inited;
+static void *hd[3]; static int inited; static void *g_fac; static int g_tier = -1;
 extern void *aot_present_window(void);
 static void *sym(const char *n) { for (int i = 0; i < 3; i++) if (hd[i]) { void *p = dlsym(hd[i], n); if (p) return p; } return NULL; }
+/* DXVK tiers, newest first. Tier 0 keeps the original library names; the others carry a suffix so all three sets can sit side by side in the APK
+   (build.sh renames them and rewrites their DT_NEEDED entries). A tier is taken only if a real probe works on this phone's Vulkan driver:
+   instance + adapter + D3D10 device. Otherwise the next, older tier is tried; if none works the caller falls back to the built-in emulation. */
+#define NTIER 3
+static const char *const tier_sfx[NTIER] = { "", "_t1", "_t2" };
+static const char *const tier_ver[NTIER] = { "3.1.1", "2.4.1", "1.9.2 (native 1.x line)" };
+static void probe_release(void *o) { if (o) { void **vt = *(void ***)o; ((uint32_t (*)(void *))vt[2])(o); } }
+static int try_tier(int t, void *w) {
+  static const char *const base[3] = { "libdxvk_dxgi", "libdxvk_d3d11", "libdxvk_d3d10core" };
+  for (int i = 0; i < 3; i++) hd[i] = NULL;
+  for (int i = 0; i < 3; i++) {
+    char n[64]; snprintf(n, sizeof n, "%s%s.so", base[i], tier_sfx[t]);
+    hd[i] = dlopen(n, RTLD_NOW | (t == 0 ? RTLD_GLOBAL : RTLD_LOCAL));   /* older tiers stay local so their symbols never bind into another tier */
+    if (!hd[i]) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): %s unavailable: %s\n", t, tier_ver[t], n, dlerror()); return -1; }
+  }
+  for (int i = 0; i < 3; i++) { void (*sw)(void *) = dlsym(hd[i], "dxvk_android_set_window"); if (sw) sw(w); }
+  typedef uint32_t (*CF)(const void *, void **); typedef uint32_t (*CD)(void *, void *, uint32_t, uint32_t, void **);
+  CF cf = (CF)sym("CreateDXGIFactory1"); CD cd = (CD)sym("D3D10CoreCreateDevice"); int tf = ti_by_name("IDXGIFactory1");
+  if (!cf || !cd || tf < 0) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): missing entry points\n", t, tier_ver[t]); return -1; }
+  void *fac = NULL, *ad = NULL, *dev = NULL; uint32_t hr = cf(PIS[tf].guid, &fac);
+  if ((int32_t)hr < 0 || !fac) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): CreateDXGIFactory1 failed %#x\n", t, tier_ver[t], hr); return -1; }
+  { uint64_t iv[3] = { (uint64_t)(uintptr_t)fac, 0, (uint64_t)(uintptr_t)&ad }; float z[4] = { 0 }; hr = (uint32_t)hcall(fac, slot_by_name(&PIS[tf], "EnumAdapters"), iv, 3, z); }
+  if ((int32_t)hr < 0 || !ad) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): no usable Vulkan adapter (%#x)\n", t, tier_ver[t], hr); probe_release(fac); return -1; }
+  hr = cd(fac, ad, 0, 0xA000, &dev);
+  if ((int32_t)hr < 0 || !dev) { fprintf(stderr, "[dxvk] tier %d (DXVK %s): the driver cannot create a D3D10 device (%#x)\n", t, tier_ver[t], hr); probe_release(ad); probe_release(fac); return -1; }
+  probe_release(dev); probe_release(ad);
+  g_fac = fac; g_tier = t; return 0;
+}
 static int init_dxvk(void) {
   if (inited) return inited > 0 ? 0 : -1; inited = -1;
   if (!aot_is_pe32) return -1;
@@ -319,14 +352,15 @@ static int init_dxvk(void) {
      explicitly instead of inheriting whatever cwd we were started with. overwrite=0 keeps a user override. */
   { char cd[512]; if (getcwd(cd, sizeof cd)) setenv("DXVK_STATE_CACHE_PATH", cd, 0); }
   setenv("DXVK_STATE_CACHE", "1", 0);
-  static const char *names[3] = { "libdxvk_dxgi.so", "libdxvk_d3d11.so", "libdxvk_d3d10core.so" };
-  for (int i = 0; i < 3; i++) { hd[i] = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL); if (!hd[i]) { fprintf(stderr, "[dxvk] %s unavailable: %s (using the built-in D3D10 emulation)\n", names[i], dlerror()); return -1; } }
   void *w = aot_present_window(); if (!w) { fprintf(stderr, "[dxvk] no Android window yet\n"); return -1; }
-  for (int i = 0; i < 3; i++) { void (*sw)(void *) = dlsym(hd[i], "dxvk_android_set_window"); if (sw) sw(w); }
   { char b[32]; snprintf(b, sizeof b, "%llx", (unsigned long long)(uintptr_t)w); setenv("AOT_ANDROID_WINDOW", b, 1); }
-  inited = 1; return 0;
+  int t0 = 0; { const char *e = getenv("AOT_DXVK_TIER"); if (e && e[0] >= '0' && e[0] < '0' + NTIER) t0 = e[0] - '0'; }   /* testing: start at an older tier */
+  for (int t = t0; t < NTIER; t++) {
+    if (try_tier(t, w) == 0) { fprintf(stderr, "[dxvk] using DXVK %s (tier %d of %d)%s\n", tier_ver[t], t, NTIER - 1, t > t0 ? " after falling back from a newer tier" : ""); inited = 1; return 0; }
+  }
+  fprintf(stderr, "[dxvk] no DXVK tier works on this device (using the built-in D3D10 emulation)\n");
+  return -1;
 }
-static void *g_fac;
 static void *fac_get(void) {
   if (g_fac || init_dxvk() != 0) return g_fac;
   uint32_t (*cf)(const void *, void **) = (uint32_t (*)(const void *, void **))sym("CreateDXGIFactory1"); int tf = ti_by_name("IDXGIFactory1");
