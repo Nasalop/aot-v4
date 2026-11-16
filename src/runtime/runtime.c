@@ -386,6 +386,28 @@ void aot_heap_crash_dump(void) {
 static inline void imp_post(int idx, Thunk *t, CPU *c) {
    static int8_t iocls[MAXTHUNK]; int8_t k_ = iocls[idx]; if (!k_) { const char *dt = strchr(t->name, '!'); const char *nn = dt ? dt + 1 : t->name; static const char *const io_names[] = { "ReadFile", "GetOverlappedResult", "LockFileEx", "UnlockFileEx", "GetFileSizeEx", "SetFilePointerEx", "WriteFile", "SetEndOfFile", "SetFilePointer", "GetFileSize", NULL }; k_ = 1; for (int q = 0; io_names[q]; q++) if (!strcmp(nn, io_names[q])) k_ = 2; iocls[idx] = k_; } if (k_ == 2) io_fail_note(t->name, (uint32_t)c->r[0]); 
 }
+#ifdef AOT_RELEASE
+/* Release-build log policy (see aot_release.h). A fatal report ("\n[aot] ...") switches everything on for the rest of the process so the register and
+   code dumps that follow it are kept; otherwise a message is kept when it is an error or a one-time start-up fact, at most 40 times per format string. */
+volatile int aot_log_all;
+int aot_keep(const char *fmt) {
+  if (aot_log_all) return 1;
+  if (!fmt) return 0;
+  const char *s = fmt; int nl = 0; if (*s == '\n') { s++; nl = 1; }
+  static const char *const keep[] = { "[aot]", "[cpu]", "[gfx]", "[hlsl]", "[winfile]", "[d3d10] Create", "[dxvk] tier", "[dxvk] using", "[dxvk] no DXVK",
+    "[dxvk] out of", "[dxvk] missing", "[dxvk] Create", "[dxvk] Enum", "[dxvk] D3D10", "[dxvk] host", "[dxvk] no Android", "[dxvk] %s::%s", "[dxvk] guest", "[audio]",
+    "cannot", "mappings", "executable", "image base", "entry point", "usage", "[heap]", "[in] GetDevice", NULL };
+  int ok = 0; for (int i = 0; keep[i]; i++) if (!strncmp(s, keep[i], strlen(keep[i]))) { ok = 1; break; }
+  if (!ok) return 0;
+  if (nl && !strncmp(s, "[aot]", 5)) { aot_log_all = 1; return 1; }
+  static struct { const char *p; int n; } seen[512]; unsigned h = (unsigned)(((uintptr_t)fmt >> 3) * 2654435761u) & 511;
+  for (int probe = 0; probe < 512; probe++, h = (h + 1) & 511) {
+    if (seen[h].p == fmt) return seen[h].n++ < 40;
+    if (!seen[h].p) { seen[h].p = fmt; seen[h].n = 1; return 1; }
+  }
+  return 0;
+}
+#endif
 /* Cross-region tail dispatch (JMPREG / AOT_TAILDISP in aot_runtime.h). Anything that is not a plain translated entry (import thunks, the return
    thunk, unknown addresses, a region that does not enter at pc) is handed back to run() as the return value, exactly like EXIT(pc). */
 /* pc -> region index for indirect branches. One 64-bit word per slot, shared by every thread (they all run the
@@ -730,6 +752,7 @@ int main(int argc, char **argv) {
   for (int i = 2; i < argc; i++) { strncat(g_cmdline, " ", sizeof g_cmdline - strlen(g_cmdline) - 1); strncat(g_cmdline, argv[i], sizeof g_cmdline - strlen(g_cmdline) - 1); }
   shims_init(argc - 1, argv + 1);
   aot_sys_init();
+  fprintf(stderr, "[aot] boot: image mapped and verified, starting the guest at entry 0x%llx\n", (unsigned long long)aot_entry);
   run(c, aot_entry, -1);
   aot_win_audio_cleanup();
   return 0;
