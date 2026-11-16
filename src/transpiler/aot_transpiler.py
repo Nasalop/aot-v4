@@ -77,6 +77,14 @@ NATIVE_CRT = {
                '{r0=(uint32_t)strlen((const char*)(uintptr_t)LD(uint32_t,r4+4));' + _NRET),
     0x9cb690: (bytes.fromhex('8b5424048b4c2408f7c203000000'),                        # strcmp(a, b) -> -1 / 0 / 1 exactly like the CRT (callers compare with -1)
                '{int r_=strcmp((const char*)(uintptr_t)LD(uint32_t,r4+4),(const char*)(uintptr_t)LD(uint32_t,r4+8));r0=(uint32_t)(r_<0?-1:r_>0?1:0);' + _NRET),
+    # The image carries a second copy of memmove, strlen and strcmp (a different CRT translation unit); both copies of
+    # each are listed, since a call goes to whichever one its translation unit was compiled against.
+    0x9bc260: (bytes.fromhex('558bec57568b750c8b4d108b7d088bc18bd103c63bfe7608'),   # second memmove/dst,src,n -> dst, same prologue as above
+               '{uint32_t d_=LD(uint32_t,r4+4),s_=LD(uint32_t,r4+8),n_=LD(uint32_t,r4+12);if(n_)memmove((void*)(uintptr_t)d_,(const void*)(uintptr_t)s_,n_);r0=d_;' + _NRET),
+    0x404a60: (bytes.fromhex('8b542404f6c2038bc27411'),                              # second strlen(s): alignment test, then the 0x7efefeff word scan
+               '{r0=(uint32_t)strlen((const char*)(uintptr_t)LD(uint32_t,r4+4));' + _NRET),
+    0x9ed170: (bytes.fromhex('8b5424088b4c24048a013a02'),                            # second strcmp(a, b): byte-at-a-time, returns the difference
+               '{int r_=strcmp((const char*)(uintptr_t)LD(uint32_t,r4+4),(const char*)(uintptr_t)LD(uint32_t,r4+8));r0=(uint32_t)(r_<0?-1:r_>0?1:0);' + _NRET),
 }
 RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=LD(uint32_t,(uint32_t)r4+4u),need_=sz_+1u;'
                  'if(nc_>((w_>>0xe)&0x3fffu)&&nc_<need_){uint32_t ask_=need_+(need_>>2);'
