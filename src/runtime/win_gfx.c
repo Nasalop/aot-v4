@@ -1196,9 +1196,10 @@ F(sh_CreateDXGIFactory) { if (aot_dxvk_factory(A(1)) == 0) return S_OK; init_vts
 F(u_one) { return 1; }
 F(u_zero) { return 0; }
 F(u_hwnd) { return HWND_FAKE; }
-void aot_win_client_size(uint32_t *pw, uint32_t *ph) { uint32_t w = g_w ? g_w : 1280, h = g_h ? g_h : 720; if (!g_pinit) aot_present_size(&w, &h); *pw = w; *ph = h; }
-F(u_getclientrect) { uint32_t w = g_w ? g_w : 1280, h = g_h ? g_h : 720; if (!g_pinit) aot_present_size(&w, &h); uint8_t *r = (uint8_t *)A(1); ST(int32_t, r, 0); ST(int32_t, r + 4, 0); ST(int32_t, r + 8, w); ST(int32_t, r + 12, h); return 1; }
-F(u_sysmetrics) { uint32_t w, h; if (g_pinit) { w = g_w; h = g_h; } else aot_present_size(&w, &h); int i = (int)A(0); return i == 0 || i == 16 ? w : i == 1 || i == 17 ? h : 0; }
+#include "aot_settings.h"   /* EDIT-menu upscaler: the client size is what the game renders into, so scaling it here is the render scale */
+void aot_win_client_size(uint32_t *pw, uint32_t *ph) { static int inited; uint32_t w = g_w ? g_w : 1280, h = g_h ? g_h : 720; if (!g_pinit) aot_present_size(&w, &h); if (!inited) { inited = 1; aot_settings_init(); } aot_settings_scale(&w, &h); *pw = w; *ph = h; }
+F(u_getclientrect) { static int inited; uint32_t w = g_w ? g_w : 1280, h = g_h ? g_h : 720; if (!g_pinit) aot_present_size(&w, &h); if (!inited) { inited = 1; aot_settings_init(); } aot_settings_scale(&w, &h); uint8_t *r = (uint8_t *)A(1); ST(int32_t, r, 0); ST(int32_t, r + 4, 0); ST(int32_t, r + 8, w); ST(int32_t, r + 12, h); return 1; }
+F(u_sysmetrics) { static int inited; uint32_t w, h; if (g_pinit) { w = g_w; h = g_h; } else aot_present_size(&w, &h); if (!inited) { inited = 1; aot_settings_init(); } aot_settings_scale(&w, &h); int i = (int)A(0); return i == 0 || i == 16 ? w : i == 1 || i == 17 ? h : 0; }
 F(u_msgbox) { fflush(stdout); fprintf(stderr, "[MessageBox] %s\n", (const char *)A(1)); return 1; }
 F(u_getcursor) { memset((void *)A(0), 0, 8); return 1; }
 F(u_tickcount) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000; }

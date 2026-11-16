@@ -77,6 +77,9 @@ public final class GameActivity extends NativeActivity {
     private static native void nativeView0(int w, int h);
     private static native long nativeFrames0();
     private static native long nativeNs0(int k);
+    /* EDIT menu -> runtime: fps cap (0 = off), upscaler on/off, quality level 0..4 */
+    private static native void nativeSettings0(int fpsCap, int upscale, int quality);
+    private static void nativeSettings(int fpsCap, int upscale, int quality) { if (nativesOk) try { nativeSettings0(fpsCap, upscale, quality); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "settings natives unavailable: " + t); } }
     private static boolean nativesOk = true;
     private static void nativeKey(int vk, int down) { if (nativesOk) try { nativeKey0(vk, down); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
     private static void nativeMouse(int kind, float x, float y) { if (nativesOk) try { nativeMouse0(kind, x, y); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
@@ -185,6 +188,53 @@ public final class GameActivity extends NativeActivity {
         @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); if (dbg) post(statsTick); }
         @Override protected void onDetachedFromWindow() { removeCallbacks(statsTick); super.onDetachedFromWindow(); }
         private final Btn kbToggle = new Btn("KB", -1, 0.93f, 0.08f, 0.05f, 0.07f, true);
+        /* EDIT opens our own menu: frame-rate cap, the upscaler (SGSR2) and its quality level. Tapping a row cycles
+           the value, the choice is stored so it survives a restart, and the upscaler can be switched off entirely.
+           Everything is applied to the runtime through nativeSettings(); nothing here parses files. */
+        private final Btn editBtn = new Btn("EDIT", -1, 0.055f, 0.19f, 0.045f, 0.06f, true);
+        private boolean menu;
+        private int setFps, setUpscale, setQuality = 2;
+        private static final String[] FPS_TXT = { "OFF", "30 FPS", "60 FPS" };
+        private static final String[] QUAL_TXT = { "ULTRA QUALITY", "QUALITY", "BALANCED", "PERFORMANCE", "ULTRA PERFORMANCE" };
+        private android.content.SharedPreferences prefs() { return getContext().getSharedPreferences("aot_settings", 0); }
+        private void sendSettings() { nativeSettings(setFps == 0 ? 0 : (setFps == 1 ? 30 : 60), setUpscale, setQuality); }
+        private void loadSettings() {
+            android.content.SharedPreferences s = prefs();
+            setFps = s.getInt("fps", 0); setUpscale = s.getInt("upscale", 0); setQuality = s.getInt("quality", 2);
+            if (setFps < 0 || setFps > 2) setFps = 0;
+            if (setQuality < 0 || setQuality > 4) setQuality = 2;
+            if (setUpscale != 0) setUpscale = 1;
+            sendSettings();
+        }
+        private void saveSettings() {
+            prefs().edit().putInt("fps", setFps).putInt("upscale", setUpscale).putInt("quality", setQuality).apply();
+            sendSettings();
+        }
+        private int menuRow(float x, float y) {   /* rows of the menu, in the same normalised coordinates as the buttons */
+            float w = getWidth(), h = getHeight();
+            if (x < w * 0.28f || x > w * 0.82f) return -1;
+            for (int i = 0; i < 4; i++) if (Math.abs(y - h * (0.245f + i * 0.085f)) < h * 0.038f) return i;
+            return -1;
+        }
+        private void menuTap(int row) {
+            if (row == 0) setFps = (setFps + 1) % 3;
+            else if (row == 1) setUpscale = setUpscale != 0 ? 0 : 1;
+            else if (row == 2) { if (setUpscale != 0) setQuality = (setQuality + 1) % 5; }
+            else if (row == 3) { menu = false; invalidate(); return; }
+            saveSettings(); invalidate();
+        }
+        private void drawMenu(Canvas c, float w, float h) {
+            p.setStyle(Paint.Style.FILL); p.setColor(0xC8000000);
+            c.drawRect(w * 0.28f, h * 0.15f, w * 0.82f, h * 0.60f, p);
+            p.setColor(0xFFFFFFFF); p.setTextAlign(Paint.Align.CENTER);
+            p.setTextSize(h * 0.030f); c.drawText("SETTINGS", w * 0.55f, h * 0.195f, p);
+            String[] rows = { "FPS CAP: " + FPS_TXT[setFps],
+                              "UPSCALER: " + (setUpscale != 0 ? "SGSR2" : "OFF"),
+                              "QUALITY: " + (setUpscale != 0 ? QUAL_TXT[setQuality] : "-"),
+                              "CLOSE" };
+            p.setTextSize(h * 0.026f);
+            for (int i = 0; i < 4; i++) c.drawText(rows[i], w * 0.55f, h * (0.245f + i * 0.085f), p);
+        }
         private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         private int stickPtr = -1, mousePtr = -1, rightPtr = -1; private float sx, sy, kx, ky; private final boolean[] dir = new boolean[4];   // W A S D
         private static final int[] DIRVK = { 0x57, 0x41, 0x53, 0x44 };
@@ -192,6 +242,7 @@ public final class GameActivity extends NativeActivity {
         ControlsView(Context c) {
             super(c);
             dbg = (c.getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+            loadSettings();
             Object[][] g = { {"SPACE\njump/act", 0x20, 0.93f, 0.80f}, {"E\naction", 0x45, 0.85f, 0.64f}, {"SHIFT\nhigh prof.", 0x10, 0.76f, 0.84f}, {"CTRL\nlow prof.", 0x11, 0.68f, 0.66f},
                 {"ENTER", 0x0D, 0.93f, 0.55f}, {"Q", 0x51, 0.58f, 0.84f}, {"TAB\nmap", 0x09, 0.50f, 0.68f}, {"ESC\nmenu", 0x1B, 0.06f, 0.08f}, {"F", 0x46, 0.85f, 0.43f}, {"R", 0x52, 0.76f, 0.50f} };
             for (Object[] o : g) game.add(new Btn((String) o[0], (Integer) o[1], (Float) o[2], (Float) o[3], 0.045f, 0.075f, false));
@@ -215,6 +266,7 @@ public final class GameActivity extends NativeActivity {
         private java.util.List<Btn> active() { return kbToggle.on ? kb : game; }
         private Btn hit(float x, float y) {
             if (inside(kbToggle, x, y)) return kbToggle;
+            if (inside(editBtn, x, y)) return editBtn;
             for (Btn b : active()) if (inside(b, x, y)) return b; return null; }
         private void setDir(int i, boolean on) { if (dir[i] != on) { dir[i] = on; nativeKey(DIRVK[i], on ? 1 : 0); } }
         private void stick(float x, float y) {
@@ -228,6 +280,8 @@ public final class GameActivity extends NativeActivity {
                 int a = e.getActionMasked(), i = e.getActionIndex(), id = e.getPointerId(i);
                 if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
                     float x = e.getX(i), y = e.getY(i); Btn b = hit(x, y);
+                    if (b == editBtn) { menu = !menu; invalidate(); return true; }
+                    if (menu) { menuTap(menuRow(x, y)); return true; }   /* the menu swallows taps so nothing leaks to the game */
                     if (b == kbToggle) { releaseAll(); kbToggle.on = !kbToggle.on; }
                     else if (b != null) { b.ptr = id; if (b.mk != 0) nativeMouse(b.mk, x, y); else if (b.sticky) { b.on = !b.on; nativeKey(b.vk, b.on ? 1 : 0); } else nativeKey(b.vk, 1); }
                     else if (!kbToggle.on && x < getWidth() * 0.30f && y > getHeight() * 0.35f && stickPtr < 0) { stickPtr = id; sx = x; sy = y; stick(x, y); }
@@ -268,6 +322,7 @@ public final class GameActivity extends NativeActivity {
                     p.setColor(0xFFFFFFFF); p.setTextAlign(Paint.Align.CENTER); p.setTextSize(r * 0.42f); c.drawText("STICK = W A S D", bx, by + r * 2.4f, p);
                     c.drawText("touch anywhere else = mouse (2nd finger = right click)", w * 0.5f, h * 0.97f, p);
                 }
+                if (menu) drawMenu(c, w, h);   /* drawn last, so the menu sits on top of the buttons */
             } catch (Throwable t) { android.util.Log.w("aotgame", "controls draw: " + t); }
         }
     }

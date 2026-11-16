@@ -33,8 +33,21 @@ static void hint_start(void) {
   void *mgr = gm(); if (!mgr) return; int32_t tid = (int32_t)syscall(SYS_gettid);
   g_hint = cs(mgr, &tid, 1, 16666666); LOG("performance hint session %s", g_hint ? "created" : "refused");
 }
+#include "aot_settings.h"   /* EDIT-menu settings: fps cap (below) and the upscaler (applied to the client size) */
 void aot_present_tick(void) {   /* once per presented frame, from the game thread */
-  if (!g_hint) return; struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); uint64_t now = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+  /* Frame-rate cap from the EDIT menu: hold each presented frame in its slot. A late frame does not build up a debt,
+     and with the cap off nothing extra runs at all. */
+  int cap = aot_settings_fps();
+  struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+  uint64_t now = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+  if (cap > 0) {
+    static uint64_t next_ns; uint64_t step = 1000000000ull / (unsigned)cap;
+    if (!next_ns || now > next_ns + step * 4) next_ns = now;   /* first frame, or resuming after a stall */
+    if (next_ns > now) { struct timespec s; uint64_t d = next_ns - now; s.tv_sec = (time_t)(d / 1000000000ull); s.tv_nsec = (long)(d % 1000000000ull); nanosleep(&s, NULL); }
+    next_ns += step;
+    clock_gettime(CLOCK_MONOTONIC, &t); now = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+  }
+  if (!g_hint) return;
   if (g_hint_last) g_hint_rep(g_hint, (int64_t)(now - g_hint_last)); g_hint_last = now;
 }
 static void *game_thread(void *arg) {
@@ -150,6 +163,9 @@ JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativePad0(JNIEnv *env, jc
 extern volatile uint64_t aot_frames, aot_ns[4];
 JNIEXPORT jlong JNICALL Java_com_aot_game_GameActivity_nativeNs0(JNIEnv *env, jclass cls, jint k) { (void)env; (void)cls; return k >= 0 && k < 4 ? (jlong)aot_ns[k] : 0; }
 JNIEXPORT jlong JNICALL Java_com_aot_game_GameActivity_nativeFrames0(JNIEnv *env, jclass cls) { (void)env; (void)cls; return (jlong)aot_frames; }
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeSettings0(JNIEnv *env, jclass cls, jint fps, jint upscale, jint quality) {
+  (void)env; (void)cls; aot_settings_set((int)fps, (int)upscale, (int)quality);
+}
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeView0(JNIEnv *env, jclass cls, jint w, jint h) { (void)env; (void)cls; LOG("overlay view size %dx%d", w, h); aot_input_view((uint32_t)w, (uint32_t)h); }
 static void on_cmd(struct android_app *app, int32_t cmd) {
   if (cmd == APP_CMD_INIT_WINDOW) aot_android_set_window(app->window);
