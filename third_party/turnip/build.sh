@@ -3,8 +3,7 @@
 #   libturnip_a7xx.so   Turnip v27.0.0-r2 "Standard"  Adreno 6xx / 7xx (Snapdragon 8 Gen 3 and older)
 #   libturnip_a8xx.so   Turnip v27.0.0-r2 "A8xx"      Adreno 810/812/825/829/830/840 (Snapdragon 8 Elite)
 #
-# STATUS: staged only. Nothing in the app selects or loads these yet, so they are inert files in the APK; the
-# selection code is a separate change.
+# STATUS: loaded at run time by dxvk_proxy.c (turnip_setup) through libadrenotools; the hook libraries come from the app's CMake build.
 #
 # These are the drivers' own prebuilt releases (short of a full Mesa tree and a KGSL kernel this build cannot compile
 # them here), and the zips contain exactly the ICD the runtime would load: libvulkan_freedreno.so. Every download is
