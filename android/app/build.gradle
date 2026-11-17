@@ -25,7 +25,8 @@ android {
         arguments "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
                   "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
                   "-DAOT_MODE=${project.findProperty('aotMode') ?: 'transpiler'}",
-                  "-DAOT_PREBUILT_GEN=${project.findProperty('aotPrebuilt') ?: ''}"
+                  "-DAOT_PREBUILT_GEN=${project.findProperty('aotPrebuilt') ?: ''}",
+                  "-DAOT_DEBLOAT=${project.findProperty('aotDebloat') ?: '0'}"
       }
     }
   }

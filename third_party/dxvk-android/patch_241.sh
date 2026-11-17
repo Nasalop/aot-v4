@@ -18,3 +18,21 @@ sub('meson.build',"""  if (not lib_sdl2.found() and not lib_glfw.found())
     error('SDL2 or GLFW are required to build dxvk-native')
   endif""","")
 P
+# Runtime choice of the Vulkan loader (same change as patch.sh): keeps the system driver as the default.
+python3 - "$D" <<'P' || true
+import sys
+d = sys.argv[1]; p = d + '/src/vulkan/loader.cpp'
+try: s = open(p).read()
+except OSError:
+    print('turnip: no src/vulkan/loader.cpp in this tree; DXVK keeps the system Vulkan loader'); raise SystemExit(0)
+if '"libvulkan.so.1"' not in s:
+    print('turnip: DXVK does not name libvulkan.so.1 here; keeping the system loader'); raise SystemExit(0)
+s = s.replace('"libvulkan.so.1"', 'aot_vulkan_lib_name()')
+s = ('#include <cstdlib>\n'
+     'static inline const char* aot_vulkan_lib_name() {\n'
+     '  const char* p = std::getenv("AOT_VULKAN_LIB");\n'
+     '  return (p && *p) ? p : "libvulkan.so.1";\n'
+     '}\n') + s
+open(p, 'w').write(s)
+print('turnip: DXVK now honours AOT_VULKAN_LIB')
+P

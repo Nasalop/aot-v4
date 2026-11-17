@@ -12,6 +12,12 @@ set(GLUE ${ANDROID_NDK}/sources/android/native_app_glue)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -w -fno-strict-aliasing -fwrapv")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Release debloat (-PaotDebloat=1 from the release workflow, off everywhere else so dev builds keep their symbols):
+# no debug info is generated at all. The libraries are additionally stripped after linking, further down.
+option(AOT_DEBLOAT "Drop debug info and strip the packaged native libraries" OFF)
+if(AOT_DEBLOAT)
+  add_compile_options(-g0)
+endif()
 if(NOT DEFINED AOT_MODE)
   set(AOT_MODE transpiler)
 endif()
@@ -55,9 +61,20 @@ else()
     set(GEN ${CMAKE_CURRENT_SOURCE_DIR}/gen/aot_tab.c)
   endif()
   set_source_files_properties(${GEN} PROPERTIES COMPILE_FLAGS "-O2 -fwrapv -fno-strict-aliasing")   # same flags the release.yml shards use for these files
-  add_library(aotgame SHARED android_main.c ${GLUE}/android_native_app_glue.c ${RT}/runtime.c ${RT}/win_resolver.c ${RT}/shims.c ${RT}/win_compat.c ${RT}/win_file.c ${RT}/win_file_async.c ${RT}/win_audio.c ${RT}/win_d3d10.c ${RT}/win_sys.c ${RT}/win_x86.c ${RT}/win_x86_dll.c ${RT}/win_input.c ${RT}/win_gfx.c ${RT}/aot_settings.c ${RT}/dxvk_proxy.c ${RT}/hlsl_compile.c ${RT}/gfx_backend.c ${RT}/gfx_draw_batch.c ${GEN})
+  add_library(aotgame SHARED android_main.c ${GLUE}/android_native_app_glue.c ${RT}/runtime.c ${RT}/win_resolver.c ${RT}/shims.c ${RT}/win_compat.c ${RT}/win_file.c ${RT}/win_file_async.c ${RT}/win_audio.c ${RT}/win_d3d10.c ${RT}/win_sys.c ${RT}/win_x86.c ${RT}/win_x86_dll.c ${RT}/win_input.c ${RT}/win_gfx.c ${RT}/aot_settings.c ${RT}/aot_gpu.c ${RT}/dxvk_proxy.c ${RT}/hlsl_compile.c ${RT}/gfx_backend.c ${RT}/gfx_draw_batch.c ${GEN})
   target_sources(aotgame PRIVATE ${RT}/aot_prof.c)   # sampling profiler (compiles to nothing with -DAOT_RELEASE)
   add_library(aotreserve SHARED ${RT}/aot_reserve.c)   # LD_PRELOADed by wrap.sh to reserve the PE32 image range before ART starts
+  # The four Vulkan entry points DXVK dlopen()s, forwarded to a bundled Turnip driver (aot_vk_icd.c). Its own tiny
+  # library so no Vulkan symbol lands in aotgame and the system path is untouched when no Turnip driver is chosen.
+  add_library(aotvkicd SHARED ${RT}/aot_vk_icd.c)
+  target_link_libraries(aotvkicd PRIVATE log)
+  # Release debloat: strip the symbol tables out of the libraries that go into the APK. .dynsym is kept, so the
+  # runtime's dlsym() of the DXVK entry points and dlopen() of the driver wrapper keep working.
+  if(AOT_DEBLOAT AND CMAKE_STRIP)
+    foreach(t aotgame aotreserve aotvkicd)
+      add_custom_command(TARGET ${t} POST_BUILD COMMAND ${CMAKE_STRIP} --strip-unneeded "$<TARGET_FILE:${t}>" VERBATIM)
+    endforeach()
+  endif()
   target_include_directories(aotgame PRIVATE ${RT} ${GLUE} ${RT}/../../third_party/vkd3d/include)
   target_compile_definitions(aotgame PRIVATE AOT_ANDROID_APP=1)
   target_link_options(aotgame PRIVATE -Wl,-u,ANativeActivity_onCreate)

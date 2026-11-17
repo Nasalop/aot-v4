@@ -34,6 +34,7 @@ static void hint_start(void) {
   g_hint = cs(mgr, &tid, 1, 16666666); LOG("performance hint session %s", g_hint ? "created" : "refused");
 }
 #include "aot_settings.h"   /* EDIT-menu settings: fps cap (below) and the upscaler (applied to the client size) */
+#include "aot_gpu.h"         /* Vulkan driver choice (system / bundled Turnip), applied before DXVK starts */
 void aot_present_tick(void) {   /* once per presented frame, from the game thread */
   /* Frame-rate cap from the EDIT menu: hold each presented frame in its slot. A late frame does not build up a debt,
      and with the cap off nothing extra runs at all. */
@@ -56,6 +57,11 @@ static void *game_thread(void *arg) {
   const char *ext = g_app->activity->externalDataPath; char dir[512], exe[600], lg[600];
   snprintf(dir, sizeof dir, "%s/game", ext); mkdir(ext, 0777); mkdir(dir, 0777);
   snprintf(exe, sizeof exe, "%s/game.exe", dir); snprintf(lg, sizeof lg, "%s/log.txt", ext);
+  /* The driver menu stores its choice before game_dir.txt is written, so it is always on disk before the game can
+     start: "<driver id> <nativeLibraryDir>". No file (first run, or an older install) keeps the system driver. */
+  { char dp[700]; snprintf(dp, sizeof dp, "%s/driver.txt", ext);
+    FILE *df = fopen(dp, "r");
+    if (df) { int id = 0; char ld[512] = ""; if (fscanf(df, "%d %511s", &id, ld) == 2) { aot_gpu_init(ld, id); LOG("driver choice %d from %s", id, dp); } fclose(df); } }
   int fd = open(lg, O_WRONLY | O_CREAT | O_TRUNC, 0666); if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); }
   if (access(exe, R_OK) != 0) {   /* first run: copy bundled exe out of the APK */
     AAsset *a = AAssetManager_open(g_app->activity->assetManager, "game.exe", AASSET_MODE_STREAMING);
@@ -166,6 +172,14 @@ JNIEXPORT jlong JNICALL Java_com_aot_game_GameActivity_nativeNs0(JNIEnv *env, jc
 JNIEXPORT jlong JNICALL Java_com_aot_game_GameActivity_nativeFrames0(JNIEnv *env, jclass cls) { (void)env; (void)cls; return (jlong)aot_frames; }
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeSettings0(JNIEnv *env, jclass cls, jint fps, jint upscale, jint quality) {
   (void)env; (void)cls; aot_settings_set((int)fps, (int)upscale, (int)quality);
+}
+/* Vulkan driver from the menu: 0 = the phone's own driver, 1 = bundled Turnip for Adreno 6xx/7xx, 2 = for Adreno 8xx.
+   Takes effect the next time the game starts; a driver that does not come up is replaced by the system one. */
+JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeDriver0(JNIEnv *env, jclass cls, jint id, jstring libdir) {
+  (void)cls; char ld[512] = "";
+  if (libdir) { const char *s = (*env)->GetStringUTFChars(env, libdir, NULL); if (s) { snprintf(ld, sizeof ld, "%s", s); (*env)->ReleaseStringUTFChars(env, libdir, s); } }
+  aot_gpu_init(ld, (int)id);
+  LOG("driver choice %d (native libs %s)", (int)id, ld[0] ? ld : "?");
 }
 JNIEXPORT void JNICALL Java_com_aot_game_GameActivity_nativeView0(JNIEnv *env, jclass cls, jint w, jint h) { (void)env; (void)cls; LOG("overlay view size %dx%d", w, h); aot_input_view((uint32_t)w, (uint32_t)h); }
 static void on_cmd(struct android_app *app, int32_t cmd) {

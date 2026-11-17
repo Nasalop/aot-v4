@@ -80,6 +80,21 @@ public final class GameActivity extends NativeActivity {
     /* EDIT menu -> runtime: fps cap (0 = off), upscaler on/off, quality level 0..4 */
     private static native void nativeSettings0(int fpsCap, int upscale, int quality);
     private static void nativeSettings(int fpsCap, int upscale, int quality) { if (nativesOk) try { nativeSettings0(fpsCap, upscale, quality); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "settings natives unavailable: " + t); } }
+    /* Vulkan driver from the menu: 0 = the phone's own driver (default), 1 = bundled Turnip for Adreno 6xx/7xx,
+       2 = bundled Turnip for Adreno 8xx. Stored in the preferences and written to driver.txt, which the native side
+       reads before it boots the game, so the choice is in place even if this call is still in flight. */
+    private static native void nativeDriver0(int id, String nativeLibDir);
+    private void applyDriverChoice(int id) {
+        if (id < 0 || id > 2) id = 0;
+        getSharedPreferences("aot_settings", 0).edit().putInt("driver", id).apply();
+        try {
+            File dir = getExternalFilesDir(null);
+            if (dir != null) try (FileOutputStream out = new FileOutputStream(new File(dir, "driver.txt"))) {
+                out.write((id + " " + getApplicationInfo().nativeLibraryDir + "\n").getBytes("UTF-8"));
+            }
+        } catch (Throwable t) { android.util.Log.w("aotgame", "driver.txt: " + t); }
+        if (nativesOk) try { nativeDriver0(id, getApplicationInfo().nativeLibraryDir); } catch (Throwable t) { nativesOk = false; }
+    }
     private static boolean nativesOk = true;
     private static void nativeKey(int vk, int down) { if (nativesOk) try { nativeKey0(vk, down); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
     private static void nativeMouse(int kind, float x, float y) { if (nativesOk) try { nativeMouse0(kind, x, y); } catch (Throwable t) { nativesOk = false; android.util.Log.w("aotgame", "input natives unavailable: " + t); } }
@@ -193,47 +208,51 @@ public final class GameActivity extends NativeActivity {
            Everything is applied to the runtime through nativeSettings(); nothing here parses files. */
         private final Btn editBtn = new Btn("EDIT", -1, 0.055f, 0.19f, 0.045f, 0.06f, true);
         private boolean menu;
-        private int setFps, setUpscale, setQuality = 2;
+        private int setFps, setUpscale, setQuality = 2, setDriver;   /* setDriver: 0 = phone's driver, 1 = Turnip 6xx/7xx, 2 = Turnip 8xx */
         private static final String[] FPS_TXT = { "OFF", "30 FPS", "60 FPS" };
+        private static final String[] DRV_TXT = { "SYSTEM", "TURNIP (6xx/7xx)", "TURNIP (8xx)" };
         private static final String[] QUAL_TXT = { "ULTRA QUALITY", "QUALITY", "BALANCED", "PERFORMANCE", "ULTRA PERFORMANCE" };
         private android.content.SharedPreferences prefs() { return getContext().getSharedPreferences("aot_settings", 0); }
         private void sendSettings() { nativeSettings(setFps == 0 ? 0 : (setFps == 1 ? 30 : 60), setUpscale, setQuality); }
         private void loadSettings() {
             android.content.SharedPreferences s = prefs();
-            setFps = s.getInt("fps", 0); setUpscale = s.getInt("upscale", 0); setQuality = s.getInt("quality", 2);
+            setFps = s.getInt("fps", 0); setUpscale = s.getInt("upscale", 0); setQuality = s.getInt("quality", 2); setDriver = s.getInt("driver", 0);
+            if (setDriver < 0 || setDriver > 2) setDriver = 0;
             if (setFps < 0 || setFps > 2) setFps = 0;
             if (setQuality < 0 || setQuality > 4) setQuality = 2;
             if (setUpscale != 0) setUpscale = 1;
             sendSettings();
         }
         private void saveSettings() {
-            prefs().edit().putInt("fps", setFps).putInt("upscale", setUpscale).putInt("quality", setQuality).apply();
+            prefs().edit().putInt("fps", setFps).putInt("upscale", setUpscale).putInt("quality", setQuality).putInt("driver", setDriver).apply();
             sendSettings();
         }
         private int menuRow(float x, float y) {   /* rows of the menu, in the same normalised coordinates as the buttons */
             float w = getWidth(), h = getHeight();
             if (x < w * 0.28f || x > w * 0.82f) return -1;
-            for (int i = 0; i < 4; i++) if (Math.abs(y - h * (0.245f + i * 0.085f)) < h * 0.038f) return i;
+            for (int i = 0; i < 5; i++) if (Math.abs(y - h * (0.245f + i * 0.085f)) < h * 0.038f) return i;
             return -1;
         }
         private void menuTap(int row) {
             if (row == 0) setFps = (setFps + 1) % 3;
             else if (row == 1) setUpscale = setUpscale != 0 ? 0 : 1;
             else if (row == 2) { if (setUpscale != 0) setQuality = (setQuality + 1) % 5; }
-            else if (row == 3) { menu = false; invalidate(); return; }
+            else if (row == 3) { setDriver = (setDriver + 1) % 3; ((GameActivity) getContext()).applyDriverChoice(setDriver); }   /* takes effect on the next start */
+            else if (row == 4) { menu = false; invalidate(); return; }
             saveSettings(); invalidate();
         }
         private void drawMenu(Canvas c, float w, float h) {
             p.setStyle(Paint.Style.FILL); p.setColor(0xC8000000);
-            c.drawRect(w * 0.28f, h * 0.15f, w * 0.82f, h * 0.60f, p);
+            c.drawRect(w * 0.28f, h * 0.15f, w * 0.82f, h * 0.66f, p);
             p.setColor(0xFFFFFFFF); p.setTextAlign(Paint.Align.CENTER);
             p.setTextSize(h * 0.030f); c.drawText("SETTINGS", w * 0.55f, h * 0.195f, p);
             String[] rows = { "FPS CAP: " + FPS_TXT[setFps],
                               "UPSCALER: " + (setUpscale != 0 ? "SGSR2" : "OFF"),
                               "QUALITY: " + (setUpscale != 0 ? QUAL_TXT[setQuality] : "-"),
+                              "DRIVER: " + DRV_TXT[setDriver],
                               "CLOSE" };
             p.setTextSize(h * 0.026f);
-            for (int i = 0; i < 4; i++) c.drawText(rows[i], w * 0.55f, h * (0.245f + i * 0.085f), p);
+            for (int i = 0; i < 5; i++) c.drawText(rows[i], w * 0.55f, h * (0.245f + i * 0.085f), p);
         }
         private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
         private int stickPtr = -1, mousePtr = -1, rightPtr = -1; private float sx, sy, kx, ky; private final boolean[] dir = new boolean[4];   // W A S D
@@ -359,6 +378,8 @@ public final class GameActivity extends NativeActivity {
             if (prev != null) prev.uncaughtException(th, ex);
         });
         super.onCreate(state);
+        /* before the native thread can reach DXVK: the driver chosen in the last menu (system driver when unset) */
+        try { applyDriverChoice(getSharedPreferences("aot_settings", 0).getInt("driver", 0)); } catch (Throwable t) { android.util.Log.w("aotgame", "driver choice: " + t); }
         try { getWindow().getDecorView().post(this::addControls); } catch (Throwable t) { android.util.Log.w("aotgame", "controls overlay skipped: " + t); }
         boolean bundled = false;
         try (InputStream in = getAssets().open("game.exe")) { bundled = true; } catch (Exception ignored) { }
@@ -459,9 +480,39 @@ public final class GameActivity extends NativeActivity {
                     .setPositiveButton("Choose again", (d, w) -> ensureGameAccess()).show();
             return;
         }
+        askDriver(dir);
+    }
+
+    /* After the folder is picked, one question decides the Vulkan driver. The game folder file is written only after
+       the answer, and the native side blocks on that file, so the choice is always stored before the engine starts.
+       "System driver" is first and is the default: nothing changes unless a driver is picked. */
+    private void askDriver(File dir) {
+        int current = getSharedPreferences("aot_settings", 0).getInt("driver", 0);
+        if (current < 0 || current > 2) current = 0;
+        String[] items = {
+                "System driver (recommended)",
+                "Turnip - Adreno 6xx / 7xx",
+                "Turnip - Adreno 8xx (8 Elite)" };
+        new AlertDialog.Builder(this)
+                .setTitle("Graphics driver")
+                .setMessage("System uses your phone's own Vulkan driver. Turnip is the open-source Mesa driver: it can "
+                        + "run some games faster, but it is experimental and is skipped automatically when it does not "
+                        + "start on this phone.")
+                .setCancelable(false)
+                .setSingleChoiceItems(items, current, (d, which) -> { d.dismiss(); startGame(dir, which); })
+                .setNegativeButton("Back", (d, w) -> { gateOpen = false; ensureGameAccess(); })
+                .show();
+    }
+
+    private void startGame(File dir, int driver) {
+        applyDriverChoice(driver);
         try (FileOutputStream o = new FileOutputStream(gameDirFile())) { o.write((dir.getAbsolutePath() + "\n").getBytes("UTF-8")); }
-        catch (Exception e) { showError("Could not save the game folder: " + e.getMessage()); return; }
-        android.widget.Toast.makeText(this, "Starting game from " + dir + " (log: aot_log.txt in that folder)", android.widget.Toast.LENGTH_LONG).show();
+        catch (Exception e) {
+            android.widget.Toast.makeText(this, "Could not save the game folder: " + e.getMessage(), android.widget.Toast.LENGTH_LONG).show();
+            gateOpen = false; ensureGameAccess(); return;
+        }
+        String drv = driver == 0 ? "system driver" : driver == 1 ? "Turnip (6xx/7xx)" : "Turnip (8xx)";
+        android.widget.Toast.makeText(this, "Starting from " + dir + " with the " + drv + " (log: aot_log.txt in that folder)", android.widget.Toast.LENGTH_LONG).show();
     }
 
     @Override
