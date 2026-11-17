@@ -80,6 +80,22 @@ else()
     target_link_libraries(aotgame PRIVATE -Wl,--whole-archive ${AOT_SHARDS} -Wl,--no-whole-archive)
   endif()
 
+  # libadrenotools: opens a private Vulkan loader with a custom (Turnip) driver in it. Its four hook libraries (libhook_impl, libmain_hook,
+  # libfile_redirect_hook, libgsl_alloc_hook) are built here and packaged next to libaotgame.so; the library itself is linked statically.
+  include(FetchContent)
+  if(NOT DEFINED CMAKE_ANDROID_ARCH_ABI)
+    set(CMAKE_ANDROID_ARCH_ABI arm64-v8a)
+  endif()
+  FetchContent_Declare(adrenotools
+    GIT_REPOSITORY https://github.com/bylaws/libadrenotools.git
+    GIT_TAG 8fae8ce254dfc1344527e05301e43f37dea2df80
+    GIT_SUBMODULES lib/linkernsbypass
+  )
+  set(BUILD_SHARED_LIBS OFF)
+  FetchContent_MakeAvailable(adrenotools)
+  target_link_libraries(aotgame PRIVATE adrenotools)
+  add_dependencies(aotgame hook_impl main_hook file_redirect_hook gsl_alloc_hook)
+
   option(AOT_ENABLE_DXBC_SPIRV "Build dxbc-spirv for Direct3D shader translation" ON)
   if(AOT_ENABLE_DXBC_SPIRV)
     include(FetchContent)
