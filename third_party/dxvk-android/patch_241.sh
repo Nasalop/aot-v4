@@ -18,3 +18,4 @@ sub('meson.build',"""  if (not lib_sdl2.found() and not lib_glfw.found())
     error('SDL2 or GLFW are required to build dxvk-native')
   endif""","")
 P
+python3 "$H/patch_vkloader.py" "$D"
