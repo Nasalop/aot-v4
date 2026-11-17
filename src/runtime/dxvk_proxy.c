@@ -321,6 +321,42 @@ static void *sym(const char *n) { for (int i = 0; i < 3; i++) if (hd[i]) { void 
 static const char *const tier_sfx[NTIER] = { "", "_t1", "_t2" };
 static const char *const tier_ver[NTIER] = { "3.1.1", "2.4.1", "1.9.2 (native 1.x line)" };
 static void *g_win;
+/* ---- Turnip (Mesa Freedreno) instead of the phone's stock Adreno driver ----
+   libadrenotools opens a private copy of the system Vulkan loader whose driver slot is filled with the Turnip ICD that build.sh staged in the APK
+   (libturnip_a8xx.so for Adreno 8xx, libturnip_a7xx.so for 6xx/7xx). Its vkGetInstanceProcAddr is handed to DXVK through AOT_VK_GIPA (patch_vkloader.py),
+   so only DXVK 3.1.1 / 2.4.1 use it; the 1.9.2 tier links the system loader and stays on the stock driver.
+   Choice: AOT_GPU_DRIVER or a one-word file gpu_driver.txt in the game folder: auto (default) | system | turnip | turnip_a8xx | turnip_a7xx.
+   auto = Turnip when the GPU model is readable and a matching driver is in the APK. Any failure (driver missing, loader refused, no device, no
+   DXVK device) drops back to the stock driver and says so in the log. */
+#ifdef __ANDROID__
+#include <adrenotools/driver.h>
+static int g_turnip;
+static void turnip_off(void) { unsetenv("AOT_VK_GIPA"); g_turnip = 0; }
+static void turnip_setup(void) {
+  char mode[40] = "auto"; const char *e = getenv("AOT_GPU_DRIVER");
+  if (e && *e) snprintf(mode, sizeof mode, "%s", e);
+  else { FILE *f = fopen("gpu_driver.txt", "r"); if (f) { char b[40]; if (fgets(b, sizeof b, f)) { b[strcspn(b, " \t\r\n")] = 0; if (b[0]) snprintf(mode, sizeof mode, "%s", b); } fclose(f); } }
+  if (!strcmp(mode, "system")) { fprintf(stderr, "[gpu] driver: stock Adreno driver (gpu_driver = system)\n"); return; }
+  char model[64] = ""; { FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r"); if (f) { if (fgets(model, sizeof model, f)) model[strcspn(model, "\r\n")] = 0; fclose(f); } }
+  int n = 0; for (const char *q = model; *q; q++) if (*q >= '0' && *q <= '9') { n = atoi(q); break; }
+  const char *drv = NULL;
+  if (!strcmp(mode, "turnip_a8xx")) drv = "libturnip_a8xx.so"; else if (!strcmp(mode, "turnip_a7xx")) drv = "libturnip_a7xx.so";
+  else if (n >= 800) drv = "libturnip_a8xx.so"; else if (n >= 600) drv = "libturnip_a7xx.so";
+  if (!drv) { fprintf(stderr, "[gpu] driver: stock Adreno driver (GPU model \"%s\" is not one Turnip is chosen for; put turnip_a8xx or turnip_a7xx in gpu_driver.txt to force one)\n", model); return; }
+  Dl_info di; char dir[600];
+  if (!dladdr((void *)turnip_setup, &di) || !di.dli_fname) { fprintf(stderr, "[gpu] driver: stock Adreno driver (cannot locate the app's library folder)\n"); return; }
+  snprintf(dir, sizeof dir, "%s", di.dli_fname); { char *sl = strrchr(dir, '/'); if (!sl) return; sl[1] = 0; }   /* nativeLibraryDir, with the trailing slash adrenotools expects */
+  char full[700]; snprintf(full, sizeof full, "%s%s", dir, drv);
+  if (access(full, R_OK) != 0) { fprintf(stderr, "[gpu] driver: stock Adreno driver (%s is not in this APK)\n", drv); return; }
+  void *h = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, NULL, dir, dir, drv, NULL, NULL);
+  void *gipa = h ? dlsym(h, "vkGetInstanceProcAddr") : NULL;
+  if (!gipa) { fprintf(stderr, "[gpu] driver: stock Adreno driver (libadrenotools could not open a Vulkan loader for %s)\n", drv); return; }
+  char b[32]; snprintf(b, sizeof b, "%llx", (unsigned long long)(uintptr_t)gipa); setenv("AOT_VK_GIPA", b, 1); g_turnip = 1;
+  fprintf(stderr, "[gpu] driver: Turnip (%s) for GPU \"%s\"; DXVK 3.1.1 / 2.4.1 use it, the 1.9.2 tier uses the stock driver\n", drv, model);
+}
+#else
+static int g_turnip; static void turnip_off(void) {} static void turnip_setup(void) {}
+#endif
 /* Load one tier's three libraries and hand them the window. No device is created here: tier 0 then runs exactly the path it always did, and a
    newer tier is only given up on if the real factory/adapter/device creation below fails on this phone's driver. */
 static int load_tier(int t) {
@@ -350,6 +386,7 @@ static int init_dxvk(void) {
   setenv("DXVK_STATE_CACHE", "1", 0);
   g_win = aot_present_window(); if (!g_win) { fprintf(stderr, "[dxvk] no Android window yet\n"); return -1; }
   { char b[32]; snprintf(b, sizeof b, "%llx", (unsigned long long)(uintptr_t)g_win); setenv("AOT_ANDROID_WINDOW", b, 1); }
+  turnip_setup();
   int t0 = 0; { const char *e = getenv("AOT_DXVK_TIER"); if (e && e[0] >= '0' && e[0] < '0' + NTIER) t0 = e[0] - '0'; }   /* testing: start at an older tier */
   g_tier = t0 - 1;
   if (!next_tier()) { fprintf(stderr, "[dxvk] no DXVK tier is available (using the built-in D3D10 emulation)\n"); return -1; }
@@ -384,6 +421,7 @@ uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_de
       else { hr = cd(fac, ad, 0, 0xA000, &dev); if ((int32_t)hr < 0) fprintf(stderr, "[dxvk] D3D10CoreCreateDevice failed %#x\n", hr); }
     }
     if ((int32_t)hr >= 0 && dev) break;
+    if (g_turnip) { fprintf(stderr, "[gpu] DXVK could not create a device on Turnip (hr=%#x); retrying tier %d on the stock driver\n", hr, g_tier); turnip_off(); g_fac = NULL; continue; }
     if (!next_tier()) return (int32_t)hr < 0 ? hr : (uint64_t)-1;
   }
   if (sc_out) {
