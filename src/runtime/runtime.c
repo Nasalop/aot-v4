@@ -394,7 +394,7 @@ int aot_keep(const char *fmt) {
   if (aot_log_all) return 1;
   if (!fmt) return 0;
   const char *s = fmt; int nl = 0; if (*s == '\n') { s++; nl = 1; }
-  static const char *const keep[] = { "[aot]", "[cpu]", "[gfx]", "[hlsl]", "[winfile]", "[d3d10] Create", "[dxvk] tier", "[dxvk] using", "[dxvk] no DXVK",
+  static const char *const keep[] = { "[aot]", "[cpu]", "[gfx]", "[gpu]", "[hlsl]", "[winfile]", "[d3d10] Create", "[dxvk] tier", "[dxvk] using", "[dxvk] no DXVK",
     "[dxvk] out of", "[dxvk] missing", "[dxvk] Create", "[dxvk] Enum", "[dxvk] D3D10", "[dxvk] host", "[dxvk] no Android", "[dxvk] %s::%s", "[dxvk] guest", "[audio]",
     "cannot", "mappings", "executable", "image base", "entry point", "usage", "[heap]", "[in] GetDevice", "[ev]", "  T", "    hot T", "    regs T", NULL };
   int ok = 0; for (int i = 0; keep[i]; i++) if (!strncmp(s, keep[i], strlen(keep[i]))) { ok = 1; break; }
