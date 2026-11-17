@@ -20,3 +20,4 @@ sub('meson.build',"""  if (not lib_sdl3.found() and not lib_sdl2.found() and not
 sub('src/dxvk/dxvk_presenter.cpp',"    if (m_acquireStatus != VK_SUCCESS && m_swapchain)\n      Logger::info","    if (m_acquireStatus == VK_SUBOPTIMAL_KHR) m_acquireStatus = VK_SUCCESS;  /* Android: rotated display makes every present SUBOPTIMAL; rebuilding each frame is useless */\n\n    if (m_acquireStatus != VK_SUCCESS && m_swapchain)\n      Logger::info")
 sub('src/dxvk/dxvk_presenter.cpp',"    if (status != VK_SUCCESS) {\n      Logger::info","    if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR) {\n      Logger::info")
 P
+python3 "$H/patch_vkloader.py" "$D"
