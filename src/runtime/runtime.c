@@ -432,12 +432,17 @@ static __thread int aot_guest_depth;   /* > 0 when a shim re-entered the guest (
 /* PE32 import calls are served right here instead of returning to run(): a call into a thunk used to unwind to the dispatcher, which did the
    thunk check, watchdog bookkeeping, two clock reads and a region lookup per import, then re-entered translated code. Now the shim runs and the
    return address is tail-dispatched. EXIT/RET thunks, unimplemented imports and AOT_TRACE_IMPORTS runs still go through run(). */
+/* Serving imports inside aot_tail is a speed-up that is OFF until it has been confirmed on a device (build with -DAOT_INLINE_IMPORTS=1). With it off every
+   import returns to run(), exactly as in the builds that are known to boot. */
+#ifndef AOT_INLINE_IMPORTS
+#define AOT_INLINE_IMPORTS 0
+#endif
 static int imp_trace = -1;
 uint64_t aot_tail(CPU *c, uint64_t pc) {
   for (;;) {
     if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
-      if (!aot_is_pe32 || idx <= RET_IDX || idx >= nthunks || !thunks[idx].fn) return pc;
+      if (!AOT_INLINE_IMPORTS || !aot_is_pe32 || idx <= RET_IDX || idx >= nthunks || !thunks[idx].fn) return pc;
       if (__builtin_expect(imp_trace < 0, 0)) imp_trace = getenv("AOT_TRACE_IMPORTS") != NULL;
       if (imp_trace) return pc;
       Thunk *t = &thunks[idx]; WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx;
