@@ -66,7 +66,7 @@ RESERVE_PROBE = ('{static int n_=0;uint32_t w_=LD(uint32_t,(uint32_t)r1+4u);'
 # Native replacements for the statically linked MSVC C-runtime string/memory routines of the AC1 exe (cdecl, 32-bit). The translated versions are
 # SSE/rep loops with all vector state in memory, several times slower than the host's own; ~450 call sites each for memset and memmove. A replacement is
 # applied ONLY when the function's first bytes match exactly (so another game, or another build of this one, is never hooked by address alone).
-# Registers other than eax are left alone: the originals only clobber eax/ecx/edx/flags, which no caller may rely on.
+# Register numbering: r0=eax r1=ecx r2=edx r3=ebx (x86 encoding order). Registers other than the result are left alone: the originals only clobber eax/ecx/edx/flags, which no caller may rely on.
 NATIVE_CRT_ON = True   # False = every C-runtime function is translated like any other code (one-line revert of this whole pass)
 # Calls to these are dropped at the call site instead of being redirected to the hooked entry. __security_check_cookie
 # passes unless the guest has already corrupted its own stack, so the check itself is nothing; what it costs is the
@@ -89,12 +89,12 @@ NATIVE_CRT = {
     # cookie, fail the process on mismatch, return. The cookie is read from its fixed image address here, so the
     # value is whatever __security_init_cookie wrote, and a genuine mismatch still stops the game as before.
     0x9bbe4e: (bytes.fromhex('3b0dace88e017502f3c3'),
-               '{if((uint32_t)r2!=(uint32_t)LD(uint32_t,0x18ee8ac))aot_unimpl(0x9bbe4eULL,"__security_check_cookie: stack cookie mismatch");' + _NRET),
+               '{if((uint32_t)r1!=(uint32_t)LD(uint32_t,0x18ee8ac))aot_unimpl(0x9bbe4eULL,"__security_check_cookie: stack cookie mismatch");' + _NRET),
     # __aullshr(value, count): unsigned 64-bit shift right, value in edx:eax, count in cl, result in edx:eax. Counts
     # of 64 and above give 0, exactly as the original's two range tests do.
     0x9bd020: (bytes.fromhex('80f940731580f92073060fadd0d3eac3'),
-               '{uint32_t n_=(uint32_t)(r2&0xff);uint64_t v_=((uint64_t)(r1&0xffffffff)<<32)|(r0&0xffffffff);'
-               'v_=n_>=64?0:(v_>>n_);r0=v_&0xffffffff;r1=v_>>32;' + _NRET),
+               '{uint32_t n_=(uint32_t)(r1&0xff);uint64_t v_=((uint64_t)(r2&0xffffffff)<<32)|(r0&0xffffffff);'
+               'v_=n_>=64?0:(v_>>n_);r0=v_&0xffffffff;r2=v_>>32;' + _NRET),
     0x9bbea0: (bytes.fromhex('558bec57568b750c8b4d108b7d088bc18bd103c63bfe7608'),   # memmove/memcpy(dst, src, n) -> dst; the CRT one handles overlap
                '{uint32_t d_=LD(uint32_t,r4+4),s_=LD(uint32_t,r4+8),n_=LD(uint32_t,r4+12);if(n_)memmove((void*)(uintptr_t)d_,(const void*)(uintptr_t)s_,n_);r0=d_;' + _NRET),
     0x9bc5d0: (bytes.fromhex('8b54240c8b4c240485d2'),                                # memset(dst, c, n) -> dst
@@ -116,7 +116,7 @@ NATIVE_CRT = {
     0x9bbe60: (bytes.fromhex('8b4424088b4c24100bc88b4c240c7509'),                    # 64-bit multiply helper (77 call sites)
                '{uint32_t l1_=LD(uint32_t,r4+4),h1_=LD(uint32_t,r4+8),l2_=LD(uint32_t,r4+12),h2_=LD(uint32_t,r4+16);'
                'uint64_t p_=(uint64_t)(((uint64_t)h1_<<32)|l1_)*(uint64_t)(((uint64_t)h2_<<32)|l2_);'
-               'r0=p_&0xffffffff;r1=p_>>32;pc=POP32();r4+=16;goto dispatch;}'),
+               'r0=p_&0xffffffff;r2=p_>>32;pc=POP32();r4+=16;goto dispatch;}'),
 }
 RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=LD(uint32_t,(uint32_t)r4+4u),need_=sz_+1u;'
                  'if(nc_>((w_>>0xe)&0x3fffu)&&nc_<need_){uint32_t ask_=need_+(need_>>2);'
