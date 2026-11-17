@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # build.sh <outdir>: stage the bundled Turnip (Mesa Freedreno Vulkan) drivers for the APK.
-#   libturnip_a7xx.so   Turnip v27.0.0-r2 "Standard"  Adreno 6xx / 7xx (Snapdragon 8 Gen 3 and older)
-#   libturnip_a8xx.so   Turnip v27.0.0-r2 "A8xx"      Adreno 810/812/825/829/830/840 (Snapdragon 8 Elite)
+#   libturnip_a7xx.so   Turnip v27.0.0-R2        Adreno 6xx / 7xx (Snapdragon 8 Gen 3 and older)
+#   libturnip_a8xx.so   Turnip Gen8 V39          Adreno 810/812/825/829/830/840 (Snapdragon 8 Elite)
 #
 # STATUS: loaded at run time by dxvk_proxy.c (turnip_setup) through libadrenotools; the hook libraries come from the app's CMake build.
 #
-# These are the drivers' own prebuilt releases (short of a full Mesa tree and a KGSL kernel this build cannot compile
-# them here), and the zips contain exactly the ICD the runtime would load: libvulkan_freedreno.so. Every download is
-# checked against the SHA-256 published in that release's notes.
+# Source: StevenMXZ/Adreno-Tools-Drivers release v39 ("Turnip Gen8 V39 / Turnip v27.0.0-R2", Mesa build, Vulkan 1.4.367,
+# 2026-11-07). Both zips are straight from that release and contain exactly the ICD the runtime loads:
+# libvulkan_freedreno.so (8.36 MB / 8.37 MB) plus meta.json. Every download is checked against the SHA-256 that release
+# publishes for the file.
 #
 # A download or hash failure is NOT fatal: the APK simply ships without that file. Nothing else depends on them.
 set -uo pipefail
 OUT=$(realpath -m "${1:?usage: build.sh <outdir>}")
-TAG=v27.0.0-20261114-r2
-BASE="https://github.com/The412Banner/Banners-Turnip/releases/download/$TAG"
+TAG=v39
+BASE="https://github.com/StevenMXZ/Adreno-Tools-Drivers/releases/download/$TAG"
 mkdir -p "$OUT"
 
 stage() {   # stage <zip> <sha256> <staged name> <what it is for>
@@ -37,11 +38,11 @@ stage() {   # stage <zip> <sha256> <staged name> <what it is for>
   echo "turnip: staged $dst ($(du -h "$OUT/$dst" | cut -f1)) from $zip - $what"
 }
 
-stage "Turnip-$TAG.zip"      "40f5becf92911aea9b18e1ecb9e1d4e790ebb1dde6d5a863f6a9c1d2d083bb8f" libturnip_a7xx.so "Adreno 6xx/7xx" || true
-stage "Turnip-$TAG-A8xx.zip" "13485ce18af8b861efcbf3d25560b15285c2298f460e0d3b7c32abbfd1f17f7a" libturnip_a8xx.so "Adreno 8xx"     || true
+stage "Turnip_v27.0.0-R2.zip" "8d30be022582d0c03b1918c019540491d00439e14e9e5e1359fe0bb19004f781" libturnip_a7xx.so "Adreno 6xx/7xx" || true
+stage "Turnip_Gen8_V39.zip"   "572e415c11b636ea2a4c4968c60a9b24e459302549c8ea38e814dbd07e40654d" libturnip_a8xx.so "Adreno 8xx"     || true
 
-# Optional, same one line each, if you ever want them on the menu:
-#   Adreno 710/720/722 (real-hardware registers): Turnip-$TAG-710-720-Test.zip  1520e89d43f24fe2054d1cdd8fdf54dcc58d62fb5b004abf06b052b9d6b6eca9
-#   Adreno 740 with One UI flicker:              Turnip-$TAG-8G2-OneUI.zip     5817969aaabee2ae7b5301c05ac36dace942c735e15691fa963cbdaeb82d395d
+# Same release, other two archives, if a variant is ever wanted (same one line each):
+#   Turnip_Gen8_V39_Patched.zip  bd457b30f195cf93a334b5302c221b1b5cb59c79c485935decf95d560a38c8a2   extra unmerged patches for AAA games/performance; upstream says use unpatched if you hit issues
+#   Turnip_v27.0.0-R2-Oneui.zip  a397a00394aab5a5acc2901d98c98dcf9d2ac4169f12464d654eb51dab92ac03   Adreno 740 on newer One UI, when the standard build makes the UI flicker
 ls -la "$OUT" 2>/dev/null
 exit 0
