@@ -3,12 +3,14 @@
 #   libturnip_a7xx.so   Turnip v27.0.0-r2 "Standard"  Adreno 6xx / 7xx (Snapdragon 8 Gen 3 and older)
 #   libturnip_a8xx.so   Turnip v27.0.0-r2 "A8xx"      Adreno 810/812/825/829/830/840 (Snapdragon 8 Elite)
 #
-# These are the drivers' own prebuilt releases (Mesa main, short of a full Mesa tree and a KGSL kernel this build
-# cannot compile them here), and the zips contain exactly the ICD this runtime loads: libvulkan_freedreno.so.
-# Every download is checked against the SHA-256 published in that release's notes.
+# STATUS: staged only. Nothing in the app selects or loads these yet, so they are inert files in the APK; the
+# selection code is a separate change.
 #
-# A download or hash failure is NOT fatal: the APK then ships without that driver, and the in-game choice falls back
-# to the system driver with one [gpu] line in the log. Nothing else in the build depends on these files.
+# These are the drivers' own prebuilt releases (short of a full Mesa tree and a KGSL kernel this build cannot compile
+# them here), and the zips contain exactly the ICD the runtime would load: libvulkan_freedreno.so. Every download is
+# checked against the SHA-256 published in that release's notes.
+#
+# A download or hash failure is NOT fatal: the APK simply ships without that file. Nothing else depends on them.
 set -uo pipefail
 OUT=$(realpath -m "${1:?usage: build.sh <outdir>}")
 TAG=v27.0.0-20261114-r2

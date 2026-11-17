@@ -4,7 +4,6 @@
    d3d10_proxy_gen.inc) convert the guest stdcall frame (32-bit values, 32-bit pointers, 32-bit-layout structs) into a call on the real
    host COM object loaded from libdxvk_*.so. Guest memory is identity-mapped below 4 GB, so POD pointers pass through unchanged. */
 #include "shims.h"
-#include "aot_gpu.h"   /* ?system? or a bundled Turnip driver, chosen in the menu that follows the folder picker */
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -349,10 +348,6 @@ static int init_dxvk(void) {
      explicitly instead of inheriting whatever cwd we were started with. overwrite=0 keeps a user override. */
   { char cd[512]; if (getcwd(cd, sizeof cd)) setenv("DXVK_STATE_CACHE_PATH", cd, 0); }
   setenv("DXVK_STATE_CACHE", "1", 0);
-  /* Which Vulkan driver this run uses has to be decided before DXVK creates its instance: the system driver leaves the
-     environment alone, a bundled Turnip driver points DXVK at libaotvkicd.so and falls back to the system driver if
-     it does not come up on this phone. */
-  aot_gpu_apply();
   g_win = aot_present_window(); if (!g_win) { fprintf(stderr, "[dxvk] no Android window yet\n"); return -1; }
   { char b[32]; snprintf(b, sizeof b, "%llx", (unsigned long long)(uintptr_t)g_win); setenv("AOT_ANDROID_WINDOW", b, 1); }
   int t0 = 0; { const char *e = getenv("AOT_DXVK_TIER"); if (e && e[0] >= '0' && e[0] < '0' + NTIER) t0 = e[0] - '0'; }   /* testing: start at an older tier */
