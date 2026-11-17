@@ -480,7 +480,7 @@ public final class GameActivity extends NativeActivity {
                     .setPositiveButton("Choose again", (d, w) -> ensureGameAccess()).show();
             return;
         }
-        askDriver(dir);
+        askDriver(dir);   /* writes game_dir.txt itself, so onResume must not prompt again while it is open */
     }
 
     /* After the folder is picked, one question decides the Vulkan driver. The game folder file is written only after
@@ -493,15 +493,24 @@ public final class GameActivity extends NativeActivity {
                 "System driver (recommended)",
                 "Turnip - Adreno 6xx / 7xx",
                 "Turnip - Adreno 8xx (8 Elite)" };
-        new AlertDialog.Builder(this)
-                .setTitle("Graphics driver")
-                .setMessage("System uses your phone's own Vulkan driver. Turnip is the open-source Mesa driver: it can "
-                        + "run some games faster, but it is experimental and is skipped automatically when it does not "
-                        + "start on this phone.")
-                .setCancelable(false)
-                .setSingleChoiceItems(items, current, (d, which) -> { d.dismiss(); startGame(dir, which); })
-                .setNegativeButton("Back", (d, w) -> { gateOpen = false; ensureGameAccess(); })
-                .show();
+        /* onActivityResult runs before onResume, and onResume calls ensureGameAccess(): game_dir.txt exists only after
+           this dialog is answered, so without this flag that check opens the folder prompt over the top of this one
+           and the user is sent back to the picker. gateOpen means "our own prompt is up". */
+        gateOpen = true;
+        try {
+            new AlertDialog.Builder(this)
+                    .setTitle("Graphics driver")
+                    .setMessage("System uses your phone's own Vulkan driver. Turnip is the open-source Mesa driver: it can "
+                            + "run some games faster, but it is experimental and is skipped automatically when it does not "
+                            + "start on this phone.")
+                    .setCancelable(false)
+                    .setSingleChoiceItems(items, current, (d, which) -> { d.dismiss(); startGame(dir, which); })
+                    .setNegativeButton("Back", (d, w) -> { gateOpen = false; ensureGameAccess(); })
+                    .show();
+        } catch (Throwable t) {   /* a broken dialog must never block the game: start it on the system driver */
+            android.util.Log.w("aotgame", "driver prompt failed: " + t);
+            startGame(dir, 0);
+        }
     }
 
     private void startGame(File dir, int driver) {
@@ -511,6 +520,7 @@ public final class GameActivity extends NativeActivity {
             android.widget.Toast.makeText(this, "Could not save the game folder: " + e.getMessage(), android.widget.Toast.LENGTH_LONG).show();
             gateOpen = false; ensureGameAccess(); return;
         }
+        gateOpen = false;   /* the folder file now exists, so ensureGameAccess() short-circuits from here on */
         String drv = driver == 0 ? "system driver" : driver == 1 ? "Turnip (6xx/7xx)" : "Turnip (8xx)";
         android.widget.Toast.makeText(this, "Starting from " + dir + " with the " + drv + " (log: aot_log.txt in that folder)", android.widget.Toast.LENGTH_LONG).show();
     }
