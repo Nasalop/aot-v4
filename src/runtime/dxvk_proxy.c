@@ -144,6 +144,87 @@ static uint64_t hcall(void *o, int slot, const uint64_t *iv, int ni, const float
   GF f = (GF)hvt[slot];
   return f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], fv[0], fv[1], fv[2], fv[3], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23]);
 }
+/* ---- render thread -------------------------------------------------------------------------------------------------------------------------
+   The game thread used to run every D3D10 call into DXVK itself, so DXVK's command recording sat on the same core as the game's own code.
+   Draws, state binds and clears return nothing and take only values, objects and small arrays, so they are copied into a ring and replayed on a
+   second thread in the same order while the game thread goes on running translated code. Anything else (Map/Unmap, Create*, Present, queries,
+   Release, UpdateSubresource, ...) first waits until the ring is empty, so the order of everything DXVK sees is exactly the game's order, and
+   DXVK's context is only ever entered by one thread at a time.
+   Off with AOT_RENDER_THREAD=0 or the word 0/off in a file render_thread.txt in the game folder. */
+typedef struct { void *host; int slot, ni; uint64_t iv[12]; float fv[4]; uint8_t blob[1536]; } RCmd;
+#define RQN 1024
+static RCmd rq[RQN];
+static uint32_t rq_h, rq_t;                 /* producer / consumer positions (free-running) */
+static int rt_state = -1, rt_sleep;         /* rt_state: -1 undecided, 0 off, 1 running */
+static pthread_mutex_t rt_mu = PTHREAD_MUTEX_INITIALIZER, rt_pmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rt_cv = PTHREAD_COND_INITIALIZER;
+static const struct { const char *n; int a, sz, cnt; } RSP[] = {   /* guest pointers that must be copied: iv index, bytes (per element), iv index of the count (0 = one) */
+  { "OMSetBlendState", 2, 16, 0 }, { "RSSetViewports", 2, 24, 1 }, { "RSSetScissorRects", 2, 16, 1 }, { "ClearRenderTargetView", 2, 16, 0 },
+  { "CopySubresourceRegion", 8, 24, 0 }, { "IASetVertexBuffers", 4, 4, 2 }, { "IASetVertexBuffers", 5, 4, 2 },
+};
+static int rt_deferrable(const PI *pi, const PM *m) {   /* the methods whose effect does not depend on anything the guest does after the call returns */
+  static const char *const ok[] = { "VSSetConstantBuffers", "PSSetConstantBuffers", "GSSetConstantBuffers", "VSSetShaderResources", "PSSetShaderResources", "GSSetShaderResources",
+    "VSSetSamplers", "PSSetSamplers", "GSSetSamplers", "VSSetShader", "PSSetShader", "GSSetShader", "DrawIndexed", "Draw", "DrawIndexedInstanced", "DrawInstanced", "DrawAuto",
+    "IASetInputLayout", "IASetVertexBuffers", "IASetIndexBuffer", "IASetPrimitiveTopology", "OMSetRenderTargets", "OMSetBlendState", "OMSetDepthStencilState",
+    "RSSetState", "RSSetViewports", "RSSetScissorRects", "ClearRenderTargetView", "ClearDepthStencilView", "CopyResource", "CopySubresourceRegion", "SetPredication", "GenerateMips" };
+  if (m->ret || strncmp(pi->name, "ID3D10Device", 12)) return 0;
+  for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) if (!strcmp(m->name, ok[i])) return 1;
+  return 0;
+}
+static void *rt_main(void *arg) {
+  (void)arg; pthread_setname_np(pthread_self(), "aot-render");
+  for (;;) {
+    uint32_t t = rq_t;
+    if (__atomic_load_n(&rq_h, __ATOMIC_ACQUIRE) == t) {
+      int i = 0; while (i++ < 3000 && __atomic_load_n(&rq_h, __ATOMIC_ACQUIRE) == t) __asm__ volatile("yield");
+      if (__atomic_load_n(&rq_h, __ATOMIC_ACQUIRE) == t) {
+        pthread_mutex_lock(&rt_mu); __atomic_store_n(&rt_sleep, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&rq_h, __ATOMIC_SEQ_CST) == t) pthread_cond_wait(&rt_cv, &rt_mu);
+        __atomic_store_n(&rt_sleep, 0, __ATOMIC_SEQ_CST); pthread_mutex_unlock(&rt_mu);
+      }
+      continue;
+    }
+    RCmd *c = &rq[t % RQN]; hcall(c->host, c->slot, c->iv, c->ni, c->fv);
+    __atomic_store_n(&rq_t, t + 1, __ATOMIC_RELEASE);
+  }
+  return NULL;
+}
+static int rt_enabled(void) {
+  if (rt_state >= 0) return rt_state;
+  int on = 1; const char *e = getenv("AOT_RENDER_THREAD");
+  if (e && *e) on = !(e[0] == '0' || !strcmp(e, "off"));
+  else { FILE *f = fopen("render_thread.txt", "r"); if (f) { char b[16] = ""; if (fgets(b, sizeof b, f)) on = !(b[0] == '0' || !strncmp(b, "off", 3)); fclose(f); } }
+  if (on) { pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&th, &at, rt_main, NULL) != 0) on = 0; pthread_attr_destroy(&at); }
+  fprintf(stderr, "[gfx] render thread: %s\n", on ? "on (D3D draws, binds and clears are replayed on a second thread)" : "off");
+  rt_state = on; return on;
+}
+static void rt_drain(void) {
+  if (__atomic_load_n(&rq_t, __ATOMIC_ACQUIRE) == __atomic_load_n(&rq_h, __ATOMIC_ACQUIRE)) return;
+  int i = 0;
+  while (__atomic_load_n(&rq_t, __ATOMIC_ACQUIRE) != __atomic_load_n(&rq_h, __ATOMIC_ACQUIRE)) { if (++i < 4000) __asm__ volatile("yield"); else usleep(30); }
+}
+/* Copy one deferrable call into the ring. Returns 0 when it cannot be (too large): the caller then drains and runs it directly. */
+static int rt_push(const PM *m, void *host, int slot, const uint64_t *iv, int ni, const float *fv, const uint8_t *ar, size_t ap) {
+  if (ni > 12 || ap > sizeof(((RCmd *)0)->blob)) return 0;
+  pthread_mutex_lock(&rt_pmu);
+  uint32_t h = rq_h;
+  while (h - __atomic_load_n(&rq_t, __ATOMIC_ACQUIRE) >= RQN) usleep(20);   /* ring full: the render thread is behind */
+  RCmd *c = &rq[h % RQN]; c->host = host; c->slot = slot; c->ni = ni; memcpy(c->fv, fv, sizeof c->fv);
+  size_t used = ap; if (ap) memcpy(c->blob, ar, ap);
+  for (int j = 0; j < ni; j++) c->iv[j] = iv[j];
+  for (int j = 1; j < ni; j++) if (ap && iv[j] >= (uint64_t)(uintptr_t)ar && iv[j] < (uint64_t)(uintptr_t)ar + ap) c->iv[j] = (uint64_t)(uintptr_t)c->blob + (iv[j] - (uint64_t)(uintptr_t)ar);   /* marshalling arena -> the copy */
+  for (unsigned k = 0; k < sizeof RSP / sizeof RSP[0]; k++) {
+    if (strcmp(m->name, RSP[k].n) || RSP[k].a >= ni || !iv[RSP[k].a]) continue;
+    size_t n = (size_t)RSP[k].sz * (RSP[k].cnt ? iv[RSP[k].cnt] : 1u); n = (n + 15) & ~(size_t)15;
+    if (!n || used + n > sizeof c->blob) { pthread_mutex_unlock(&rt_pmu); return 0; }
+    memcpy(c->blob + used, (const void *)(uintptr_t)iv[RSP[k].a], n); c->iv[RSP[k].a] = (uint64_t)(uintptr_t)(c->blob + used); used += n;
+  }
+  __atomic_store_n(&rq_h, h + 1, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&rt_sleep, __ATOMIC_SEQ_CST)) { pthread_mutex_lock(&rt_mu); pthread_cond_signal(&rt_cv); pthread_mutex_unlock(&rt_mu); }
+  pthread_mutex_unlock(&rt_pmu); return 1;
+}
 static void conv_scd_in(const uint8_t *g, uint8_t *h) { memset(h, 0, 72); memcpy(h, g, 44); uint64_t w = LD(uint32_t, g + 44); memcpy(h + 48, &w, 8); memcpy(h + 56, g + 48, 4); memcpy(h + 60, g + 52, 4); memcpy(h + 64, g + 56, 4); }
 static void conv_wstr(uint8_t *g, const uint8_t *h, int n) { for (int i = 0; i < n; i++) ST(uint16_t, g + 2 * i, LD(uint32_t, h + 4 * i)); }
 static uint32_t sat(uint64_t v) { return v > 0x7fffffffu ? 0x7fffffffu : (uint32_t)v; }
@@ -192,6 +273,8 @@ static uint64_t px_call_inner(CPU *c, const PI *pi, int slot) {
   static uint8_t seen[64][256]; int ti_ = (int)(pi - PIS); int first = ti_ < 64 && slot < 256 && !seen[ti_][slot]++;
   if (first || ntr < 20) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
   if (!o) { const uint32_t *w = (const uint32_t *)(uintptr_t)A(0); fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x [%#x %#x %#x %#x]\n", pi->name, m->name, (unsigned)A(0), w?w[0]:0, w?w[1]:0, w?w[2]:0, w?w[3]:0); return E_NOTIMPL_; }
+  int dk = rt_enabled() && rt_deferrable(pi, m);
+  if (!dk) rt_drain();   /* everything that is not replayed on the render thread first lets the queued calls finish: DXVK sees the game's own order, one thread at a time */
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
   /* Anything other than Map/Unmap may make the host contents of this resource differ from the shadow
      (copies into it, UpdateSubresource, GPU use), so the shadow stops being a usable mirror. */
@@ -239,7 +322,10 @@ static uint64_t px_call_inner(CPU *c, const PI *pi, int slot) {
   int is_present = m->name[0] == 'P' && !strcmp(m->name, "Present") && ni >= 2;
   if (is_present) iv[1] = 0;   /* no vsync wait: SyncInterval 0 (the game asks for 1, which makes every frame a multiple of the refresh period) */
   uint64_t pt0 = is_present ? px_now_ns() : 0;
-  uint64_t r = hcall(o->host, slot, iv, ni, fv); uint32_t hr = (uint32_t)r;
+  uint64_t r;
+  if (dk && np == 0 && rt_push(m, o->host, slot, iv, ni, fv, ar, ap)) r = 0;
+  else { if (dk) rt_drain(); r = hcall(o->host, slot, iv, ni, fv); }
+  uint32_t hr = (uint32_t)r;
   if (is_present) { __atomic_add_fetch(&aot_ns[0], px_now_ns() - pt0, __ATOMIC_RELAXED); __atomic_add_fetch(&aot_frames, 1, __ATOMIC_RELAXED); aot_present_tick(); }
   int occl = is_gd && (o->qtype == 2 || o->qtype == 6 || o->qtype == 8);   /* OCCLUSION, OCCLUSION_PREDICATE, SO_OVERFLOW_PREDICATE: culling hints, never worth stalling the frame on the GPU */
   if (occl && hr == 1) {   /* not ready: answer "visible" now. Culling is only an optimisation; waiting for it serialised CPU and GPU every frame */
@@ -411,7 +497,7 @@ uint64_t aot_dxvk_d3d10_create(uint64_t dev_out, uint64_t sc_out, uint64_t sc_de
   int tf = ti_by_name("IDXGIFactory1"), tdev = ti_by_name("ID3D10Device"), tsc = ti_by_name("IDXGISwapChain");
   void *fac = NULL, *ad = NULL, *dev = NULL, *sc = NULL; uint32_t hr = 0;
   for (;;) {   /* one pass per tier: the first tier whose driver support is good enough to create the device wins */
-    CF cf = (CF)sym("CreateDXGIFactory1"); CD cd = (CD)sym("D3D10CoreCreateDevice");
+    rt_drain(); CF cf = (CF)sym("CreateDXGIFactory1"); CD cd = (CD)sym("D3D10CoreCreateDevice");
     ad = NULL; dev = NULL; hr = (uint32_t)-1;
     if (!cf || !cd) fprintf(stderr, "[dxvk] missing entry points in tier %d\n", g_tier);
     else if (!(fac = fac_get())) fprintf(stderr, "[dxvk] tier %d: no factory\n", g_tier);
