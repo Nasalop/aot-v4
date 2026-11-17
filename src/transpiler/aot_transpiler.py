@@ -1225,7 +1225,8 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
                     s = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
                 out.append(s)
             last = b[-1]; lm = last.mnemonic.split()[-1]
-            if lm not in ('jmp', 'ljmp', 'ret', 'retf', 'iret', 'iretd', 'iretq', 'call', 'lcall', 'ud2', 'int3', 'int1', 'hlt'): out.append(tgt(last.address + last.size))
+            elided = lm == 'call' and last.operands and last.operands[0].type == X86_OP_IMM and native_elided(rec, last.operands[0].imm)   # dropped call: execution simply continues after it
+            if elided or lm not in ('jmp', 'ljmp', 'ret', 'retf', 'iret', 'iretd', 'iretq', 'call', 'lcall', 'ud2', 'int3', 'int1', 'hlt'): out.append(tgt(last.address + last.size))
         out.append('}\n')
         buf.append('\n'.join(out))
         if (k + 1) % regions_per_file == 0 or k == len(regions) - 1:
