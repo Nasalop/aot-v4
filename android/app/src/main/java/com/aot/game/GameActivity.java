@@ -358,14 +358,29 @@ public final class GameActivity extends NativeActivity {
                     try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(new File(d, "game_dir.txt")))) { String gd = br.readLine(); if (gd != null && !gd.isEmpty()) { java.io.PrintWriter w2 = new java.io.PrintWriter(new File(gd, "aot_java_crash.txt")); ex.printStackTrace(w2); w2.close(); } } catch (Throwable ignored2) { } } } catch (Throwable ignored) { }
             if (prev != null) prev.uncaughtException(th, ex);
         });
+        if (state == null) { try { File gd0 = getExternalFilesDir(null); if (gd0 != null) new File(gd0, "gpu_driver.txt").delete(); } catch (Throwable ignored) { } }   // the native thread waits for a fresh choice every launch
         super.onCreate(state);
         try { getWindow().getDecorView().post(this::addControls); } catch (Throwable t) { android.util.Log.w("aotgame", "controls overlay skipped: " + t); }
         boolean bundled = false;
         try (InputStream in = getAssets().open("game.exe")) { bundled = true; } catch (Exception ignored) { }
         bundledMode = bundled;
-        if (state == null && !bundled) {
-            showFolderPrompt();
-        }
+        final boolean bundled2 = bundled;
+        final Runnable next = () -> { if (state == null && !bundled2) showFolderPrompt(); else if (bundledMode) ensureGameAccess(); };
+        if (state == null) showGpuChoice(next); else gpuChosen = true;
+    }
+
+    // ---- graphics driver choice at every start: the stock Adreno driver or the bundled Turnip (Mesa) driver ----
+    private boolean gpuChosen;
+    private void saveGpuChoice(String v) {
+        try { File d = getExternalFilesDir(null); if (d != null) { java.io.FileWriter w = new java.io.FileWriter(new File(d, "gpu_driver.txt")); w.write(v); w.close(); } }
+        catch (Throwable t) { android.util.Log.w("aotgame", "could not store the driver choice: " + t); }
+    }
+    private void showGpuChoice(final Runnable next) {
+        new AlertDialog.Builder(this).setTitle("Graphics driver").setCancelable(false)
+                .setMessage("System: the phone's own Adreno driver.\nTurnip: the bundled open-source Mesa driver (falls back to System by itself if it cannot start).")
+                .setNegativeButton("System", (d, w) -> { saveGpuChoice("system"); gpuChosen = true; next.run(); })
+                .setPositiveButton("Turnip", (d, w) -> { saveGpuChoice("turnip"); gpuChosen = true; next.run(); })
+                .show();
     }
 
     // ---- bundled-game mode: run in place from a user-selected folder (no copying) ----
@@ -407,7 +422,7 @@ public final class GameActivity extends NativeActivity {
                 @Override public void onInputDeviceChanged(int id) { scanPads(); }
             }, null);
         }
-        if (bundledMode) ensureGameAccess();
+        if (bundledMode && gpuChosen) ensureGameAccess();
     }
 
     private File gameDirFile() { File d = getExternalFilesDir(null); return d == null ? null : new File(d, "game_dir.txt"); }
