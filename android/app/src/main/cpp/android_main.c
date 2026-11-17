@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include "win_input.h"
@@ -63,6 +64,11 @@ static void *game_thread(void *arg) {
     if (a && o) { while ((n = AAsset_read(a, buf, sizeof buf)) > 0) fwrite(buf, 1, n, o); fclose(o); AAsset_close(a); }
     else { dprintf(2, "cannot extract game.exe from APK\n"); return NULL; }
   }
+  /* the startup dialog stores the driver choice (system / turnip) before anything else runs; the DXVK loader reads it from AOT_GPU_DRIVER */
+  { char gq[700], gv[40] = ""; snprintf(gq, sizeof gq, "%s/gpu_driver.txt", ext);
+    for (int i = 0; i < 2000 && !gv[0]; i++) { FILE *f = fopen(gq, "r"); if (f) { if (fgets(gv, sizeof gv, f)) gv[strcspn(gv, " \t\r\n")] = 0; fclose(f); } if (!gv[0]) usleep(300000); }
+    if (!gv[0]) snprintf(gv, sizeof gv, "system");
+    setenv("AOT_GPU_DRIVER", gv, 1); dprintf(2, "[boot] graphics driver choice: %s\n", gv); }
   /* wait until the Java side has stored the user-selected game folder (all-files access + folder picker) */
   char gd[600] = "", gp[700]; snprintf(gp, sizeof gp, "%s/game_dir.txt", ext);
   for (;;) { FILE *f = fopen(gp, "r"); if (f) { if (fgets(gd, sizeof gd, f)) gd[strcspn(gd, "\r\n")] = 0; fclose(f); if (gd[0]) break; } usleep(300000); }
