@@ -72,21 +72,10 @@ static inline void aot_st80(uint64_t a, aot_f80 v) {
 #endif
 }
 /* NaN guard for x87 stores: the game's grid-walk loops spin forever on NaN. First sites are logged; NaN is stored as 0. */
-static inline aot_f80 aot_nanckm(aot_f80 v, uint32_t pc, uint64_t a) {
-  if (__builtin_expect(v != v, 0)) {
-    static volatile int n;
-    if (n < 24) { n++; const uint32_t *w = (const uint32_t *)(uintptr_t)(a & ~3ULL);
-      fprintf(stderr, "[aot] x87 NaN LOADED at pc=%#x from %#llx: [%08x %08x %08x %08x | %08x %08x %08x %08x]\n", pc, (unsigned long long)a, w[-4], w[-3], w[-2], w[-1], w[0], w[1], w[2], w[3]); }
-  }
-  return v;
-}
-static inline aot_f80 aot_nanck(aot_f80 v, uint32_t pc) {
-  if (__builtin_expect(v != v, 0)) {
-    static volatile int n;
-    if (n < 24) { n++; fprintf(stderr, "[aot] x87 NaN store at pc=%#x -> (value kept, as on hardware)\n", pc); }
-  }
-  return v;
-}
+void aot_nan_m(uint32_t pc, uint64_t a) __attribute__((noinline, cold));   /* runtime.c: logs the first few NaN loads/stores; kept out of line so the x87 fast path stays tiny */
+void aot_nan_s(uint32_t pc) __attribute__((noinline, cold));
+static inline aot_f80 aot_nanckm(aot_f80 v, uint32_t pc, uint64_t a) { if (__builtin_expect(v != v, 0)) aot_nan_m(pc, a); return v; }
+static inline aot_f80 aot_nanck(aot_f80 v, uint32_t pc) { if (__builtin_expect(v != v, 0)) aot_nan_s(pc); return v; }
 /* x87 float -> integer with FCW rounding control (rc<0: truncate). Out-of-range / NaN -> integer indefinite. */
 static inline int64_t aot_fist(aot_f80 v, int bits, uint16_t fcw, int trunc_) {
   int rc = trunc_ ? 3 : (fcw >> 10) & 3; aot_f80 r;
