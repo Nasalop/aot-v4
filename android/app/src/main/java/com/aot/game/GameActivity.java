@@ -379,7 +379,23 @@ public final class GameActivity extends NativeActivity {
         new AlertDialog.Builder(this).setTitle("Graphics driver").setCancelable(false)
                 .setMessage("System: the phone's own Adreno driver.\nTurnip: the bundled open-source Mesa driver (falls back to System by itself if it cannot start).")
                 .setNegativeButton("System", (d, w) -> { saveGpuChoice("system"); gpuChosen = true; next.run(); })
-                .setPositiveButton("Turnip", (d, w) -> { saveGpuChoice("turnip"); gpuChosen = true; next.run(); })
+                .setPositiveButton("Turnip", (d, w) -> showTurnipPicker(next))
+                .show();
+    }
+    /* second popup: which bundled Turnip build (every libturnip_*.so in the app's native library folder) */
+    private void showTurnipPicker(final Runnable next) {
+        final java.util.ArrayList<String> files = new java.util.ArrayList<>();
+        try {
+            String[] l = new File(getApplicationInfo().nativeLibraryDir).list();
+            if (l != null) for (String f : l) if (f.startsWith("libturnip_") && f.endsWith(".so")) files.add(f);
+        } catch (Throwable ignored) { }
+        java.util.Collections.sort(files);
+        final java.util.ArrayList<String> labels = new java.util.ArrayList<>(), vals = new java.util.ArrayList<>();
+        labels.add("Automatic (best for this GPU)"); vals.add("turnip");
+        for (String f : files) { labels.add(f.substring(10, f.length() - 3).replace('_', ' ').trim()); vals.add("turnip:" + f); }
+        new AlertDialog.Builder(this).setTitle("Turnip driver").setCancelable(false)
+                .setItems(labels.toArray(new String[0]), (d, which) -> { saveGpuChoice(vals.get(which)); gpuChosen = true; next.run(); })
+                .setNegativeButton("Back", (d, w) -> showGpuChoice(next))
                 .show();
     }
 
