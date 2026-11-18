@@ -813,3 +813,14 @@ int main(int argc, char **argv) {
   aot_win_audio_cleanup();
   return 0;
 }
+
+/* NaN guard reports for x87 loads/stores (called from the inline checks in aot_runtime.h; cold) */
+void aot_nan_m(uint32_t pc, uint64_t a) {
+  static volatile int n;
+  if (n < 24) { n++; const uint32_t *w = (const uint32_t *)(uintptr_t)(a & ~3ULL);
+    fprintf(stderr, "[aot] x87 NaN LOADED at pc=%#x from %#llx: [%08x %08x %08x %08x | %08x %08x %08x %08x]\n", pc, (unsigned long long)a, w[-4], w[-3], w[-2], w[-1], w[0], w[1], w[2], w[3]); }
+}
+void aot_nan_s(uint32_t pc) {
+  static volatile int n;
+  if (n < 24) { n++; fprintf(stderr, "[aot] x87 NaN store at pc=%#x -> (value kept, as on hardware)\n", pc); }
+}
