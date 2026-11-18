@@ -427,14 +427,16 @@ static void *g_win;
 static int g_turnip;
 static void turnip_off(void) { unsetenv("AOT_VK_GIPA"); g_turnip = 0; }
 static void turnip_setup(void) {
-  char mode[40] = "auto"; const char *e = getenv("AOT_GPU_DRIVER");
+  char mode[100] = "auto"; const char *e = getenv("AOT_GPU_DRIVER");
   if (e && *e) snprintf(mode, sizeof mode, "%s", e);
-  else { FILE *f = fopen("gpu_driver.txt", "r"); if (f) { char b[40]; if (fgets(b, sizeof b, f)) { b[strcspn(b, " \t\r\n")] = 0; if (b[0]) snprintf(mode, sizeof mode, "%s", b); } fclose(f); } }
+  else { FILE *f = fopen("gpu_driver.txt", "r"); if (f) { char b[100]; if (fgets(b, sizeof b, f)) { b[strcspn(b, " \t\r\n")] = 0; if (b[0]) snprintf(mode, sizeof mode, "%s", b); } fclose(f); } }
   if (!strcmp(mode, "system")) { fprintf(stderr, "[gpu] driver: stock Adreno driver (gpu_driver = system)\n"); return; }
   char model[64] = ""; { FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r"); if (f) { if (fgets(model, sizeof model, f)) model[strcspn(model, "\r\n")] = 0; fclose(f); } }
   int n = 0; for (const char *q = model; *q; q++) if (*q >= '0' && *q <= '9') { n = atoi(q); break; }
   const char *drv = NULL;
-  if (!strcmp(mode, "turnip_a8xx_patched")) drv = "libturnip_a8xx_patched.so"; else if (!strcmp(mode, "turnip_a8xx")) drv = "libturnip_a8xx.so"; else if (!strcmp(mode, "turnip_a7xx")) drv = "libturnip_a7xx.so";
+  static char pick[96];
+  if (!strncmp(mode, "turnip:", 7) && !strchr(mode + 7, '/') && !strstr(mode + 7, "..") && !strncmp(mode + 7, "libturnip_", 10)) { snprintf(pick, sizeof pick, "%s", mode + 7); drv = pick; }
+  else if (!strcmp(mode, "turnip_a8xx_patched")) drv = "libturnip_a8xx_patched.so"; else if (!strcmp(mode, "turnip_a8xx")) drv = "libturnip_a8xx.so"; else if (!strcmp(mode, "turnip_a7xx")) drv = "libturnip_a7xx.so";
   else if (n >= 800) drv = "libturnip_a8xx.so"; else if (n >= 600) drv = "libturnip_a7xx.so";
   if (!drv) { fprintf(stderr, "[gpu] driver: stock Adreno driver (GPU model \"%s\" is not one Turnip is chosen for; put turnip_a8xx or turnip_a7xx in gpu_driver.txt to force one)\n", model); return; }
   Dl_info di; char dir[600];
