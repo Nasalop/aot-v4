@@ -173,6 +173,16 @@ extern const int aot_is_pe32;   /* 1 when the recompiled image is a 32-bit PE32 
 #define PUSH(v) do { uint64_t _p = (v); r4 -= 8; ST(uint64_t, r4, _p); } while (0)
 #define POP() ({ uint64_t _p = LD(uint64_t, r4); r4 += 8; _p; })
 
+#ifdef AOT_M32
+/* PE32 images only ever touch eax..edi: r8-r15 do not exist for them, so they are neither loaded at a region entry nor stored at an exit (they were 16 of the 21 loads and
+   stores every call, return and region transition paid). They stay declared (0) because a few translator templates still name them. */
+#define DECL_STATE \
+  uint64_t r0 = c->r[0], r1 = c->r[1], r2 = c->r[2], r3 = c->r[3], r4 = c->r[4], r5 = c->r[5], r6 = c->r[6], r7 = c->r[7], \
+           r8 = 0, r9 = 0, r10 = 0, r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0; \
+  uint8_t cf = c->cf, zf = c->zf, sf = c->sf, of = c->of, pf = c->pf
+#define SAVES() do { c->r[0] = r0; c->r[1] = r1; c->r[2] = r2; c->r[3] = r3; c->r[4] = r4; c->r[5] = r5; c->r[6] = r6; c->r[7] = r7; \
+  c->cf = cf; c->zf = zf; c->sf = sf; c->of = of; c->pf = pf; (void)r8; (void)r9; (void)r10; (void)r11; (void)r12; (void)r13; (void)r14; (void)r15; } while (0)
+#else
 #define DECL_STATE \
   uint64_t r0 = c->r[0], r1 = c->r[1], r2 = c->r[2], r3 = c->r[3], r4 = c->r[4], r5 = c->r[5], r6 = c->r[6], r7 = c->r[7], \
            r8 = c->r[8], r9 = c->r[9], r10 = c->r[10], r11 = c->r[11], r12 = c->r[12], r13 = c->r[13], r14 = c->r[14], r15 = c->r[15]; \
@@ -180,6 +190,7 @@ extern const int aot_is_pe32;   /* 1 when the recompiled image is a 32-bit PE32 
 #define SAVES() do { c->r[0] = r0; c->r[1] = r1; c->r[2] = r2; c->r[3] = r3; c->r[4] = r4; c->r[5] = r5; c->r[6] = r6; c->r[7] = r7; \
   c->r[8] = r8; c->r[9] = r9; c->r[10] = r10; c->r[11] = r11; c->r[12] = r12; c->r[13] = r13; c->r[14] = r14; c->r[15] = r15; \
   c->cf = cf; c->zf = zf; c->sf = sf; c->of = of; c->pf = pf; } while (0)
+#endif
 #define EXIT(a) do { SAVES(); return (a); } while (0)
 /* Cross-region transfers. A region that leaves through a direct call/jump/fall-through (JMPREG) or a return/indirect target it does not contain
    (AOT_TAILDISP) tail-calls the next region instead of returning to run(): no region lookup and no per-dispatch bookkeeping in the dispatcher loop, and
