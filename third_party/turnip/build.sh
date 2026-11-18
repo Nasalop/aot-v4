@@ -84,7 +84,7 @@ fetch_releases || true
 # ---- every driver zip in the V39 / V38 releases, staged as libturnip_<slug>.so so the in-app picker can offer them all ----
 # Names of the release assets are not assumed: whatever .zip assets those releases carry are staged (max TURNIP_MAX, default 8).
 stage_all() {
-python3 - "$VERS" "$W/releases.json" "${TURNIP_MAX:-8}" <<'PY'
+python3 - "$VERS" "$W/releases.json" "${TURNIP_MAX:-6}" <<'PY'
 import json, re, sys
 vers, f, mx = sys.argv[1].split(), sys.argv[2], int(sys.argv[3])
 try: rels = json.load(open(f))
