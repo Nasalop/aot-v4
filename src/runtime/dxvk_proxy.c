@@ -22,6 +22,7 @@ volatile uint64_t aot_frames;   /* presented frames, for the FPS counter */
 volatile uint64_t aot_ns[4];    /* wall time the game thread spent blocked: [0] inside Present, [1] waiting for an event/timestamp query */
 extern void aot_present_tick(void);   /* android_main.c: frame pacing hint for the Android scheduler */
 static inline uint64_t px_now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+#include <sched.h>
 #include "d3d10_proxy_gen.inc"
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
 /* ---- where the game thread's time goes: time inside translated code vs time in the D3D proxy ---- */
@@ -176,7 +177,8 @@ static void *rt_main(void *arg) {
   for (;;) {
     uint32_t t = rq_t;
     if (__atomic_load_n(&rq_h, __ATOMIC_ACQUIRE) == t) {
-      int i = 0; while (i++ < 3000 && __atomic_load_n(&rq_h, __ATOMIC_ACQUIRE) == t) __asm__ volatile("yield");
+      uint64_t t0 = px_now_ns(); int i = 0;   /* stay awake ~300 us: a thread that sleeps and wakes every few microseconds is clocked down by the scheduler and answers slowly */
+      while (__atomic_load_n(&rq_h, __ATOMIC_ACQUIRE) == t) { __asm__ volatile("yield"); if ((++i & 255) == 0 && px_now_ns() - t0 > 300000) break; }
       if (__atomic_load_n(&rq_h, __ATOMIC_ACQUIRE) == t) {
         pthread_mutex_lock(&rt_mu); __atomic_store_n(&rt_sleep, 1, __ATOMIC_SEQ_CST);
         while (__atomic_load_n(&rq_h, __ATOMIC_SEQ_CST) == t) pthread_cond_wait(&rt_cv, &rt_mu);
@@ -199,17 +201,22 @@ static int rt_enabled(void) {
   fprintf(stderr, "[gfx] render thread: %s\n", on ? "on (D3D draws, binds and clears are replayed on a second thread)" : "off");
   rt_state = on; return on;
 }
+static uint32_t rt_since, rt_nd, rt_ncmd; static int rt_inline;   /* adaptive: commands queued per forced wait, and a countdown of calls to run inline */
 static void rt_drain(void) {
   if (__atomic_load_n(&rq_t, __ATOMIC_ACQUIRE) == __atomic_load_n(&rq_h, __ATOMIC_ACQUIRE)) return;
   int i = 0;
-  while (__atomic_load_n(&rq_t, __ATOMIC_ACQUIRE) != __atomic_load_n(&rq_h, __ATOMIC_ACQUIRE)) { if (++i < 4000) __asm__ volatile("yield"); else usleep(30); }
+  while (__atomic_load_n(&rq_t, __ATOMIC_ACQUIRE) != __atomic_load_n(&rq_h, __ATOMIC_ACQUIRE)) { if (++i < 20000) __asm__ volatile("yield"); else sched_yield(); }
+  /* If the game forces a wait after only a few queued calls, the hand-off costs more than the overlap gains: run inline for a while, then look again. */
+  rt_nd++; rt_ncmd += rt_since; rt_since = 0;
+  if (rt_nd >= 400) { uint32_t avg = rt_ncmd / rt_nd; rt_nd = rt_ncmd = 0;
+    if (avg < 10) { rt_inline = 40000; fprintf(stderr, "[gfx] render thread: only %u calls per forced wait, running D3D inline for a while\n", avg); } }
 }
 /* Copy one deferrable call into the ring. Returns 0 when it cannot be (too large): the caller then drains and runs it directly. */
 static int rt_push(const PM *m, void *host, int slot, const uint64_t *iv, int ni, const float *fv, const uint8_t *ar, size_t ap) {
   if (ni > 12 || ap > sizeof(((RCmd *)0)->blob)) return 0;
   pthread_mutex_lock(&rt_pmu);
   uint32_t h = rq_h;
-  while (h - __atomic_load_n(&rq_t, __ATOMIC_ACQUIRE) >= RQN) usleep(20);   /* ring full: the render thread is behind */
+  while (h - __atomic_load_n(&rq_t, __ATOMIC_ACQUIRE) >= RQN) sched_yield();   /* ring full: the render thread is behind */
   RCmd *c = &rq[h % RQN]; c->host = host; c->slot = slot; c->ni = ni; memcpy(c->fv, fv, sizeof c->fv);
   size_t used = ap; if (ap) memcpy(c->blob, ar, ap);
   for (int j = 0; j < ni; j++) c->iv[j] = iv[j];
@@ -220,7 +227,7 @@ static int rt_push(const PM *m, void *host, int slot, const uint64_t *iv, int ni
     if (!n || used + n > sizeof c->blob) { pthread_mutex_unlock(&rt_pmu); return 0; }
     memcpy(c->blob + used, (const void *)(uintptr_t)iv[RSP[k].a], n); c->iv[RSP[k].a] = (uint64_t)(uintptr_t)(c->blob + used); used += n;
   }
-  __atomic_store_n(&rq_h, h + 1, __ATOMIC_RELEASE);
+  rt_since++; __atomic_store_n(&rq_h, h + 1, __ATOMIC_RELEASE);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   if (__atomic_load_n(&rt_sleep, __ATOMIC_SEQ_CST)) { pthread_mutex_lock(&rt_mu); pthread_cond_signal(&rt_cv); pthread_mutex_unlock(&rt_mu); }
   pthread_mutex_unlock(&rt_pmu); return 1;
@@ -273,7 +280,8 @@ static uint64_t px_call_inner(CPU *c, const PI *pi, int slot) {
   static uint8_t seen[64][256]; int ti_ = (int)(pi - PIS); int first = ti_ < 64 && slot < 256 && !seen[ti_][slot]++;
   if (first || ntr < 20) { ntr++; fprintf(stderr, "[dxvk] #%d %s::%s this=%#x host=%p\n", ntr, pi->name, m->name, (unsigned)A(0), o ? o->host : NULL); }
   if (!o) { const uint32_t *w = (const uint32_t *)(uintptr_t)A(0); fprintf(stderr, "[dxvk] %s::%s called on a non-proxy object %#x [%#x %#x %#x %#x]\n", pi->name, m->name, (unsigned)A(0), w?w[0]:0, w?w[1]:0, w?w[2]:0, w?w[3]:0); return E_NOTIMPL_; }
-  int dk = rt_enabled() && rt_deferrable(pi, m);
+  if (rt_inline > 0) rt_inline--;
+  int dk = rt_enabled() && !rt_inline && rt_deferrable(pi, m);
   if (!dk) rt_drain();   /* everything that is not replayed on the render thread first lets the queued calls finish: DXVK sees the game's own order, one thread at a time */
   uint8_t ar[8192]; size_t ap = 0; uint64_t iv[32]; float fv[4] = { 0 }; int ni = 0, nf = 0, np = 0; void *ot[8]; int nt = 0; Post post[8];
   /* Anything other than Map/Unmap may make the host contents of this resource differ from the shadow
@@ -411,7 +419,7 @@ static void *g_win;
    libadrenotools opens a private copy of the system Vulkan loader whose driver slot is filled with the Turnip ICD that build.sh staged in the APK
    (libturnip_a8xx.so for Adreno 8xx, libturnip_a7xx.so for 6xx/7xx). Its vkGetInstanceProcAddr is handed to DXVK through AOT_VK_GIPA (patch_vkloader.py),
    so only DXVK 3.1.1 / 2.4.1 use it; the 1.9.2 tier links the system loader and stays on the stock driver.
-   Choice: AOT_GPU_DRIVER or a one-word file gpu_driver.txt in the game folder: auto (default) | system | turnip | turnip_a8xx | turnip_a7xx.
+   Choice: AOT_GPU_DRIVER or a one-word file gpu_driver.txt in the game folder: auto (default) | system | turnip | turnip_a8xx | turnip_a8xx_patched | turnip_a7xx.
    auto = Turnip when the GPU model is readable and a matching driver is in the APK. Any failure (driver missing, loader refused, no device, no
    DXVK device) drops back to the stock driver and says so in the log. */
 #ifdef __ANDROID__
@@ -426,7 +434,7 @@ static void turnip_setup(void) {
   char model[64] = ""; { FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r"); if (f) { if (fgets(model, sizeof model, f)) model[strcspn(model, "\r\n")] = 0; fclose(f); } }
   int n = 0; for (const char *q = model; *q; q++) if (*q >= '0' && *q <= '9') { n = atoi(q); break; }
   const char *drv = NULL;
-  if (!strcmp(mode, "turnip_a8xx")) drv = "libturnip_a8xx.so"; else if (!strcmp(mode, "turnip_a7xx")) drv = "libturnip_a7xx.so";
+  if (!strcmp(mode, "turnip_a8xx_patched")) drv = "libturnip_a8xx_patched.so"; else if (!strcmp(mode, "turnip_a8xx")) drv = "libturnip_a8xx.so"; else if (!strcmp(mode, "turnip_a7xx")) drv = "libturnip_a7xx.so";
   else if (n >= 800) drv = "libturnip_a8xx.so"; else if (n >= 600) drv = "libturnip_a7xx.so";
   if (!drv) { fprintf(stderr, "[gpu] driver: stock Adreno driver (GPU model \"%s\" is not one Turnip is chosen for; put turnip_a8xx or turnip_a7xx in gpu_driver.txt to force one)\n", model); return; }
   Dl_info di; char dir[600];
