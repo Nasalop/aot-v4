@@ -81,6 +81,34 @@ stage_banner() {   # stage_banner <zip> <sha256> <staged name> <what>
 }
 
 fetch_releases || true
+# ---- every driver zip in the V39 / V38 releases, staged as libturnip_<slug>.so so the in-app picker can offer them all ----
+# Names of the release assets are not assumed: whatever .zip assets those releases carry are staged (max TURNIP_MAX, default 8).
+stage_all() {
+python3 - "$VERS" "$W/releases.json" "${TURNIP_MAX:-8}" <<'PY'
+import json, re, sys
+vers, f, mx = sys.argv[1].split(), sys.argv[2], int(sys.argv[3])
+try: rels = json.load(open(f))
+except Exception: sys.exit(0)
+out, seen = [], set()
+for v in vers:
+    pat = re.compile(r'(?<![0-9])v?%s(?![0-9])' % re.escape(v), re.I)
+    for r in rels:
+        if not (pat.search(r.get('name') or '') or pat.search(r.get('tag_name') or '')): continue
+        for a in r.get('assets', []):
+            n = a['name']
+            if not n.lower().endswith('.zip') or n in seen: continue
+            if re.search(r'a6xx|a5xx|a4xx|a3xx', n, re.I) and not re.search(r'a7xx|a8xx|gen8', n, re.I): continue
+            seen.add(n); out.append((n, a['browser_download_url'], (a.get('digest') or '').replace('sha256:', '')))
+for n, u, d in out[:mx]: print('%s\t%s\t%s' % (n, u, d))
+PY
+}
+stage_all | while IFS=$'\t' read -r name url sha; do
+  slug=$(echo "${name%.zip}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '_' | cut -c1-40)
+  dst="libturnip_${slug}.so"; [ -s "$OUT/$dst" ] && continue
+  curl -fsSL --retry 3 --connect-timeout 20 -o "$W/$name" "$url" || { echo "WARNING: turnip: could not download $name"; continue; }
+  if [ -n "$sha" ]; then got=$(sha256sum "$W/$name" | cut -d' ' -f1); [ "$got" = "$sha" ] || { echo "WARNING: turnip: $name fails its SHA-256"; continue; }; fi
+  unpack_driver "$W/$name" "$dst" && echo "turnip: staged $dst from $name"
+done
 stage_new a8xx         libturnip_a8xx.so         "Adreno 8xx"           || stage_banner "Turnip-$BTAG-A8xx.zip" 13485ce18af8b861efcbf3d25560b15285c2298f460e0d3b7c32abbfd1f17f7a libturnip_a8xx.so "Adreno 8xx (fallback)" || true
 stage_new a7xx         libturnip_a7xx.so         "Adreno 6xx/7xx"       || stage_banner "Turnip-$BTAG.zip"      40f5becf92911aea9b18e1ecb9e1d4e790ebb1dde6d5a863f6a9c1d2d083bb8f libturnip_a7xx.so "Adreno 6xx/7xx (fallback)" || true
 stage_new a8xx_patched libturnip_a8xx_patched.so "Adreno 8xx patched"  || true
