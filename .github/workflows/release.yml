@@ -160,9 +160,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: android/app/src/main/jniLibs-turnip
-          key: turnip-gen8-v39-20261107-${{ hashFiles('third_party/turnip/**') }}
+          key: turnip-v27.0.0-20261114-r2-${{ hashFiles('third_party/turnip/**') }}
       - name: Stage Turnip drivers (cache miss only)
         if: steps.turnipc.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash third_party/turnip/build.sh android/app/src/main/jniLibs-turnip
       - name: Copy Turnip drivers into jniLibs
         run: cp android/app/src/main/jniLibs-turnip/*.so android/app/src/main/jniLibs/arm64-v8a/ 2>/dev/null || echo "no Turnip driver staged; the stock driver is used"
