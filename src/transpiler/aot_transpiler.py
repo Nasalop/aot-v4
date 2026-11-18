@@ -128,6 +128,7 @@ RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=L
 
 # Direct (in-region) calls for these leaf imports; set AOT_FASTCALL=0 in the environment of the transpiler to disable.
 FAST_CALLS = os.environ.get('AOT_FASTCALL', '1') != '0'
+INLINE_LEAF = os.environ.get('AOT_INLINE_LEAF', '1') != '0'   # tiny leaf functions are translated in place at direct call sites (see Gen.inline_leaf)
 FAST_IMPORTS = {'EnterCriticalSection', 'LeaveCriticalSection', 'TryEnterCriticalSection', 'GetTickCount', 'QueryPerformanceCounter', 'QueryPerformanceFrequency',
                 'TlsGetValue', 'TlsSetValue', 'GetLastError', 'SetLastError', 'SetEvent', 'ResetEvent', 'WaitForSingleObject', 'ReleaseSemaphore', 'ReleaseMutex',
                 'SwitchToThread', 'GetCurrentThreadId', 'InterlockedIncrement', 'InterlockedDecrement', 'InterlockedExchange', 'InterlockedExchangeAdd', 'InterlockedCompareExchange'}
@@ -440,6 +441,51 @@ class Gen:
         if o.type != X86_OP_MEM or o.mem.base or o.mem.index or o.mem.segment or o.size != 4: return None
         e = self.iat_map().get(o.mem.disp & 0xFFFFFFFF)
         return e if e and e[1] in FAST_IMPORTS else None
+    # ---- inline tiny leaf functions at their direct call sites ----
+    # A guest call/ret pair costs two region transitions (SAVES + DECL_STATE of every register, a region lookup, a binary search over the region's entry
+    # points), roughly a hundred host instructions, to run a body of two or three. This engine is full of such accessors and predicates. A function that
+    # is nothing but straight-line instructions from a whitelist followed by `ret` is translated in place instead: the return address is still pushed
+    # and popped (so [esp+N] arguments and _ReturnAddress-style tricks behave exactly), and the popped value is checked against the call site's
+    # fall-through, falling back to the ordinary dispatch if it ever differs. All five flags stay live at the end, as they were at the call.
+    INL_MAX = 12
+    INL_MN = frozenset(('mov', 'movzx', 'movsx', 'lea', 'add', 'sub', 'adc', 'sbb', 'and', 'or', 'xor', 'not', 'neg', 'inc', 'dec', 'cmp', 'test', 'shl', 'shr', 'sar', 'imul',
+        'cdq', 'cwde', 'xchg', 'push', 'pop', 'bswap', 'sete', 'setne', 'setl', 'setle', 'setg', 'setge', 'setb', 'setbe', 'seta', 'setae', 'sets', 'setns', 'setp', 'setnp',
+        'cmove', 'cmovne', 'cmovl', 'cmovle', 'cmovg', 'cmovge', 'cmovb', 'cmovbe', 'cmova', 'cmovae', 'cmovs', 'cmovns',
+        'movss', 'movaps', 'movups', 'movd', 'addss', 'subss', 'mulss', 'xorps', 'andps', 'orps',
+        'fld', 'fst', 'fstp', 'fild', 'fadd', 'faddp', 'fsub', 'fsubp', 'fmul', 'fmulp', 'fdiv', 'fdivp', 'fxch', 'fchs', 'fabs', 'fldz', 'fld1'))
+    def _inl_ok(self, ins):
+        mn = ins.mnemonic.split()[-1]
+        if mn not in self.INL_MN or len(ins.mnemonic.split()) > 1 or 0xF0 in ins.prefix or 0xF2 in ins.prefix or 0xF3 in ins.prefix: return False
+        if mn == 'xchg' and any(o.type == X86_OP_MEM for o in ins.operands): return False   # implicit lock
+        if mn in ('movss', 'movaps', 'movups', 'movd', 'addss', 'subss', 'mulss', 'xorps', 'andps', 'orps') and not any(o.type == X86_OP_REG and ins.reg_name(o.reg).startswith('xmm') for o in ins.operands): return False
+        return True
+    def inline_leaf(self, i, op, nx, tgt):
+        a = op.imm
+        if a in NATIVE_CRT or native_elided(self.rec, a): return ''
+        cache = self.__dict__.setdefault('_leaf', {}); ent = cache.get(a, 0)
+        if ent == 0:
+            ent = None; seq = []; x = a
+            for _ in range(self.INL_MAX + 1):
+                ins = self.rec.decode(x)
+                if ins is None or not self.rec.in_text(x): break
+                mn = ins.mnemonic.split()[-1]
+                if mn == 'ret':
+                    if len(ins.operands) <= 1 and not any(0xF3 in q.prefix for q in (ins,)): ent = (seq, ins)
+                    break
+                if not self._inl_ok(ins): break
+                seq.append(ins); x += ins.size
+            cache[a] = ent
+        if not ent: return ''
+        seq, rt = ent
+        live = set(F5); needs = []
+        for ins in reversed(seq):
+            w, r, vc = flagrw(ins)
+            if vc: needs.append(set(F5)); live |= r; continue
+            needs.append(live & w); live = (live - w) | r
+        needs.reverse()
+        body = ''.join(self.tr(ins, nd, tgt) for ins, nd in zip(seq, needs)); self.i = i
+        imm = rt.operands[0].imm if rt.operands else 0
+        return ('PUSH32(0x%xULL);%s{uint32_t t_=POP32();%sif(t_!=0x%xULL){pc=t_;goto dispatch;}}%s' % (nx, body, ('r4=(uint32_t)(r4+%d);' % imm) if imm else '', nx, tgt(nx)))
     def fast_call(self, i, op, nx, tgt):
         pre = ''; dll = name = None
         if op.type == X86_OP_MEM:
@@ -628,6 +674,10 @@ class Gen:
                 if op.type == X86_OP_IMM: return 'PUSH32(c->sregs[1]);PUSH32(0x%xULL);%s' % (nx, tgt(op.imm))
                 return '{uint64_t a=%s;uint32_t t=LD(uint32_t,a);PUSH32(c->sregs[1]);PUSH32(0x%xULL);pc=t;goto dispatch;}' % (self.addr(op), nx)
             if op.type == X86_OP_IMM and native_elided(self.rec, op.imm): return ';'   # /GS cookie check: nothing to do, and no stack push at all
+            if op.type == X86_OP_IMM and self.m32 and INLINE_LEAF:
+                try: inl = self.inline_leaf(i, op, nx, tgt)
+                except Exception: inl = ''
+                if inl: return inl
             if op.type == X86_OP_IMM: orig = '%s(0x%xULL);%s' % (PU, nx, tgt(op.imm))
             else: orig = '{uint64_t t=%s; %s(0x%xULL); pc=t; goto dispatch;}' % (self.rdop(op, PS), PU, nx)
             if self.m32 and FAST_CALLS:
@@ -1192,7 +1242,7 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
     protos = ''.join('uint64_t region_%d(CPU*,uint64_t);\n' % q for q in range(len(regions)))   # direct region-to-region tail calls need the prototypes in every part file
     unsup = rec.unsup; nok = 0
     native_hooks = []
-    files = []; buf = [HDR + protos]
+    files = []; buf = [('#define AOT_M32 1\n' if g.m32 else '') + HDR + protos]   # PE32: regions load/store only eax..edi (see DECL_STATE in aot_runtime.h)
     for k, reg in enumerate(regions):
         out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;uint64_t pc0=pc;\n' % k,
                'if(pc==0x%xULL)goto L_%x;' % (reg[0][0].address, reg[0][0].address),   # enter at the region start without touching the switch: the common case
