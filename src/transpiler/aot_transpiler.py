@@ -1250,11 +1250,19 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
         if len(reg) >= 24 and os.environ.get('AOT_TABLE_DISPATCH', '1') != '0':
             # Table dispatch: the entry addresses and label addresses live in rodata and are binary-searched. A big switch makes the compiler hoist every case
             # constant into a register for the whole region (spills everywhere, and ~20 constants rebuilt after every helper call).
-            ents = sorted(set(b[0].address for b in reg)); kt = 'uint32_t' if g.m32 else 'uint64_t'
-            out.append('{static const %s K[%d]={%s};static const void*const T[%d]={%s};unsigned lo=0,hi=%d;%s pk=(%s)pc;'
-                       'while(lo<hi){unsigned md=(lo+hi)>>1;if(K[md]<pk)lo=md+1;else hi=md;}'
-                       'if(lo<%d&&K[lo]==pk&&(%s)(pk==pc))goto *T[lo];AOT_TAILDISP(pc,pc0);}' % (
-                kt, len(ents), ','.join('0x%x' % a for a in ents), len(ents), ','.join('&&L_%x' % a for a in ents), len(ents), kt, kt, len(ents), 'int'))
+            ents = sorted(set(b[0].address for b in reg)); w64 = not g.m32
+            bits = max(4, (2 * len(ents) - 1).bit_length()); sz = 1 << bits; mask = (1 << (64 if w64 else 32)) - 1
+            mul = 0x9E3779B97F4A7C15 if w64 else 0x9E3779B1; sh = (64 if w64 else 32) - bits
+            keys = [0] * sz; lbl = [ents[0]] * sz
+            for a_ in ents:   # open addressing, linear probing: the generated lookup repeats exactly this probe order
+                h = ((a_ * mul) & mask) >> sh
+                while keys[h]: h = (h + 1) & (sz - 1)
+                keys[h] = a_; lbl[h] = a_
+            kt = 'uint64_t' if w64 else 'uint32_t'
+            out.append('{static const %s K[%d]={%s};static const void*const T[%d]={%s};%s pk=(%s)pc;unsigned h=(unsigned)((pk*%s)>>%d)&%d;'
+                       'for(;;){%s kk=K[h];if(kk==pk&&pk==pc)goto *T[h];if(!kk)break;h=(h+1)&%d;}AOT_TAILDISP(pc,pc0);}' % (
+                kt, sz, ','.join('0x%x' % k for k in keys), sz, ','.join('&&L_%x' % x for x in lbl), kt, kt,
+                ('0x%xULL' % mul) if w64 else ('0x%xu' % mul), sh, sz - 1, kt, sz - 1))
         else:
             out.append('switch(pc){')
             out += ['case 0x%xULL:goto L_%x;' % (b[0].address, b[0].address) for b in reg]
