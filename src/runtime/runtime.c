@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 
 #define THUNK_BASE (aot_is_pe32 ? 0x6ff00000ULL : 0x6fff00000000ULL)
 #define THUNK_SZ 16
@@ -37,7 +38,19 @@ static uint64_t image_fingerprint(const uint8_t *image, size_t size) {
   return hash;
 }
 
+#if defined(__aarch64__)
+/* The game's own profiler markers and timers execute RDTSC constantly. clock_gettime costs a library call plus the vDSO read (~40 ns); the ARM generic counter is one register read
+   (~3 ns) and is monotonic and system-wide. It is scaled to the 3 GHz the old code was already presented with, so durations the game computes keep their meaning. */
+uint64_t aot_rdtsc(void) {
+  static uint64_t scale;   /* 3e9 / counter frequency as 48.16 fixed point; 0 = not set up yet */
+  uint64_t cnt; __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(cnt));
+  uint64_t sc = __atomic_load_n(&scale, __ATOMIC_RELAXED);
+  if (!sc) { uint64_t f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); if (!f) f = 19200000; sc = (uint64_t)(((unsigned __int128)3000000000ULL << 16) / f); __atomic_store_n(&scale, sc, __ATOMIC_RELAXED); }
+  return (uint64_t)(((unsigned __int128)cnt * sc) >> 16);
+}
+#else
 uint64_t aot_rdtsc(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 3000000000ULL + (uint64_t)t.tv_nsec * 3; }
+#endif
 
 void aot_unimpl(uint64_t addr, const char *text) {
   fflush(stdout);
@@ -156,23 +169,59 @@ static void io_fail_note(const char *name, uint32_t eax) {
 done:
   if (hit && cnt[k % 16]++ < 10) fprintf(stderr, "[aot] %s failed (eax=%u, last error %u)\n", n, (unsigned)eax, (unsigned)aot_last_error);
 }
-typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int imp[12]; volatile unsigned in; volatile uint64_t wh, set; volatile uint32_t wms; volatile int waiting; CPU *cpu; } __attribute__((aligned(128))) WdThread;
+typedef struct { volatile uint64_t pc; volatile unsigned n; volatile int tid; volatile int imp[12]; volatile unsigned in; volatile uint64_t wh, set; volatile uint32_t wms; volatile int waiting; CPU *cpu; } __attribute__((aligned(128))) WdThread;
 static WdThread wd_t[16]; static int wd_cnt; static __thread WdThread *wd_me;
 static WdThread *wd_self(void);
 void aot_wd_wait(uint64_t h, uint32_t ms, int on) { WdThread *w = wd_self(); w->wh = h; w->wms = ms; w->waiting = on; }
 void aot_wd_set(uint64_t h) { wd_self()->set = h; }
-static WdThread *wd_self(void) { if (!wd_me) { int k = __atomic_fetch_add(&wd_cnt, 1, __ATOMIC_RELAXED); wd_me = &wd_t[k % 16]; } return wd_me; }
+static WdThread *wd_self(void) { if (!wd_me) { int k = __atomic_fetch_add(&wd_cnt, 1, __ATOMIC_RELAXED); wd_me = &wd_t[k % 16]; wd_me->tid = (int)syscall(SYS_gettid); } return wd_me; }
+/* ---- host-PC sampling profiler (what the CPU is really executing, per guest thread) ----
+   The watchdog's "hot pc" only knows the last place the dispatcher was entered, which says little once regions tail-call each other. Here the watchdog thread
+   sends SIGPROF to each running guest thread every 2 ms; the handler records the interrupted host PC. A PC inside generated code is reported as its region
+   (with the guest address range, so it can be matched to the game's functions); anything else as the library function it is in (libc, the vDSO, our runtime). */
+#if defined(__aarch64__)
+#include <signal.h>
+#include <ucontext.h>
+#include <dlfcn.h>
+static uint64_t prof_ring[8192]; static unsigned prof_w, prof_r;
+static void prof_h(int sig, siginfo_t *si, void *uc_) { (void)sig; (void)si; WdThread *w = wd_me; if (!w) return;
+  uint64_t pc = ((ucontext_t *)uc_)->uc_mcontext.pc; unsigned i = __atomic_fetch_add(&prof_w, 1, __ATOMIC_RELAXED); prof_ring[i & 8191] = ((uint64_t)(w - wd_t) << 56) | (pc & 0xffffffffffffffULL); }
+typedef struct { uintptr_t fn; int k; } PReg; static PReg *preg; static int npreg; static uintptr_t preg_end;
+static int preg_cmp(const void *a, const void *b) { uintptr_t x = ((const PReg *)a)->fn, y = ((const PReg *)b)->fn; return x < y ? -1 : x > y; }
+static void prof_init(void) { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = prof_h; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(SIGPROF, &sa, NULL);
+  preg = malloc(sizeof(PReg) * (size_t)(aot_nregions + 1)); for (int m = 0; m < aot_nregions; m++) { preg[m].fn = (uintptr_t)aot_region_fn[m]; preg[m].k = m; } npreg = aot_nregions; qsort(preg, (size_t)npreg, sizeof(PReg), preg_cmp);
+  preg_end = npreg ? preg[npreg - 1].fn + (1u << 20) : 0; }
+static int prof_region(uint64_t pc) { if (!npreg || pc < preg[0].fn || pc >= preg_end) return -1; int lo = 0, hi = npreg - 1; while (lo < hi) { int mid = (lo + hi + 1) / 2; if (preg[mid].fn <= pc) lo = mid; else hi = mid - 1; } return preg[lo].k; }
+/* bin = region number (>= 0) or -(address of the library function + 1 bucket by 64 bytes); counted in small per-thread tables */
+static uint64_t pk[16][256]; static uint32_t pn[16][256]; static uint32_t ptot[16];
+static void prof_bin(int slot, uint64_t pc) { int r = prof_region(pc); uint64_t key = r >= 0 ? (uint64_t)r : (1ull << 62) | (pc >> 6); ptot[slot]++;
+  unsigned h = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 56); for (int pr = 0; pr < 16; pr++, h = (h + 1) & 255) if (pn[slot][h] == 0 || pk[slot][h] == key) { pk[slot][h] = key; pn[slot][h]++; return; } }
+static void prof_drain(void) { unsigned w = __atomic_load_n(&prof_w, __ATOMIC_ACQUIRE); if (w - prof_r > 8192) prof_r = w - 8192; for (; prof_r != w; prof_r++) { uint64_t e = prof_ring[prof_r & 8191]; prof_bin((int)(e >> 56) & 15, e & 0xffffffffffffffULL); } }
+static void prof_sample(void) { pid_t pid = getpid(); for (int t = 0; t < wd_cnt && t < 16; t++) if (!wd_t[t].waiting && wd_t[t].tid) syscall(SYS_tgkill, pid, wd_t[t].tid, SIGPROF); }
+static void prof_report(int t) {
+  for (int top = 0; top < 8; top++) { int bi = -1; for (int h = 0; h < 256; h++) if (pn[t][h] && (bi < 0 || pn[t][h] > pn[t][bi])) bi = h; if (bi < 0 || pn[t][bi] * 100 < ptot[t]) break;   /* below 1%: stop */
+    uint64_t key = pk[t][bi]; double pct = 100.0 * pn[t][bi] / (ptot[t] ? ptot[t] : 1);
+    if (!(key >> 62)) { int k = (int)key; fprintf(stderr, "    prof T%d %5.1f%% region #%d guest %llx-%llx\n", t, pct, k, (unsigned long long)aot_region_lo[k], (unsigned long long)aot_region_hi[k]); }
+    else { uintptr_t pc = (uintptr_t)((key & ~(1ull << 62)) << 6); Dl_info di; const char *nm = "?", *fn = "?"; if (dladdr((void *)pc, &di)) { if (di.dli_sname) nm = di.dli_sname; if (di.dli_fname) { fn = strrchr(di.dli_fname, '/'); fn = fn ? fn + 1 : di.dli_fname; } }
+      fprintf(stderr, "    prof T%d %5.1f%% host %s!%s (+%#llx)\n", t, pct, fn, nm, di.dli_saddr ? (unsigned long long)(pc - (uintptr_t)di.dli_saddr) : 0ull); }
+    pn[t][bi] = 0; }
+  fprintf(stderr, "    prof T%d samples=%u\n", t, ptot[t]); memset(pn[t], 0, sizeof pn[t]); ptot[t] = 0; }
+#else
+static void prof_init(void) {} static void prof_sample(void) {} static void prof_drain(void) {} static void prof_report(int t) { (void)t; }
+#endif
 /* Watchdog: every 10 s report guest progress (region transitions, imports, recent entries) so a hang/spin is located without a debugger. */
 static void *watchdog(void *arg) {
-  (void)arg; for (int k = 0; k < 6; k++) {
+  (void)arg; prof_init(); for (int k = 0; k < 6; k++) {
     static uint64_t hp[16][512]; static uint32_t hc[16][512]; memset(hp, 0, sizeof hp); memset(hc, 0, sizeof hc);
     for (int i = 0; i < 5000; i++) { usleep(2000);   /* 2 ms pc sampler: where do running guest threads spend their time? */
+      prof_sample(); usleep(300); prof_drain();
       for (int t = 0; t < wd_cnt && t < 16; t++) { if (wd_t[t].waiting) continue; uint64_t pc = wd_t[t].pc; unsigned h = (unsigned)((pc * 2654435761u) >> 7) & 511; for (int pr = 0; pr < 8; pr++, h = (h + 1) & 511) if (hp[t][h] == pc || !hc[t][h]) { hp[t][h] = pc; hc[t][h]++; break; } } }
     fprintf(stderr, "[aot] watchdog %ds, per guest thread (pc, region entries, last non-sync imports):\n", 10 * (k + 1));
     for (int t = 0; t < wd_cnt && t < 16; t++) {
       WdThread *w = &wd_t[t]; fprintf(stderr, "  T%d pc=%llx n=%u %s h=%llx ms=%x lastSet=%llx:", t, (unsigned long long)w->pc, w->n, w->waiting ? "WAITING" : "running", (unsigned long long)w->wh, w->wms, (unsigned long long)w->set); unsigned in = w->in; int shown = 0;
       for (unsigned i = 0; i < 12 && shown < 5; i++) { int idx = w->imp[(in + 11 - i) % 12]; if (idx > 0 && idx < nthunks) { const char *nm = thunks[idx].name; if (strstr(nm, "CriticalSection") || strstr(nm, "Tls") || strstr(nm, "Fls") || strstr(nm, "QueryPerf")) continue; fprintf(stderr, " %s", nm); shown++; } }
       fprintf(stderr, "\n");
+      prof_report(t);
       for (int top = 0; top < 6; top++) { int bi = -1; for (int h = 0; h < 512; h++) if (hc[t][h] && (bi < 0 || hc[t][h] > hc[t][bi])) bi = h; if (bi < 0 || hc[t][bi] < 25) break; fprintf(stderr, "    hot T%d pc=%llx samples=%u\n", t, (unsigned long long)hp[t][bi], hc[t][bi]); hc[t][bi] = 0; }
       if (!wd_t[t].waiting && wd_t[t].cpu) { CPU *cc = wd_t[t].cpu; fprintf(stderr, "    regs T%d eax=%llx ecx=%llx edx=%llx ebx=%llx esp=%llx ebp=%llx esi=%llx edi=%llx ftop=%d fsw=%04x st0=%g st1=%g st2=%g st3=%g\n", t,
         (unsigned long long)cc->r[0], (unsigned long long)cc->r[1], (unsigned long long)cc->r[2], (unsigned long long)cc->r[3], (unsigned long long)cc->r[4], (unsigned long long)cc->r[5], (unsigned long long)cc->r[6], (unsigned long long)cc->r[7],
@@ -396,7 +445,7 @@ int aot_keep(const char *fmt) {
   const char *s = fmt; int nl = 0; if (*s == '\n') { s++; nl = 1; }
   static const char *const keep[] = { "[aot]", "[cpu]", "[gfx]", "[gpu]", "[perf]", "[hlsl]", "[winfile]", "[d3d10] Create", "[dxvk] tier", "[dxvk] using", "[dxvk] no DXVK",
     "[dxvk] out of", "[dxvk] missing", "[dxvk] Create", "[dxvk] Enum", "[dxvk] D3D10", "[dxvk] host", "[dxvk] no Android", "[dxvk] %s::%s", "[dxvk] guest", "[audio]",
-    "cannot", "mappings", "executable", "image base", "entry point", "usage", "[heap]", "[in] GetDevice", "[ev]", "  T", "    hot T", "    regs T", NULL };
+    "cannot", "mappings", "executable", "image base", "entry point", "usage", "[heap]", "[in] GetDevice", "[ev]", "  T", "    prof T", "    hot T", "    regs T", NULL };
   int ok = 0; for (int i = 0; keep[i]; i++) if (!strncmp(s, keep[i], strlen(keep[i]))) { ok = 1; break; }
   if (!ok) return 0;
   if (nl && !strncmp(s, "[aot]", 5)) { aot_log_all = 1; return 1; }
