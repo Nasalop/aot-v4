@@ -193,9 +193,9 @@ static void *rt_main(void *arg) {
 }
 static int rt_enabled(void) {
   if (rt_state >= 0) return rt_state;
-  int on = 1; const char *e = getenv("AOT_RENDER_THREAD");
+  int on = 0; const char *e = getenv("AOT_RENDER_THREAD");   /* off by default: measured, D3D is ~2% of a gameplay frame, so a second thread has nothing to take over */
   if (e && *e) on = !(e[0] == '0' || !strcmp(e, "off"));
-  else { FILE *f = fopen("render_thread.txt", "r"); if (f) { char b[16] = ""; if (fgets(b, sizeof b, f)) on = !(b[0] == '0' || !strncmp(b, "off", 3)); fclose(f); } }
+  else { FILE *f = fopen("render_thread.txt", "r"); if (f) { char b[16] = ""; if (fgets(b, sizeof b, f)) on = (b[0] == '1' || !strncmp(b, "on", 2)); fclose(f); } }
   if (on) { pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
     if (pthread_create(&th, &at, rt_main, NULL) != 0) on = 0; pthread_attr_destroy(&at); }
   fprintf(stderr, "[gfx] render thread: %s\n", on ? "on (D3D draws, binds and clears are replayed on a second thread)" : "off");
