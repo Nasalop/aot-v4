@@ -514,7 +514,7 @@ class Gen:
             pre = ''.join(self.tr(ins, set(), tgt) for ins in body[:-2])
         else: return ''
         return ('{static uint64_t(*f_)(CPU*);static int p_=-1,q_;if(p_<0){int fp_=0,pp_=0;f_=aot_x86_resolve("%s","%s",&pp_,&fp_);q_=fp_;p_=pp_;}'
-                'if(f_&&!q_){%sPUSH32(0x%xULL);c->r[4]=r4;aot_x86_thunk(c,f_,p_,0);r0=c->r[0];r1=c->r[1];r2=c->r[2];r8=c->r[8];r9=c->r[9];r4=c->r[4];%s}}'
+                'if(f_&&!q_){%sPUSH32(0x%xULL);c->r[4]=r4;FT_SYNC_OUT();aot_x86_thunk(c,f_,p_,0);FT_SYNC_IN();r0=c->r[0];r1=c->r[1];r2=c->r[2];r8=c->r[8];r9=c->r[9];r4=c->r[4];%s}}'
                 % (dll, name, pre, nx, tgt(nx)))
     FUSE = os.environ.get('AOT_FUSE_CMPJ', '0') == '1'
     def fuse_cmp_jcc(self, p, j, tgt):
@@ -1047,29 +1047,29 @@ class Gen:
               'fldl2t': 'FPUSH(3.32192809488736234787031942948939018L);', 'fldlg2': 'FPUSH(0.301029995663981195213738894724493027L);', 'fldln2': 'FPUSH(0.693147180559945309417232121458176568L);',
               'fptan': 'FST(0)=F80(tan)(FST(0));FPUSH(1);', 'fpatan': 'FST(1)=F80(atan2)(FST(1),FST(0));FPOP();', 'fyl2x': 'FST(1)=FST(1)*F80(log2)(FST(0));FPOP();',
               'fyl2xp1': 'FST(1)=FST(1)*F80(log2)(FST(0)+1);FPOP();', 'fscale': 'FST(0)=F80(ldexp)(FST(0),(int)F80(trunc)(FST(1)));',
-              'fsincos': '{aot_f80 _v=FST(0);FST(0)=F80(sin)(_v);FPUSH(F80(cos)(_v));}', 'fincstp': 'c->ftop=(c->ftop+1)&7;', 'fdecstp': 'c->ftop=(c->ftop+7)&7;',
+              'fsincos': '{aot_f80 _v=FST(0);FST(0)=F80(sin)(_v);FPUSH(F80(cos)(_v));}', 'fincstp': 'FTOP=(FTOP+1)&7;', 'fdecstp': 'FTOP=(FTOP+7)&7;',
               'fprem': '{aot_f80 _a=FST(0),_b=FST(1),_r=F80(fmod)(_a,_b);long long _q=(long long)F80(trunc)(_a/_b);FST(0)=_r;c->fsw=(c->fsw&~0x4700)|((_q&4)?0x100:0)|((_q&2)?0x4000:0)|((_q&1)?0x200:0);}',
               'fprem1': '{aot_f80 _a=FST(0),_b=FST(1),_r=F80(remainder)(_a,_b);long long _q=(long long)F80(nearbyint)(_a/_b);FST(0)=_r;c->fsw=(c->fsw&~0x4700)|((_q&4)?0x100:0)|((_q&2)?0x4000:0)|((_q&1)?0x200:0);}',
-              'fninit': 'c->fcw=0x37F;c->fsw=0;c->ftop=0;', 'finit': 'c->fcw=0x37F;c->fsw=0;c->ftop=0;', 'fnclex': 'c->fsw&=0x7f00;', 'fclex': 'c->fsw&=0x7f00;', 'fwait': '', 'wait': '',
+              'fninit': 'c->fcw=0x37F;c->fsw=0;FTOP=0;', 'finit': 'c->fcw=0x37F;c->fsw=0;FTOP=0;', 'fnclex': 'c->fsw&=0x7f00;', 'fclex': 'c->fsw&=0x7f00;', 'fwait': '', 'wait': '',
               'ffree': '', 'ffreep': 'FPOP();', 'fnop': '',
               'fxam': '{aot_f80 _v=FST(0);int _c=_v!=_v?0x100:(_v==INFINITY||_v==-INFINITY)?0x500:_v==0?0x4000:0x400;c->fsw=(c->fsw&~0x4700)|_c|(signbit(_v)?0x200:0);}',
               'ftst': '{aot_f80 _v=FST(0);c->fsw=(c->fsw&~0x4500)|(_v!=_v?0x4500:_v<0?0x100:_v==0?0x4000:0);}'}
         if mn in un: return un[mn]
         if mn in ('fnstenv', 'fnsave'):
             a = A(ops[0])
-            s = '{uint64_t p=%s;ST(uint16_t,p,c->fcw);ST(uint16_t,p+4,(c->fsw&~0x3800)|(c->ftop<<11));ST(uint16_t,p+8,0xFFFF);' % a
+            s = '{uint64_t p=%s;ST(uint16_t,p,c->fcw);ST(uint16_t,p+4,(c->fsw&~0x3800)|(FTOP<<11));ST(uint16_t,p+8,0xFFFF);' % a
             if mn == 'fnsave':
-                s += 'for(int j=0;j<8;j++)aot_st80(p+28+10*j,FST(j));c->fcw=0x37F;c->fsw=0;c->ftop=0;'
+                s += 'for(int j=0;j<8;j++)aot_st80(p+28+10*j,FST(j));c->fcw=0x37F;c->fsw=0;FTOP=0;'
             return s + '}'
         if mn in ('fldenv', 'frstor'):
             a = A(ops[0])
-            s = '{uint64_t p=%s;c->fcw=LD(uint16_t,p);c->fsw=LD(uint16_t,p+4);c->ftop=(c->fsw>>11)&7;' % a
-            if mn == 'frstor': s += 'unsigned ft=c->ftop;for(int j=0;j<8;j++)c->fst[(ft+j)&7]=aot_ld80(p+28+10*j);'
+            s = '{uint64_t p=%s;c->fcw=LD(uint16_t,p);c->fsw=LD(uint16_t,p+4);FTOP=(c->fsw>>11)&7;' % a
+            if mn == 'frstor': s += 'unsigned ftt=FTOP;for(int j=0;j<8;j++)c->fst[(ftt+j)&7]=aot_ld80(p+28+10*j);'
             return s + '}'
         if mn == 'fbstp':
             return '{uint64_t p=%s;int64_t v=aot_fist(FST(0),64,c->fcw,0);uint64_t u=v<0?-(uint64_t)v:(uint64_t)v;for(int j=0;j<9;j++){ST(uint8_t,p+j,(u%%10)|(((u/10)%%10)<<4));u/=100;}ST(uint8_t,p+9,v<0?0x80:0);FPOP();}' % A(ops[0])
         if mn in ('fnstsw', 'fstsw'):
-            v = '(uint16_t)((c->fsw&~0x3800)|(c->ftop<<11))'
+            v = '(uint16_t)((c->fsw&~0x3800)|(FTOP<<11))'
             return ('r0=(r0&~0xFFFFULL)|%s;' % v) if ops[0].type == X86_OP_REG else 'ST(uint16_t,%s,%s);' % (A(ops[0]), v)
         if mn in ('fnstcw', 'fstcw'): return 'ST(uint16_t,%s,c->fcw);' % A(ops[0])
         if mn == 'fldcw': return 'c->fcw=LD(uint16_t,%s);' % A(ops[0])
@@ -1285,7 +1285,8 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
     protos = ''.join('uint64_t region_%d(CPU*,uint64_t);\n' % q for q in range(len(regions)))   # direct region-to-region tail calls need the prototypes in every part file
     unsup = rec.unsup; nok = 0
     native_hooks = []
-    files = []; buf = [('#define AOT_M32 1\n' if g.m32 else '') + HDR + protos]   # PE32: regions load/store only eax..edi (see DECL_STATE in aot_runtime.h)
+    PRE = '#define AOT_M32 1\n#define AOT_FT 1\n' if g.m32 else ''
+    files = []; buf = [PRE + HDR + protos]   # PE32: regions load/store only eax..edi (see DECL_STATE in aot_runtime.h)
     for k, reg in enumerate(regions):
         out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;uint64_t pc0=pc;\n' % k,
                'if(pc==0x%xULL)goto L_%x;' % (reg[0][0].address, reg[0][0].address),   # enter at the region start without touching the switch: the common case
@@ -1351,7 +1352,7 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
             with open(fn, 'w', encoding='utf-8') as output:
                 output.write('\n'.join(buf))
             files.append(fn)
-            buf = [HDR + protos]
+            buf = [PRE + HDR + protos]
     tab = ['#include "aot_runtime.h"']
     tab += ['uint64_t region_%d(CPU*,uint64_t);' % k for k in range(len(regions))]
     tab.append('const int aot_is_pe32=%d;' % (1 if rec.m32 else 0))
