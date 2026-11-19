@@ -128,6 +128,8 @@ RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=L
 
 # Direct (in-region) calls for these leaf imports; set AOT_FASTCALL=0 in the environment of the transpiler to disable.
 FAST_CALLS = os.environ.get('AOT_FASTCALL', '1') != '0'
+RETCALL_LITE = os.environ.get('AOT_RETCALL_LITE', '1') != '0'   # flags dead (except cf/zf) at call/ret boundaries
+HOSTCALL = os.environ.get('AOT_HOSTCALL', '0') == '1'   # calls/returns as real host calls (runtime switch: hostcall.txt)
 INLINE_LEAF = os.environ.get('AOT_INLINE_LEAF', '1') != '0'   # tiny leaf functions are translated in place at direct call sites (see Gen.inline_leaf)
 FAST_IMPORTS = {'EnterCriticalSection', 'LeaveCriticalSection', 'TryEnterCriticalSection', 'GetTickCount', 'QueryPerformanceCounter', 'QueryPerformanceFrequency',
                 'TlsGetValue', 'TlsSetValue', 'GetLastError', 'SetLastError', 'SetEvent', 'ResetEvent', 'WaitForSingleObject', 'ReleaseSemaphore', 'ReleaseMutex',
@@ -514,6 +516,29 @@ class Gen:
         return ('{static uint64_t(*f_)(CPU*);static int p_=-1,q_;if(p_<0){int fp_=0,pp_=0;f_=aot_x86_resolve("%s","%s",&pp_,&fp_);q_=fp_;p_=pp_;}'
                 'if(f_&&!q_){%sPUSH32(0x%xULL);c->r[4]=r4;aot_x86_thunk(c,f_,p_,0);r0=c->r[0];r1=c->r[1];r2=c->r[2];r8=c->r[8];r9=c->r[9];r4=c->r[4];%s}}'
                 % (dll, name, pre, nx, tgt(nx)))
+    FUSE = os.environ.get('AOT_FUSE_CMPJ', '0') == '1'
+    def fuse_cmp_jcc(self, p, j, tgt):
+        """cmp/test immediately followed by a conditional jump whose flags nobody else reads: emit one C comparison (one cmp + one b.cc on ARM) instead of
+        computing and storing cf/zf/sf/of. Returns C code for both instructions, or None when the pair is not fusable."""
+        pm = p.mnemonic.split()[-1]; jm = j.mnemonic.split()[-1]
+        if pm not in ('cmp', 'test') or len(p.operands) != 2 or jm[0] != 'j' or jm[1:] not in COND or len(j.operands) != 1 or j.operands[0].type != X86_OP_IMM: return None
+        if p.prefix and any(x in (0xF0, 0xF3, 0xF2) for x in p.prefix if x): return None
+        S = p.operands[0].size
+        if S not in (1, 2, 4) or p.operands[1].size not in (1, 2, 4): return None
+        cc = jm[1:]; T = 'uint%d_t' % (8 * S); ST_ = 'int%d_t' % (8 * S)
+        a = self.rdop(p.operands[0], S); b = self.rdop(p.operands[1], S)
+        if pm == 'cmp':
+            m = {'e': 'a==b', 'z': 'a==b', 'ne': 'a!=b', 'nz': 'a!=b', 'l': '(%s)a<(%s)b' % (ST_, ST_), 'nge': '(%s)a<(%s)b' % (ST_, ST_), 'ge': '(%s)a>=(%s)b' % (ST_, ST_),
+                 'nl': '(%s)a>=(%s)b' % (ST_, ST_), 'le': '(%s)a<=(%s)b' % (ST_, ST_), 'ng': '(%s)a<=(%s)b' % (ST_, ST_), 'g': '(%s)a>(%s)b' % (ST_, ST_), 'nle': '(%s)a>(%s)b' % (ST_, ST_),
+                 'b': 'a<b', 'c': 'a<b', 'nae': 'a<b', 'ae': 'a>=b', 'nb': 'a>=b', 'nc': 'a>=b', 'be': 'a<=b', 'na': 'a<=b', 'a': 'a>b', 'nbe': 'a>b',
+                 's': '(%s)(%s)(a-b)<0' % (ST_, T), 'ns': '(%s)(%s)(a-b)>=0' % (ST_, T)}
+        else:
+            r = '(%s)(a&b)' % T; sr = '(%s)(a&b)' % ST_
+            m = {'e': '%s==0' % r, 'z': '%s==0' % r, 'ne': '%s!=0' % r, 'nz': '%s!=0' % r, 's': '%s<0' % sr, 'ns': '%s>=0' % sr, 'l': '%s<0' % sr, 'nge': '%s<0' % sr,
+                 'ge': '%s>=0' % sr, 'nl': '%s>=0' % sr, 'le': '%s<=0' % sr, 'ng': '%s<=0' % sr, 'g': '%s>0' % sr, 'nle': '%s>0' % sr,
+                 'be': '%s==0' % r, 'na': '%s==0' % r, 'a': '%s!=0' % r, 'nbe': '%s!=0' % r, 'b': '0', 'c': '0', 'nae': '0', 'ae': '1', 'nb': '1', 'nc': '1'}
+        if cc not in m: return None
+        return '{%s a=%s,b=%s;(void)b;if(%s){%s}}' % (T, a, b, m[cc], tgt(j.operands[0].imm))
     def tr(self, i, need, tgt):
         """returns C statements. tgt(addr)-> goto statement for a code address."""
         self.i = i; mn = i.mnemonic.split()[-1]; pre = i.mnemonic.split()[:-1]
@@ -650,6 +675,7 @@ class Gen:
             return '{%s a=%s,b=%s; unsigned k=%s; if(k){ %s r=(%s)(%s); cf=%s;zf=r==0;sf=(r>>%d)&1;pf=PAR(r);%s}}' % (
                 T, self.rdop(ops[0], S), self.rdop(ops[1], S), cnt, T, T, sh, '(a>>(%d-k))&1' % B if mn == 'shld' else '(a>>(k-1))&1', B - 1, self.wrop(ops[0], 'r', S))
         # control flow -----------------------------------------------------------
+        if mn == 'ret' and m32 and HOSTCALL: return '{pc=POP32();%sif(HC_ACTIVE(c))EXIT(pc);goto dispatch;}' % ('r4=(uint32_t)(r4+%d);' % ops[0].imm if n else '')
         if mn == 'ret': return ('{pc=POP32();%s goto dispatch;}' % ('r4=(uint32_t)(r4+%d);' % ops[0].imm if n else '')) if m32 else '{pc=POP();%s goto dispatch;}' % ('r4+=%d;' % ops[0].imm if n else '')
         if m32 and mn == 'retf': return '{pc=POP32();(void)POP32();%s goto dispatch;}' % ('r4=(uint32_t)(r4+%d);' % ops[0].imm if n else '')
         if m32 and mn in ('iret', 'iretd'):
@@ -678,8 +704,18 @@ class Gen:
                 try: inl = self.inline_leaf(i, op, nx, tgt)
                 except Exception: inl = ''
                 if inl: return inl
-            if op.type == X86_OP_IMM: orig = '%s(0x%xULL);%s' % (PU, nx, tgt(op.imm))
-            else: orig = '{uint64_t t=%s; %s(0x%xULL); pc=t; goto dispatch;}' % (self.rdop(op, PS), PU, nx)
+            hcn = tgt(nx)
+            if op.type == X86_OP_IMM:
+                orig = '%s(0x%xULL);%s' % (PU, nx, tgt(op.imm))
+                ok_ = getattr(self, 'owner', {}).get(op.imm)
+                if self.m32 and HOSTCALL and ok_ is not None:
+                    orig = ('%s(0x%xULL);if(HC_OK(c)){SAVES();uint64_t rv_=region_%d(c,0x%xULL);RELOAD();if(rv_==0x%xULL){%s}pc=rv_;goto dispatch;}%s'
+                            % (PU, nx, ok_, op.imm, nx, hcn, tgt(op.imm)))
+            else:
+                orig = '{uint64_t t=%s; %s(0x%xULL); pc=t; goto dispatch;}' % (self.rdop(op, PS), PU, nx)
+                if self.m32 and HOSTCALL:
+                    orig = ('{uint64_t t=%s; %s(0x%xULL); if(HC_OK(c)){SAVES();uint64_t rv_=aot_hcall(c,t);RELOAD();if(rv_==0x%xULL){%s}pc=rv_;goto dispatch;} pc=t; goto dispatch;}'
+                            % (self.rdop(op, PS), PU, nx, nx, hcn))
             if self.m32 and FAST_CALLS:
                 try:
                     fast = self.fast_call(i, op, nx, tgt)
@@ -1203,7 +1239,13 @@ def flag_live_out(blk, blkreg, owner, cross_block=None):
     if cross_block is None: cross_block = CROSS_BLOCK_FLAGS
     if not cross_block: return {a: set(F5) for a in blk}
     succs = {a: _block_succ(a, b, blkreg[a], owner) for a, b in blk.items()}
-    live_out = {a: (set(F5) if s is None else set()) for a, s in succs.items()}
+    def _ends_call_ret(b):
+        m = b[-1].mnemonic.split()[-1]
+        return m in ('ret', 'call')
+    # Flags are not part of the x86 calling convention: nothing reads them after a `ret`, or in a callee, that the caller computed. Blocks ending in a call or a ret
+    # therefore only keep cf/zf alive (the two a hand-written asm helper could plausibly return a result in); sf/of/pf - the expensive ones - are dropped.
+    LITE = {'cf', 'zf'} if RETCALL_LITE else set(F5)
+    live_out = {a: ((LITE if _ends_call_ret(blk[a]) else set(F5)) if s is None else set()) for a, s in succs.items()}
     live_in = {a: set() for a in blk}
     for _ in range(64):
         changed = False
@@ -1239,6 +1281,7 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
     blk = {b[0].address: b for reg in regions for b in reg}
     blkreg = {b[0].address: k for k, reg in enumerate(regions) for b in reg}
     live_out = flag_live_out(blk, blkreg, owner)
+    g.owner = owner
     protos = ''.join('uint64_t region_%d(CPU*,uint64_t);\n' % q for q in range(len(regions)))   # direct region-to-region tail calls need the prototypes in every part file
     unsup = rec.unsup; nok = 0
     native_hooks = []
@@ -1279,7 +1322,13 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
                 needs.append(live & w); live = (live - w) | r
             needs.reverse()
             out.append('L_%x:;' % b[0].address)
+            fz = None
+            if g.FUSE and g.m32 and len(b) >= 2 and not (set(live_out[b[0].address]) & set(flagrw(b[-2])[0])):
+                try: fz = g.fuse_cmp_jcc(b[-2], b[-1], tgt)
+                except Exception: fz = None
             for i, nd in zip(b, needs):
+                if fz is not None and i is b[-2]: out.append(''); nok += 1; continue
+                if fz is not None and i is b[-1]: out.append(fz); nok += 1; continue
                 try:
                     s = g.tr(i, nd, tgt); nok += 1
                     nat = NATIVE_CRT.get(i.address) if (NATIVE_CRT_ON and g.m32) else None
