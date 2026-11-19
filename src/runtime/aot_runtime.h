@@ -27,10 +27,27 @@ typedef struct {
   uint64_t gs; uint32_t mxcsr; uint16_t sregs[6]; /* es, cs, ss, ds, fs, gs */
   uint8_t cf, zf, sf, of, pf, df;
   aot_f80 fst[8]; uint16_t fcw, fsw; uint8_t ftop;
+  uint64_t hs_lo;   /* host-call mode: lowest host stack address a guest call may still nest into; ~0 = mode off (see HC_OK) */
 } CPU;
+#ifdef AOT_FT
+/* Translated regions keep the x87 stack-top in a register (ft), loaded in DECL_STATE and stored in SAVES: it used to be read-modify-written in the CPU struct by every
+   fld/fstp/fxch, so each x87 instruction waited on the previous one's store (store-to-load forwarding) and paid ~7 instructions of address arithmetic. */
+#define FTOP ft
+#define FT_DECL() unsigned ft = c->ftop
+#define FT_SYNC_OUT() (c->ftop = (uint8_t)ft)
+#define FT_SYNC_IN() (ft = c->ftop)
+#define FST(i) c->fst[(ft + (i)) & 7]
+#define FPUSH(v) do { aot_f80 _v = (v); ft = (ft + 7) & 7; c->fst[ft] = _v; } while (0)
+#define FPOP() (ft = (ft + 1) & 7)
+#else
+#define FTOP c->ftop
+#define FT_DECL() ((void)0)
+#define FT_SYNC_OUT() ((void)0)
+#define FT_SYNC_IN() ((void)0)
 #define FST(i) c->fst[(c->ftop + (i)) & 7]
 #define FPUSH(v) do { aot_f80 _v = (v); c->ftop = (c->ftop + 7) & 7; c->fst[c->ftop] = _v; } while (0)
 #define FPOP() (c->ftop = (c->ftop + 1) & 7)
+#endif
 static inline aot_f80 aot_ld80(uint64_t a) {
 #if defined(__x86_64__) && !defined(AOT_FPU_DOUBLE)
   aot_f80 v = 0; memcpy(&v, (const void *)(uintptr_t)a, 10); return v;
@@ -168,17 +185,25 @@ extern const int aot_is_pe32;   /* 1 when the recompiled image is a 32-bit PE32 
 #define DECL_STATE \
   uint64_t r0 = c->r[0], r1 = c->r[1], r2 = c->r[2], r3 = c->r[3], r4 = c->r[4], r5 = c->r[5], r6 = c->r[6], r7 = c->r[7], \
            r8 = 0, r9 = 0, r10 = 0, r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0; \
-  uint8_t cf = c->cf, zf = c->zf, sf = c->sf, of = c->of, pf = c->pf
+  uint8_t cf = c->cf, zf = c->zf, sf = c->sf, of = c->of, pf = c->pf; FT_DECL()
 #define SAVES() do { c->r[0] = r0; c->r[1] = r1; c->r[2] = r2; c->r[3] = r3; c->r[4] = r4; c->r[5] = r5; c->r[6] = r6; c->r[7] = r7; \
-  c->cf = cf; c->zf = zf; c->sf = sf; c->of = of; c->pf = pf; (void)r8; (void)r9; (void)r10; (void)r11; (void)r12; (void)r13; (void)r14; (void)r15; } while (0)
+  c->cf = cf; c->zf = zf; c->sf = sf; c->of = of; c->pf = pf; FT_SYNC_OUT(); (void)r8; (void)r9; (void)r10; (void)r11; (void)r12; (void)r13; (void)r14; (void)r15; } while (0)
 #else
 #define DECL_STATE \
   uint64_t r0 = c->r[0], r1 = c->r[1], r2 = c->r[2], r3 = c->r[3], r4 = c->r[4], r5 = c->r[5], r6 = c->r[6], r7 = c->r[7], \
            r8 = c->r[8], r9 = c->r[9], r10 = c->r[10], r11 = c->r[11], r12 = c->r[12], r13 = c->r[13], r14 = c->r[14], r15 = c->r[15]; \
-  uint8_t cf = c->cf, zf = c->zf, sf = c->sf, of = c->of, pf = c->pf
+  uint8_t cf = c->cf, zf = c->zf, sf = c->sf, of = c->of, pf = c->pf; FT_DECL()
 #define SAVES() do { c->r[0] = r0; c->r[1] = r1; c->r[2] = r2; c->r[3] = r3; c->r[4] = r4; c->r[5] = r5; c->r[6] = r6; c->r[7] = r7; \
   c->r[8] = r8; c->r[9] = r9; c->r[10] = r10; c->r[11] = r11; c->r[12] = r12; c->r[13] = r13; c->r[14] = r14; c->r[15] = r15; \
-  c->cf = cf; c->zf = zf; c->sf = sf; c->of = of; c->pf = pf; } while (0)
+  c->cf = cf; c->zf = zf; c->sf = sf; c->of = of; c->pf = pf; FT_SYNC_OUT(); } while (0)
+#endif
+#ifdef AOT_M32
+#define RELOAD() do { r0 = c->r[0]; r1 = c->r[1]; r2 = c->r[2]; r3 = c->r[3]; r4 = c->r[4]; r5 = c->r[5]; r6 = c->r[6]; r7 = c->r[7]; \
+  cf = c->cf; zf = c->zf; sf = c->sf; of = c->of; pf = c->pf; FT_SYNC_IN(); } while (0)
+#else
+#define RELOAD() do { r0 = c->r[0]; r1 = c->r[1]; r2 = c->r[2]; r3 = c->r[3]; r4 = c->r[4]; r5 = c->r[5]; r6 = c->r[6]; r7 = c->r[7]; \
+  r8 = c->r[8]; r9 = c->r[9]; r10 = c->r[10]; r11 = c->r[11]; r12 = c->r[12]; r13 = c->r[13]; r14 = c->r[14]; r15 = c->r[15]; \
+  cf = c->cf; zf = c->zf; sf = c->sf; of = c->of; pf = c->pf; FT_SYNC_IN(); } while (0)
 #endif
 #define EXIT(a) do { SAVES(); return (a); } while (0)
 /* Cross-region transfers. A region that leaves through a direct call/jump/fall-through (JMPREG) or a return/indirect target it does not contain
@@ -193,10 +218,18 @@ extern const int aot_is_pe32;   /* 1 when the recompiled image is a 32-bit PE32 
 #ifdef AOT_HAVE_TAIL
 #define AOT_MUSTTAIL __attribute__((musttail))
 uint64_t aot_tail(CPU *c, uint64_t pc);
+/* Host-call mode: a guest call is a real host call (SAVES; callee; RELOAD) and a guest `ret` a real host return, so the CPU's return-address predictor sees
+   matched call/return pairs instead of one data-dependent indirect jump per return. Correctness never depends on the pairing: whoever receives a returned
+   pc other than the one it expects just dispatches it. c->hs_lo bounds how deep host frames may nest (~0 = mode off). */
+uint64_t aot_hcall(CPU *c, uint64_t pc);
+#define HC_OK(c) ((uintptr_t)__builtin_frame_address(0) > (uintptr_t)(c)->hs_lo)
+#define HC_ACTIVE(c) ((c)->hs_lo != ~(uint64_t)0)
 #define JMPREG(k, a) do { SAVES(); AOT_MUSTTAIL return region_##k(c, (a)); } while (0)
 #define AOT_TAILDISP(p, p0) do { if ((p) == (p0)) EXIT(p); SAVES(); AOT_MUSTTAIL return aot_tail(c, (p)); } while (0)
 #else
 #define AOT_MUSTTAIL
+#define HC_OK(c) 0
+#define HC_ACTIVE(c) 0
 #define JMPREG(k, a) EXIT(a)
 #define AOT_TAILDISP(p, p0) EXIT(p)
 #endif
