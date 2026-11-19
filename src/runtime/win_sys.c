@@ -236,7 +236,21 @@ SYS(EnterCriticalSection) { if (A(0) == 0x199df84u) aot_heap_check("CS enter"); 
 SYS(LeaveCriticalSection) { if (A(0) == 0x199df84u) aot_heap_check("CS leave"); cs_leave(A(0)); return 0; }
 SYS(TryEnterCriticalSection) { uint64_t cs = A(0), tid = cur_tid(), rec = cs_recursion_offset();
   if (cs_owner_load(cs) == tid) { ST(int32_t, cs + rec, LD(int32_t, cs + rec) + 1); return 1; }
-  if (cs_owner_claim(cs, tid)) { ST(int32_t, cs + rec, 1); return 1; } return 0; }
+  if (cs_owner_claim(cs, tid)) { ST(int32_t, cs + rec, 1); return 1; }
+  /* The game builds spin-locks out of TryEnterCriticalSection + Sleep (e.g. the routine at 0xc57a70). A plain TryEnter never reached the deadlock breaker in cs_enter, so a
+   * critical section whose owner never lets go (leaked by a missed Leave, or a thread that went away holding it) kept a worker thread polling it for minutes
+   * (log: T4 retried one lock >1M times in 50 s without ever getting past it). Same rule as cs_enter's breaker: the same owner for >3 s of failed attempts from
+   * this thread means the lock is stuck; take it. */
+  static __thread uint64_t t_cs, t_own; static __thread struct timespec t_t0;
+  uint64_t own = cs_owner_load(cs); struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
+  if (t_cs != cs || t_own != own) { t_cs = cs; t_own = own; t_t0 = tn; return 0; }
+  if ((tn.tv_sec - t_t0.tv_sec) * 1000 + (tn.tv_nsec - t_t0.tv_nsec) / 1000000 > 3000) {
+    static int logged; if (logged++ < 8) fprintf(stderr, "[aot] critical section %#llx held by thread %u for >3 s while thread %u polls it with TryEnter: taking it over (stuck lock)\n", (unsigned long long)cs, (unsigned)own, (unsigned)tid);
+    uint32_t cur = (uint32_t)own; uint32_t *w = (uint32_t *)(uintptr_t)(cs + cs_owner_offset());
+    if (aot_is_pe32 ? __atomic_compare_exchange_n(w, &cur, (uint32_t)tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED) : 0) { ST(int32_t, cs + rec, 1); t_cs = 0; return 1; }
+    if (!aot_is_pe32) { uint64_t c64 = own; if (__atomic_compare_exchange_n((uint64_t *)(uintptr_t)w, &c64, tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) { ST(int32_t, cs + rec, 1); t_cs = 0; return 1; } }
+  }
+  return 0; }
 SYS(DeleteCriticalSection) { return 0; }
 
 /* ---- SRW locks / condition variables / init-once ---- */
