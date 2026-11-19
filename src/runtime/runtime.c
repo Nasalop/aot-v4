@@ -491,7 +491,7 @@ uint64_t aot_tail(CPU *c, uint64_t pc) {
   for (;;) {
     if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
       int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
-      if (!AOT_INLINE_IMPORTS || !aot_is_pe32 || idx <= RET_IDX || idx >= nthunks || !thunks[idx].fn) return pc;
+      if ((!AOT_INLINE_IMPORTS && !HC_ACTIVE(c)) || !aot_is_pe32 || idx <= RET_IDX || idx >= nthunks || !thunks[idx].fn) return pc;
       if (__builtin_expect(imp_trace < 0, 0)) imp_trace = getenv("AOT_TRACE_IMPORTS") != NULL;
       if (imp_trace) return pc;
       Thunk *t = &thunks[idx]; WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx;
@@ -499,6 +499,7 @@ uint64_t aot_tail(CPU *c, uint64_t pc) {
       pc = aot_x86_thunk(c, t->fn, t->pop, t->fp);
       imp_post(idx, t, c);
       if (aot_guest_depth == 1) aot_perf_guest -= aot_perf_ticks() - t0;   /* shim time is not translated-code time */
+      if (HC_ACTIVE(c)) return pc;   /* host-call mode: the import acted as a callee that returned; its caller (a call site, or run()) dispatches pc */
       continue;
     }
     int k = region_lookup(pc);
@@ -509,8 +510,38 @@ uint64_t aot_tail(CPU *c, uint64_t pc) {
 }
 
 
+/* Host-call mode: the non-tail call a guest `call` turns into. Runs the callee (a translated region, or an import served right here) and returns the guest pc
+   execution continues at - normally the call site's return address, which the call site then takes without any lookup. Anything unusual comes back as that pc too. */
+uint64_t aot_hcall(CPU *c, uint64_t pc) {
+  if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
+    int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
+    if (!aot_is_pe32 || idx <= RET_IDX || idx >= nthunks || !thunks[idx].fn) return pc;
+    if (__builtin_expect(imp_trace < 0, 0)) imp_trace = getenv("AOT_TRACE_IMPORTS") != NULL;
+    if (imp_trace) return pc;
+    Thunk *t = &thunks[idx]; WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx;
+    uint64_t t0 = aot_perf_ticks();
+    uint64_t np = aot_x86_thunk(c, t->fn, t->pop, t->fp);
+    imp_post(idx, t, c);
+    if (aot_guest_depth == 1) aot_perf_guest -= aot_perf_ticks() - t0;
+    return np;
+  }
+  int k = region_lookup(pc);
+  if (k < 0) return pc;
+  aot_last_pc = pc;
+  uint64_t np = aot_region_fn[k](c, pc);
+  if (np == pc) for (int m = 0; m < aot_nregions && np == pc; m++) if (m != k && pc >= aot_region_lo[m] && pc < aot_region_hi[m]) np = aot_region_fn[m](c, pc);
+  return np;
+}
+
 static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
   CPU *prev_cpu = cur_cpu; cur_cpu = c; int _outer = (aot_guest_depth++ == 0);
+  if (_outer) {   /* host-call mode: how deep guest calls may nest on this thread's host stack (off unless hostcall.txt starts with 1 / AOT_HOSTCALL=1, and only has an effect in code translated with AOT_HOSTCALL=1) */
+    static int hc_cfg = -1;
+    if (hc_cfg < 0) { hc_cfg = 0; const char *e = getenv("AOT_HOSTCALL"); if (e && *e) hc_cfg = atoi(e) != 0;
+      else { FILE *f = fopen("hostcall.txt", "r"); if (f) { int ch = fgetc(f); if (ch == '1') hc_cfg = 1; fclose(f); } }
+      fprintf(stderr, "[gfx] host-call mode: %s\n", hc_cfg ? "on" : "off"); }
+    c->hs_lo = hc_cfg ? (uint64_t)(uintptr_t)__builtin_frame_address(0) - (256u << 10) : ~(uint64_t)0;
+  }
   WdThread *w = wd_self();   /* a thread's watchdog slot never changes: resolve it once, not on every transition */
   for (;;) {
     if (pc >= THUNK_BASE && pc < THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) {
