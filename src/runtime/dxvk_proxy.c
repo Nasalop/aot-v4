@@ -22,6 +22,21 @@ volatile uint64_t aot_frames;   /* presented frames, for the FPS counter */
 volatile uint64_t aot_ns[4];    /* wall time the game thread spent blocked: [0] inside Present, [1] waiting for an event/timestamp query */
 extern void aot_present_tick(void);   /* android_main.c: frame pacing hint for the Android scheduler */
 static inline uint64_t px_now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+/* Frame cap. Present is forced to SyncInterval 0 (see px_call_inner), so a menu or loading screen the game would have vsynced ran at 1000-2000 fps: the CPU
+   core and the GPU were flat out drawing frames nobody can see, which is a large part of the heat. The cap sleeps off the rest of each frame interval; anything
+   that already runs below the cap (gameplay) is untouched. Default 60 fps; fps_cap.txt in the game folder (a number, 0 = off) or AOT_FPS_CAP overrides it. */
+static void px_frame_cap(void) {
+  static int fps = -1; static uint64_t next;
+  if (fps < 0) { fps = 60; const char *e = getenv("AOT_FPS_CAP"); if (e && *e) fps = atoi(e);
+    else { FILE *f = fopen("fps_cap.txt", "r"); if (f) { int v; if (fscanf(f, "%d", &v) == 1) fps = v; fclose(f); } }
+    if (fps < 0) fps = 0; fprintf(stderr, "[gfx] frame cap: %s\n", fps ? "on" : "off"); }
+  if (!fps) return;
+  uint64_t iv = 1000000000ull / (uint64_t)fps, now = px_now_ns();
+  if (!next || now > next + 4 * iv) next = now;           /* first frame, or we fell behind: restart the schedule instead of racing to catch up */
+  next += iv;
+  if (now < next) { struct timespec ts = { (time_t)(next / 1000000000ull), (long)(next % 1000000000ull) };
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL); }
+}
 #include <sched.h>
 #include "d3d10_proxy_gen.inc"
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
@@ -334,6 +349,7 @@ static uint64_t px_call_inner(CPU *c, const PI *pi, int slot) {
   if (dk && np == 0 && rt_push(m, o->host, slot, iv, ni, fv, ar, ap)) r = 0;
   else { if (dk) rt_drain(); r = hcall(o->host, slot, iv, ni, fv); }
   uint32_t hr = (uint32_t)r;
+  if (is_present) px_frame_cap();
   if (is_present) { __atomic_add_fetch(&aot_ns[0], px_now_ns() - pt0, __ATOMIC_RELAXED); __atomic_add_fetch(&aot_frames, 1, __ATOMIC_RELAXED); aot_present_tick(); }
   int occl = is_gd && (o->qtype == 2 || o->qtype == 6 || o->qtype == 8);   /* OCCLUSION, OCCLUSION_PREDICATE, SO_OVERFLOW_PREDICATE: culling hints, never worth stalling the frame on the GPU */
   if (occl && hr == 1) {   /* not ready: answer "visible" now. Culling is only an optimisation; waiting for it serialised CPU and GPU every frame */
