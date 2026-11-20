@@ -349,7 +349,7 @@ class Prog:
         if lm == 'ret' and not last.operands:
             o.extend(['ldr w9, [x23]', 'add w23, w23, #4']); disp_site(o, s.sh, s.mulc, 'r%x' % last.address); return o
         if lm == 'ret' and op0 is not None and op0.type == 2:
-            o.extend(['ldr w9, [x23]', 'add w23, w23, #%d' % (4 + op0.imm)]); disp_site(o, s.sh, s.mulc, 'r%x' % last.address); return o
+            o.extend(['ldr w9, [x23]'] + (['add w23, w23, #%d' % (4 + op0.imm)] if 4 + op0.imm < 4096 else mov32('w0', 4 + op0.imm) + ['add w23, w23, w0'])); disp_site(o, s.sh, s.mulc, 'r%x' % last.address); return o
         s.fallback(o, last, nd, True); return o
     def cond_from_flags(s, o, cc, lbl):
         """branch to lbl when x86 condition cc holds, reading the packed flags in x28"""
