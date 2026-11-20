@@ -29,6 +29,11 @@ typedef struct {
   aot_f80 fst[8]; uint16_t fcw, fsw; uint8_t ftop;
   uint64_t hs_lo;   /* host-call mode: lowest host stack address a guest call may still nest into; ~0 = mode off (see HC_OK) */
 } CPU;
+#if defined(__aarch64__)
+/* The ARM64 assembly backend (src/transpiler/a64gen.py) addresses these fields by constant offset. */
+_Static_assert(__builtin_offsetof(CPU, x) == 128 && __builtin_offsetof(CPU, cf) == 760 && __builtin_offsetof(CPU, zf) == 761 && __builtin_offsetof(CPU, sf) == 762 &&
+               __builtin_offsetof(CPU, of) == 763 && __builtin_offsetof(CPU, pf) == 764, "CPU layout changed: update OFF/XOFF in a64gen.py");
+#endif
 #ifdef AOT_FT
 /* Translated regions keep the x87 stack-top in a register (ft), loaded in DECL_STATE and stored in SAVES: it used to be read-modify-written in the CPU struct by every
    fld/fstp/fxch, so each x87 instruction waited on the previous one's store (store-to-load forwarding) and paid ~7 instructions of address arithmetic. */
@@ -120,6 +125,17 @@ extern uint64_t (*const aot_region_fn[])(CPU *, uint64_t);
 void aot_unimpl(uint64_t addr, const char *text) __attribute__((noreturn));
 uint64_t aot_call(CPU *c, uint64_t fn, int nargs, ...);   /* call guest function from a shim */
 uint64_t aot_rdtsc(void);
+extern uint64_t aot_tsc_scale;   /* 3e9 / counter frequency, 48.16 fixed point; set at start-up (runtime.c) */
+/* Inline guest RDTSC: the game's own profiler markers execute it constantly. One counter read and one multiply, no ISB (a pipeline flush) and no call. */
+static inline uint64_t aot_rdtsc_inl(void) {
+#if defined(__aarch64__)
+  uint64_t cnt, sc = aot_tsc_scale; __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(cnt));
+  if (__builtin_expect(!sc, 0)) return aot_rdtsc();
+  return (uint64_t)(((unsigned __int128)cnt * sc) >> 16);
+#else
+  return aot_rdtsc();
+#endif
+}
 /* Profiling clock: clock_gettime() costs about as much as the D3D proxy calls being measured, so read the
    hardware counter instead (EL0 access to cntvct/cntfrq is enabled by Linux on ARM64). */
 static inline uint64_t aot_perf_ticks(void) {
