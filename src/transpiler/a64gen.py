@@ -250,7 +250,7 @@ class Blk:
 # ======================= block terminators + program builder =======================
 def disp_site(o, sh, mulc, tag):
     """Per-site dispatch of the guest pc in w9: first probe inline (its own indirect branch), collisions/misses go to the shared slow path."""
-    o.extend(mov32('w10', mulc) + ['mul w10, w9, w10', 'lsr w10, w10, #%d' % sh, 'add x10, x29, x10, lsl #4', 'ldr w11, [x10]', 'cmp w11, w9', 'b.ne aot_a64_slow', 'ldr x12, [x10, #8]', 'br x12'])
+    o.extend(mov32('w10', mulc) + ['mul w10, w9, w10', 'lsr w10, w10, #%d' % sh, 'add x10, x29, x10, lsl #4', 'ldr w11, [x10]', 'cmp w11, w9', 'b.ne .Ls_%s' % tag, 'ldr x12, [x10, #8]', 'br x12', '.Ls_%s:' % tag, 'b aot_a64_slow'])
 
 class Prog:
     """Builds the whole-program assembly text for a list of regions (each a list of basic blocks of capstone insns)."""
@@ -270,7 +270,10 @@ class Prog:
         o.extend(['mov x0, x27'] + mov32('w1', i.address) + ['bl %s' % s.cfun(i, nd), 'mov w9, w0'])
         o.extend(['ldr w19, [x27]', 'ldr w20, [x27, #8]', 'ldr w21, [x27, #16]', 'ldr w22, [x27, #24]', 'ldr w23, [x27, #32]', 'ldr w24, [x27, #40]', 'ldr w25, [x27, #48]', 'ldr w26, [x27, #56]'])
         if w or var or ctl: o.append('bl aot_a64_fl_load')
-        if ctl: o.extend(mov32('w10', i.address + i.size) + ['cmp w9, w10', 'b.ne aot_a64_slow'])
+        if ctl: o.extend(mov32('w10', i.address + i.size) + ['cmp w9, w10', 'b.ne .Lfs%x' % i.address])
+    def fb_ctl(s, o, i, nd):
+        """control-flow instruction executed by its C function: it returns the next pc; the expected fall-through continues inline, anything else is dispatched"""
+        s.fallback(o, i, nd, True); s.goto(o, i.address + i.size); o.extend(['.Lfs%x:' % i.address, 'b aot_a64_slow'])
     def cond_branch(s, o, i, tgt, fall, fused=None):
         cc = CC[i.mnemonic[1:]]
         o.append('b.%s %s' % (cc, s.lbl(tgt)) if tgt in s.lset else 'b.%s %s_x%x' % (cc, 'aot_a64', tgt))
@@ -294,7 +297,7 @@ class Prog:
         needs.reverse()
         o.extend(['.globl %s' % s.lbl(i0.address), '.hidden %s' % s.lbl(i0.address), '%s:' % s.lbl(i0.address)])
         nat = s.natblk.get(i0.address)
-        if nat: s.fallback(o, i0, set(s.F5), True); return o
+        if nat: s.fb_ctl(o, i0, set(s.F5)); return o
         B = Blk(None, None, s.sh, '%x' % i0.address)
         last = b[-1]; lm = last.mnemonic.split()[-1]
         elided = lm == 'call' and last.operands and last.operands[0].type == 2 and s.elided(last.operands[0].imm)
@@ -316,8 +319,8 @@ class Prog:
                 B.o = []; B.ins(i, nd); o.extend(B.o); s.native += 1
             except Fn:
                 ctl = i.mnemonic.split()[-1] in s.CTL or i.mnemonic.startswith('j')
-                s.fallback(o, i, nd, ctl)
-                if ctl and i is last: return o
+                if ctl: s.fb_ctl(o, i, nd); return o
+                s.fallback(o, i, nd, False)
         if not ends:
             s.goto(o, last.address + last.size); return o
         nd = needs[-1]; nx = last.address + last.size; op0 = last.operands[0] if last.operands else None
@@ -350,7 +353,7 @@ class Prog:
             o.extend(['ldr w9, [x23]', 'add w23, w23, #4']); disp_site(o, s.sh, s.mulc, 'r%x' % last.address); return o
         if lm == 'ret' and op0 is not None and op0.type == 2:
             o.extend(['ldr w9, [x23]'] + (['add w23, w23, #%d' % (4 + op0.imm)] if 4 + op0.imm < 4096 else mov32('w0', 4 + op0.imm) + ['add w23, w23, w0'])); disp_site(o, s.sh, s.mulc, 'r%x' % last.address); return o
-        s.fallback(o, last, nd, True); return o
+        s.fb_ctl(o, last, nd); return o
     def cond_from_flags(s, o, cc, lbl):
         """branch to lbl when x86 condition cc holds, reading the packed flags in x28"""
         t = {'e': ('z', 6), 'z': ('z', 6), 'ne': ('nz', 6), 'nz': ('nz', 6), 'b': ('z', 0), 'c': ('z', 0), 'nae': ('z', 0), 'ae': ('nz', 0), 'nb': ('nz', 0), 'nc': ('nz', 0),
