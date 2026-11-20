@@ -129,6 +129,8 @@ RESERVE_CLAMP = ('{uint32_t w_=LD(uint32_t,(uint32_t)r1+4u),sz_=w_&0x3fffu,nc_=L
 # Direct (in-region) calls for these leaf imports; set AOT_FASTCALL=0 in the environment of the transpiler to disable.
 FAST_CALLS = os.environ.get('AOT_FASTCALL', '1') != '0'
 RETCALL_LITE = os.environ.get('AOT_RETCALL_LITE', '1') != '0'   # flags dead (except cf/zf) at call/ret boundaries
+ADDR_FOLD = os.environ.get('AOT_ADDR_FOLD', '0') == '1'   # measured: saves almost nothing (the add+ldr pairs are mostly esp updates), so off
+PERSITE = os.environ.get('AOT_PERSITE_DISPATCH', '0') == '1'   # per-site first-probe dispatch (return/indirect-jump sites each get their own indirect branch)
 HOSTCALL = os.environ.get('AOT_HOSTCALL', '0') == '1'   # calls/returns as real host calls (runtime switch: hostcall.txt)
 INLINE_LEAF = os.environ.get('AOT_INLINE_LEAF', '1') != '0'   # tiny leaf functions are translated in place at direct call sites (see Gen.inline_leaf)
 FAST_IMPORTS = {'EnterCriticalSection', 'LeaveCriticalSection', 'TryEnterCriticalSection', 'GetTickCount', 'QueryPerformanceCounter', 'QueryPerformanceFrequency',
@@ -341,6 +343,12 @@ class Gen:
             if m.index: p.append('r%d*%d' % (self.reg(m.index)[0], m.scale))
             if m.disp or not p: p.append('0x%xULL' % (m.disp & 0xFFFFFFFF))
             e = '(uint64_t)(uint32_t)(%s)' % '+'.join(p)
+            # [reg+disp] (one register, small displacement, no segment): add in 64 bits so the compiler folds the displacement into the load/store's addressing
+            # mode (one ldr/str instead of add+ldr). Registers hold zero-extended 32-bit values (DECL_STATE enforces it), and a sum that would wrap past 4 GB only
+            # happens for addresses that fault on real hardware too. `lea` truncates the result itself, so it stays arithmetic.
+            sd = m.disp if m.disp < 0x80000000 else m.disp - (1 << 32)
+            if ADDR_FOLD and m.base and not m.index and m.segment not in (X86_REG_GS, X86_REG_FS) and -(1 << 24) < sd < (1 << 24) and sd:
+                e = '(r%d+0x%xULL)' % (self.reg(m.base)[0], sd & MASK64)
         elif m.base == X86_REG_RIP:
             e = '0x%xULL' % ((i.address + i.size + m.disp) & MASK64)
         else:
@@ -668,7 +676,7 @@ class Gen:
         if mn in ('clc', 'stc', 'cmc'): return {'clc': 'cf=0;', 'stc': 'cf=1;', 'cmc': 'cf=!cf;'}[mn]
         if mn in ('cld', 'std'): return 'c->df=%d;' % (mn == 'std')
         if mn == 'cpuid': return 'r0=r1=r2=r3=0;'
-        if mn == 'rdtsc': return '{uint64_t t=aot_rdtsc(); r0=(uint32_t)t; r2=t>>32;}'
+        if mn == 'rdtsc': return '{uint64_t t=aot_rdtsc_inl(); r0=(uint32_t)t; r2=t>>32;}'
         if mn in ('shld', 'shrd'):
             T = 'uint%d_t' % (8 * S); B = 8 * S; cnt = '(unsigned)(%s)&%d' % (self.rdop(ops[2], 1), 63 if S == 8 else 31)
             sh = '(a<<k)|(b>>(%d-k))' % B if mn == 'shld' else '(a>>k)|(b<<(%d-k))' % B
@@ -1263,6 +1271,64 @@ def flag_live_out(blk, blkreg, owner, cross_block=None):
         return {a: set(F5) for a in blk}   # never settled: fall back to the fully conservative behaviour
     return live_out
 
+def emit_a64(rec, g, regions, owner, live_out, outdir, regions_per_file):
+    """Opt-in ARM64 assembly backend (AOT_BACKEND=a64): see a64gen.py.  The assembly is wrapped in C files (one top-level asm statement each) so the existing
+    shard compile (aot_part*.c) builds it unchanged; instructions it does not translate become one-instruction C functions (uf_<addr>) from the C backend."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import a64gen
+    ufs = {}
+    natblk = {}
+    if NATIVE_CRT_ON and g.m32:
+        for reg in regions:
+            for b in reg:
+                nat = NATIVE_CRT.get(b[0].address)
+                if nat is not None and b''.join(x.bytes for x in b).startswith(nat[0]): natblk[b[0].address] = nat
+    def cfun(i, nd):
+        name = 'uf_%x' % i.address
+        if name in ufs: return name
+        try:
+            if i.address in natblk: sx = natblk[i.address][1]
+            else:
+                sx = g.tr(i, set(F5), lambda a: '{EXIT(0x%xULL);}' % a)
+                if i.address == 0xa40284: sx += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
+                if i.address == 0x8f6b50 and i.mnemonic.split()[-1] == 'push': sx = RESERVE_CLAMP + sx
+        except Exception as e:
+            rec.unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
+            sx = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
+        ufs[name] = 'uint64_t %s(CPU*c,uint64_t pc){DECL_STATE;%s EXIT(0x%xULL);dispatch:EXIT(pc);}\n' % (name, sx, i.address + i.size)
+        return name
+    prog = a64gen.Prog(g, regions, live_out, flagrw, F5, cfun)
+    prog.elided = lambda a: native_elided(rec, a); prog.natblk = natblk; prog.special = {0xa40284: 1, 0x8f6b50: 1}
+    PRE = '#define AOT_M32 1\n#define AOT_FT 1\n'
+    files = []
+    def put(text):
+        fn = os.path.join(outdir, 'aot_part%d.c' % len(files))
+        with open(fn, 'w', encoding='utf-8') as out: out.write(text)
+        files.append(fn)
+    put(a64gen.to_c(a64gen.core_asm(prog, len(regions))))
+    for r0 in range(0, len(regions), regions_per_file):
+        lines = ['.text', '.balign 4']
+        for reg in regions[r0:r0 + regions_per_file]:
+            for bi, b in enumerate(reg):
+                bl = prog.block(b, 0, None)
+                if lines and lines[-1].startswith('b L_') and bl and bl[0:3][-1] == 'L_%x:' % b[0].address and lines[-1] == 'b L_%x' % b[0].address: lines.pop()
+                lines.extend(bl)
+        put(a64gen.to_c(lines))
+    items = sorted(ufs.items()); k = 0
+    for u0 in range(0, len(items), 4000):
+        put(PRE + HDR + ''.join(t for _, t in items[u0:u0 + 4000]))
+    tab = ['#include "aot_runtime.h"']
+    tab += ['uint64_t region_%d(CPU*,uint64_t);' % k for k in range(len(regions))]
+    tab.append('const int aot_is_pe32=1;'); tab.append('const int aot_backend_a64=1;')
+    tab.append('const uint64_t aot_image_base=0x%xULL, aot_entry=0x%xULL, aot_image_hash=0x%xULL; const int aot_nregions=%d;' % (rec.base, rec.entry, rec.image_hash, len(regions)))
+    tab.append('const uint64_t aot_region_lo[]={%s};' % ','.join('0x%xULL' % r[0][0].address for r in regions))
+    tab.append('const uint64_t aot_region_hi[]={%s};' % ','.join('0x%xULL' % (r[-1][-1].address + r[-1][-1].size) for r in regions))
+    tab.append('uint64_t (*const aot_region_fn[])(CPU*,uint64_t)={%s};' % ','.join('region_%d' % k for k in range(len(regions))))
+    with open(os.path.join(outdir, 'aot_tab.c'), 'w', encoding='utf-8') as output: output.write('\n'.join(tab) + '\n')
+    print('[a64] %d instructions translated natively, %d through C fallbacks (%d distinct), %d blocks' % (prog.native, prog.fb, len(ufs), len(prog.leaders)))
+    return len(rec.insns), len(prog.leaders), len(regions), rec.unsup
+
+
 def emit(rec, outdir, per_region=3000, regions_per_file=8):
     g = Gen(rec); blocks = rec.blocks(); os.makedirs(outdir, exist_ok=True)
     regions = []; cur = []; cnt = 0
@@ -1282,6 +1348,7 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
     blkreg = {b[0].address: k for k, reg in enumerate(regions) for b in reg}
     live_out = flag_live_out(blk, blkreg, owner)
     g.owner = owner
+    if os.environ.get('AOT_BACKEND', 'c') == 'a64' and g.m32: return emit_a64(rec, g, regions, owner, live_out, outdir, regions_per_file)
     protos = ''.join('uint64_t region_%d(CPU*,uint64_t);\n' % q for q in range(len(regions)))   # direct region-to-region tail calls need the prototypes in every part file
     unsup = rec.unsup; nok = 0
     native_hooks = []
@@ -1291,6 +1358,7 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
         out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;uint64_t pc0=pc;\n' % k,
                'if(pc==0x%xULL)goto L_%x;' % (reg[0][0].address, reg[0][0].address),   # enter at the region start without touching the switch: the common case
                'dispatch:']
+        fastd = None
         if len(reg) >= 24 and os.environ.get('AOT_TABLE_DISPATCH', '1') != '0':
             # Table dispatch: the entry addresses and label addresses live in rodata and are binary-searched. A big switch makes the compiler hoist every case
             # constant into a register for the whole region (spills everywhere, and ~20 constants rebuilt after every helper call).
@@ -1303,14 +1371,22 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
                 while keys[h]: h = (h + 1) & (sz - 1)
                 keys[h] = a_; lbl[h] = a_
             kt = 'uint64_t' if w64 else 'uint32_t'
-            out.append('{static const %s K[%d]={%s};static const void*const T[%d]={%s};%s pk=(%s)pc;unsigned h=(unsigned)((pk*%s)>>%d)&%d;'
-                       'for(;;){%s kk=K[h];if(kk==pk&&pk==pc)goto *T[h];if(!kk)break;h=(h+1)&%d;}AOT_TAILDISP(pc,pc0);}' % (
-                kt, sz, ','.join('0x%x' % k for k in keys), sz, ','.join('&&L_%x' % x for x in lbl), kt, kt,
-                ('0x%xULL' % mul) if w64 else ('0x%xu' % mul), sh, sz - 1, kt, sz - 1))
+            mulc = ('0x%xULL' % mul) if w64 else ('0x%xu' % mul)
+            if PERSITE:   # tables at function scope so every return/indirect jump can carry its own first probe and its own indirect branch
+                out.insert(1, 'static const %s K[%d]={%s};static const void*const T[%d]={%s};' % (kt, sz, ','.join('0x%x' % k for k in keys), sz, ','.join('&&L_%x' % x for x in lbl)))
+                out.append('{%s pk=(%s)pc;unsigned h=(unsigned)((pk*%s)>>%d)&%d;'
+                           'for(;;){%s kk=K[h];if(kk==pk&&pk==pc)goto *T[h];if(!kk)break;h=(h+1)&%d;}AOT_TAILDISP(pc,pc0);}' % (kt, kt, mulc, sh, sz - 1, kt, sz - 1))
+                fastd = '{%s pk_=(%s)pc;unsigned h_=(unsigned)((pk_*%s)>>%d)&%d;if(K[h_]==pk_&&pk_==pc)goto *T[h_];goto dispatch;}' % (kt, kt, mulc, sh, sz - 1)
+            else:
+                out.append('{static const %s K[%d]={%s};static const void*const T[%d]={%s};%s pk=(%s)pc;unsigned h=(unsigned)((pk*%s)>>%d)&%d;'
+                           'for(;;){%s kk=K[h];if(kk==pk&&pk==pc)goto *T[h];if(!kk)break;h=(h+1)&%d;}AOT_TAILDISP(pc,pc0);}' % (
+                    kt, sz, ','.join('0x%x' % k for k in keys), sz, ','.join('&&L_%x' % x for x in lbl), kt, kt,
+                    mulc, sh, sz - 1, kt, sz - 1))
         else:
             out.append('switch(pc){')
             out += ['case 0x%xULL:goto L_%x;' % (b[0].address, b[0].address) for b in reg]
             out.append('default:AOT_TAILDISP(pc,pc0);}')
+        nstart = len(out)
         def tgt(a, k=k):
             if owner.get(a) == k: return 'goto L_%x;' % a
             if a in owner: return 'JMPREG(%d,0x%xULL);' % (owner[a], a)   # known entry of another region: tail-call it, skip run()
@@ -1345,6 +1421,8 @@ def emit(rec, outdir, per_region=3000, regions_per_file=8):
             last = b[-1]; lm = last.mnemonic.split()[-1]
             elided = lm == 'call' and last.operands and last.operands[0].type == X86_OP_IMM and native_elided(rec, last.operands[0].imm)   # dropped call: execution simply continues after it
             if elided or lm not in ('jmp', 'ljmp', 'ret', 'retf', 'iret', 'iretd', 'iretq', 'call', 'lcall', 'ud2', 'int3', 'int1', 'hlt'): out.append(tgt(last.address + last.size))
+        if fastd:   # per-site dispatch: each return gets its own indirect branch instead of all of them sharing one (a single branch with hundreds of targets predicts badly)
+            out[nstart:] = [x.replace('goto dispatch;', fastd) for x in out[nstart:]]
         out.append('}\n')
         buf.append('\n'.join(out))
         if (k + 1) % regions_per_file == 0 or k == len(regions) - 1:
