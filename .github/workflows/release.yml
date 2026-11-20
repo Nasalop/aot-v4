@@ -20,7 +20,7 @@ jobs:
             if [ "$(echo "$C" | grep -c .)" = 1 ]; then echo "using $C as game/game.exe"; cp "$C" game/game.exe; fi
           fi
           test -f game/game.exe || { echo "game/game.exe is missing" >&2; ls -la game; exit 1; }
-          echo "key=$(sha256sum game/game.exe src/transpiler/aot_transpiler.py | sha256sum | cut -c1-16)" >> $GITHUB_OUTPUT
+          echo "key=$(sha256sum game/game.exe src/transpiler/aot_transpiler.py src/transpiler/a64gen.py | sha256sum | cut -c1-16)" >> $GITHUB_OUTPUT
       - uses: actions/cache@v4
         id: gen
         with:
@@ -37,7 +37,7 @@ jobs:
         if: steps.gen.outputs.cache-hit != 'true'
         run: |
           pip install capstone pefile
-          python src/transpiler/aot_transpiler.py game/game.exe gen | tee transpile.log
+          AOT_BACKEND=a64 python src/transpiler/aot_transpiler.py game/game.exe gen | tee transpile.log
           tar -C gen -cf - . | zstd -T0 -3 -o gen.tar.zst
           ls -la gen.tar.zst; du -sh gen
       - uses: actions/upload-artifact@v4
