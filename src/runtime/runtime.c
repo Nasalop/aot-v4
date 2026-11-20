@@ -41,11 +41,12 @@ static uint64_t image_fingerprint(const uint8_t *image, size_t size) {
 #if defined(__aarch64__)
 /* The game's own profiler markers and timers execute RDTSC constantly. clock_gettime costs a library call plus the vDSO read (~40 ns); the ARM generic counter is one register read
    (~3 ns) and is monotonic and system-wide. It is scaled to the 3 GHz the old code was already presented with, so durations the game computes keep their meaning. */
+uint64_t aot_tsc_scale;
 uint64_t aot_rdtsc(void) {
   static uint64_t scale;   /* 3e9 / counter frequency as 48.16 fixed point; 0 = not set up yet */
-  uint64_t cnt; __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(cnt));
+  uint64_t cnt; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
   uint64_t sc = __atomic_load_n(&scale, __ATOMIC_RELAXED);
-  if (!sc) { uint64_t f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); if (!f) f = 19200000; sc = (uint64_t)(((unsigned __int128)3000000000ULL << 16) / f); __atomic_store_n(&scale, sc, __ATOMIC_RELAXED); }
+  if (!sc) { uint64_t f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); if (!f) f = 19200000; sc = (uint64_t)(((unsigned __int128)3000000000ULL << 16) / f); __atomic_store_n(&scale, sc, __ATOMIC_RELAXED); __atomic_store_n(&aot_tsc_scale, sc, __ATOMIC_RELAXED); }
   return (uint64_t)(((unsigned __int128)cnt * sc) >> 16);
 }
 #else
@@ -839,7 +840,7 @@ int main(int argc, char **argv) {
   for (int i = 2; i < argc; i++) { strncat(g_cmdline, " ", sizeof g_cmdline - strlen(g_cmdline) - 1); strncat(g_cmdline, argv[i], sizeof g_cmdline - strlen(g_cmdline) - 1); }
   shims_init(argc - 1, argv + 1);
   aot_sys_init();
-  fprintf(stderr, "[aot] boot: image mapped and verified, starting the guest at entry 0x%llx\n", (unsigned long long)aot_entry);
+  { extern const int aot_backend_a64 __attribute__((weak)); fprintf(stderr, "[aot] boot: image mapped and verified, starting the guest at entry 0x%llx (backend: %s)\n", (unsigned long long)aot_entry, (&aot_backend_a64 && aot_backend_a64) ? "arm64 assembly" : "C"); }
   run(c, aot_entry, -1);
   aot_win_audio_cleanup();
   return 0;
