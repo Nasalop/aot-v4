@@ -393,8 +393,12 @@ def core_asm(prog, nregions):
          'bfi w28, w0, #6, #1', 'bfi w28, w1, #7, #1', 'bfi w28, w2, #11, #1', 'bfi w28, w3, #2, #1', 'ret',
          '.globl aot_a64_slow', '.hidden aot_a64_slow', 'aot_a64_slow:']
     o += mov32('w10', prog.mulc) + ['mul w10, w9, w10', 'lsr w10, w10, #%d' % sh,
-         '.Lsl_loop:', 'add x11, x29, x10, lsl #4', 'ldr w12, [x11]', 'cbz w12, aot_a64_exit', 'cmp w12, w9', 'b.eq .Lsl_hit', 'add w10, w10, #1', 'and w10, w10, #%d' % mask, 'b .Lsl_loop',
-         '.Lsl_hit:', 'ldr x12, [x11, #8]', 'br x12']
+         '.Lsl_loop:', 'add x11, x29, x10, lsl #4', 'ldr w12, [x11]', 'cbz w12, .Lsl_miss', 'cmp w12, w9', 'b.eq .Lsl_hit', 'add w10, w10, #1', 'and w10, w10, #%d' % mask, 'b .Lsl_loop',
+         '.Lsl_hit:', 'ldr x12, [x11, #8]', 'br x12',
+         '.Lsl_miss:', 'str x9, [sp, #-16]!', 'stp x19, x20, [x27]', 'stp x21, x22, [x27, #16]', 'stp x23, x24, [x27, #32]', 'stp x25, x26, [x27, #48]',
+         'mov x0, x27', 'mov w1, w9', 'bl aot_a64_imp_c',
+         'ldr w19, [x27]', 'ldr w20, [x27, #8]', 'ldr w21, [x27, #16]', 'ldr w22, [x27, #24]', 'ldr w23, [x27, #32]', 'ldr w24, [x27, #40]', 'ldr w25, [x27, #48]', 'ldr w26, [x27, #56]',
+         'ldr x9, [sp], #16', 'cbz w0, aot_a64_exit', 'mov w9, w0', 'b aot_a64_slow']
     for k in range(nregions): o += ['.globl region_%d' % k, '.hidden region_%d' % k, '.type region_%d, %%function' % k, 'region_%d:' % k, 'b aot_a64_enter']
     o += ['.section .data.rel.ro,"aw",@progbits', '.balign 16', '.globl aot_a64_tab', '.hidden aot_a64_tab', 'aot_a64_tab:']
     for a in place:
