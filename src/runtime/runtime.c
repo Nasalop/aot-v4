@@ -184,27 +184,48 @@ static WdThread *wd_self(void) { if (!wd_me) { int k = __atomic_fetch_add(&wd_cn
 #include <signal.h>
 #include <ucontext.h>
 #include <dlfcn.h>
-static uint64_t prof_ring[8192]; static unsigned prof_w, prof_r;
+#define PROF_NRET 6
+typedef struct { uint64_t pc; uint64_t ret[PROF_NRET]; } ProfRec;
+static ProfRec prof_ring[2048]; static uint8_t prof_slot[2048]; static unsigned prof_w, prof_r;
+/* ARM64 assembly backend: the dispatch table (guest address, host label) doubles as the map from host PC to guest basic block */
+extern const uint64_t aot_a64_tab_n __attribute__((weak, visibility("hidden"))); extern const uint8_t aot_a64_tab[] __attribute__((weak, visibility("hidden")));
+typedef struct { uintptr_t host; uint32_t guest; } GBlk; static GBlk *gblk; static int ngblk; static uintptr_t gblk_lo, gblk_hi;
+static int gblk_cmp(const void *a, const void *b) { uintptr_t x = ((const GBlk *)a)->host, y = ((const GBlk *)b)->host; return x < y ? -1 : x > y; }
+static int gblk_find(uint64_t pc) { if (!ngblk || pc < gblk_lo || pc >= gblk_hi) return -1; int lo = 0, hi = ngblk - 1; while (lo < hi) { int mid = (lo + hi + 1) / 2; if (gblk[mid].host <= pc) lo = mid; else hi = mid - 1; } return lo; }
 static void prof_h(int sig, siginfo_t *si, void *uc_) { (void)sig; (void)si; WdThread *w = wd_me; if (!w) return;
-  uint64_t pc = ((ucontext_t *)uc_)->uc_mcontext.pc; unsigned i = __atomic_fetch_add(&prof_w, 1, __ATOMIC_RELAXED); prof_ring[i & 8191] = ((uint64_t)(w - wd_t) << 56) | (pc & 0xffffffffffffffULL); }
+  mcontext_t *m = &((ucontext_t *)uc_)->uc_mcontext; unsigned i = __atomic_fetch_add(&prof_w, 1, __ATOMIC_RELAXED); ProfRec *r = &prof_ring[i & 2047]; prof_slot[i & 2047] = (uint8_t)(w - wd_t);
+  r->pc = m->pc; for (int k = 0; k < PROF_NRET; k++) r->ret[k] = 0;
+  if (gblk_find(m->pc) >= 0) return;   /* inside generated asm: x29 is the dispatch table, nothing to unwind */
+  r->ret[0] = m->regs[30]; uint64_t sp = m->sp, fp = m->regs[29];
+  for (int k = 1; k < PROF_NRET && fp > sp && fp < sp + (1u << 20) && !(fp & 7); k++) { r->ret[k] = ((uint64_t *)fp)[1]; uint64_t nf = ((uint64_t *)fp)[0]; if (nf <= fp) break; fp = nf; } }
 typedef struct { uintptr_t fn; int k; } PReg; static PReg *preg; static int npreg; static uintptr_t preg_end;
 static int preg_cmp(const void *a, const void *b) { uintptr_t x = ((const PReg *)a)->fn, y = ((const PReg *)b)->fn; return x < y ? -1 : x > y; }
-static void prof_init(void) { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = prof_h; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask); sigaction(SIGPROF, &sa, NULL);
+static void prof_init(void) { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = prof_h; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask);
+  if (&aot_a64_tab_n && aot_a64_tab_n) { size_t n = (size_t)aot_a64_tab_n; gblk = malloc(sizeof(GBlk) * n); for (size_t k = 0; k < n; k++) { uint32_t g = *(const uint32_t *)(aot_a64_tab + 16 * k); if (g) { gblk[ngblk].guest = g; gblk[ngblk].host = *(const uintptr_t *)(aot_a64_tab + 16 * k + 8); ngblk++; } }
+    qsort(gblk, (size_t)ngblk, sizeof(GBlk), gblk_cmp); if (ngblk) { gblk_lo = gblk[0].host; gblk_hi = gblk[ngblk - 1].host + 4096; } }
+  sigaction(SIGPROF, &sa, NULL);
   preg = malloc(sizeof(PReg) * (size_t)(aot_nregions + 1)); for (int m = 0; m < aot_nregions; m++) { preg[m].fn = (uintptr_t)aot_region_fn[m]; preg[m].k = m; } npreg = aot_nregions; qsort(preg, (size_t)npreg, sizeof(PReg), preg_cmp);
   preg_end = npreg ? preg[npreg - 1].fn + (1u << 20) : 0; }
 static int prof_region(uint64_t pc) { if (!npreg || pc < preg[0].fn || pc >= preg_end) return -1; int lo = 0, hi = npreg - 1; while (lo < hi) { int mid = (lo + hi + 1) / 2; if (preg[mid].fn <= pc) lo = mid; else hi = mid - 1; } return preg[lo].k; }
-/* bin = region number (>= 0) or -(address of the library function + 1 bucket by 64 bytes); counted in small per-thread tables */
-static uint64_t pk[16][256]; static uint32_t pn[16][256]; static uint32_t ptot[16];
-static void prof_bin(int slot, uint64_t pc) { int r = prof_region(pc); uint64_t key = r >= 0 ? (uint64_t)r : (1ull << 62) | (pc >> 6); ptot[slot]++;
-  unsigned h = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 56); for (int pr = 0; pr < 16; pr++, h = (h + 1) & 255) if (pn[slot][h] == 0 || pk[slot][h] == key) { pk[slot][h] = key; pn[slot][h]++; return; } }
-static void prof_drain(void) { unsigned w = __atomic_load_n(&prof_w, __ATOMIC_ACQUIRE); if (w - prof_r > 8192) prof_r = w - 8192; for (; prof_r != w; prof_r++) { uint64_t e = prof_ring[prof_r & 8191]; prof_bin((int)(e >> 56) & 15, e & 0xffffffffffffffULL); } }
+/* key kinds (bits 60-62): 0 = C-backend region number, 2 = asm code running inside guest block bucket, 3 = host code (libc, shims) called from guest block bucket, 4 = host function (pc >> 6) */
+#define PNB 1024
+static uint64_t pk[16][PNB]; static uint32_t pn[16][PNB]; static uint32_t ptot[16];
+static void prof_hit(int slot, uint64_t key) { unsigned h = (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 54); for (int pr = 0; pr < 32; pr++, h = (h + 1) & (PNB - 1)) if (pn[slot][h] == 0 || pk[slot][h] == key) { pk[slot][h] = key; pn[slot][h]++; return; } }
+static void prof_bin(int slot, const ProfRec *r) { ptot[slot]++;
+  int rg = prof_region(r->pc); if (rg >= 0) { prof_hit(slot, (uint64_t)rg); return; }
+  int g = gblk_find(r->pc);
+  if (g >= 0) { prof_hit(slot, (2ull << 60) | (gblk[g].guest >> 7)); return; }
+  prof_hit(slot, (4ull << 60) | (r->pc >> 6));
+  for (int k = 0; k < PROF_NRET; k++) { int gg = r->ret[k] ? gblk_find(r->ret[k]) : -1; if (gg >= 0) { prof_hit(slot, (3ull << 60) | (gblk[gg].guest >> 7)); break; } } }
+static void prof_drain(void) { unsigned w = __atomic_load_n(&prof_w, __ATOMIC_ACQUIRE); if (w - prof_r > 2048) prof_r = w - 2048; for (; prof_r != w; prof_r++) { ProfRec r = prof_ring[prof_r & 2047]; prof_bin(prof_slot[prof_r & 2047] & 15, &r); } }
 static void prof_sample(void) { pid_t pid = getpid(); for (int t = 0; t < wd_cnt && t < 16; t++) if (!wd_t[t].waiting && wd_t[t].tid) syscall(SYS_tgkill, pid, wd_t[t].tid, SIGPROF); }
 static void prof_report(int t) {
-  for (int top = 0; top < 8; top++) { int bi = -1; for (int h = 0; h < 256; h++) if (pn[t][h] && (bi < 0 || pn[t][h] > pn[t][bi])) bi = h; if (bi < 0 || pn[t][bi] * 100 < ptot[t]) break;   /* below 1%: stop */
-    uint64_t key = pk[t][bi]; double pct = 100.0 * pn[t][bi] / (ptot[t] ? ptot[t] : 1);
-    if (!(key >> 62)) { int k = (int)key; fprintf(stderr, "    prof T%d %5.1f%% region #%d guest %llx-%llx\n", t, pct, k, (unsigned long long)aot_region_lo[k], (unsigned long long)aot_region_hi[k]); }
-    else { uintptr_t pc = (uintptr_t)((key & ~(1ull << 62)) << 6); Dl_info di; const char *nm = "?", *fn = "?"; if (dladdr((void *)pc, &di)) { if (di.dli_sname) nm = di.dli_sname; if (di.dli_fname) { fn = strrchr(di.dli_fname, '/'); fn = fn ? fn + 1 : di.dli_fname; } }
-      fprintf(stderr, "    prof T%d %5.1f%% host %s!%s (+%#llx)\n", t, pct, fn, nm, di.dli_saddr ? (unsigned long long)(pc - (uintptr_t)di.dli_saddr) : 0ull); }
+  for (int top = 0; top < 16; top++) { int bi = -1; for (int h = 0; h < PNB; h++) if (pn[t][h] && (bi < 0 || pn[t][h] > pn[t][bi])) bi = h; if (bi < 0 || pn[t][bi] * 100 < ptot[t]) break;   /* below 1%: stop */
+    uint64_t key = pk[t][bi]; double pct = 100.0 * pn[t][bi] / (ptot[t] ? ptot[t] : 1); unsigned kind = (unsigned)(key >> 60) & 7;
+    if (kind == 0) { int k = (int)key; fprintf(stderr, "    prof T%d %5.1f%% region #%d guest %llx-%llx\n", t, pct, k, (unsigned long long)aot_region_lo[k], (unsigned long long)aot_region_hi[k]); }
+    else if (kind == 2 || kind == 3) { unsigned long long g = (key & ((1ull << 60) - 1)) << 7; fprintf(stderr, "    prof T%d %5.1f%% %s guest %llx-%llx\n", t, pct, kind == 2 ? "asm code in" : "host calls from", g, g + 127); }
+    else { uintptr_t pc = (uintptr_t)((key & ((1ull << 60) - 1)) << 6); Dl_info di; const char *nm = "?", *fn = "?"; if (dladdr((void *)pc, &di)) { if (di.dli_sname) nm = di.dli_sname; if (di.dli_fname) { fn = strrchr(di.dli_fname, '/'); fn = fn ? fn + 1 : di.dli_fname; } }
+      fprintf(stderr, "    prof T%d %5.1f%% host %s!%s (+%#llx) [%#llx]\n", t, pct, fn, nm, di.dli_saddr ? (unsigned long long)(pc - (uintptr_t)di.dli_saddr) : 0ull, (unsigned long long)(pc - (di.dli_fbase ? (uintptr_t)di.dli_fbase : 0))); }
     pn[t][bi] = 0; }
   fprintf(stderr, "    prof T%d samples=%u\n", t, ptot[t]); memset(pn[t], 0, sizeof pn[t]); ptot[t] = 0; }
 #else
@@ -477,6 +498,7 @@ static int region_lookup(uint64_t pc) {   /* pc -> region index, or -1; the one 
   if (k >= 0) __atomic_store_n(slot, ((uint64_t)p32 << 32) | (uint64_t)(unsigned)(k + 1), __ATOMIC_RELAXED);
   return k;
 }
+static __thread uint64_t pf_mark_g; volatile uint64_t aot_perf_shim, aot_perf_shim_n;
 volatile uint64_t aot_perf_guest;   /* profiling: ticks spent inside translated code, see aot_perf_ticks() */
 static __thread int aot_guest_depth;   /* > 0 when a shim re-entered the guest (callback): count the time once */
 /* PE32 import calls are served right here instead of returning to run(): a call into a thunk used to unwind to the dispatcher, which did the
@@ -523,7 +545,9 @@ uint64_t aot_a64_imp_c(CPU *c, uint64_t pc) {
   uint64_t t0 = aot_perf_ticks();
   uint64_t np = aot_x86_thunk(c, t->fn, t->pop, t->fp);
   imp_post(idx, t, c);
-  if (aot_guest_depth == 1) aot_perf_guest -= aot_perf_ticks() - t0;
+  uint64_t t1 = aot_perf_ticks();
+  if (aot_guest_depth == 1) { aot_perf_guest += t1 - pf_mark_g; pf_mark_g = t1; }   /* time-sliced: this code never returns to run(), so book the guest time up to here now (shim time stays inside, as in the C backend) */
+  aot_perf_shim += t1 - t0; aot_perf_shim_n++;
   return np;
 }
 
@@ -581,9 +605,9 @@ static uint64_t run(CPU *c, uint64_t pc, int stop_idx) {
     aot_last_pc = pc; recent_pc[recent_pc_n++ % 16] = pc;   /* shared ring: written on every region transition */
 #endif
     { w->pc = pc; w->n++; w->cpu = c; }
-    uint64_t _pt0 = aot_perf_ticks();
+    uint64_t _pt0 = aot_perf_ticks(); pf_mark_g = _pt0;
     uint64_t np = aot_region_fn[k](c, pc);
-    if (_outer) aot_perf_guest += aot_perf_ticks() - _pt0;   /* includes any proxy work nested inside the guest code */
+    if (_outer) aot_perf_guest += aot_perf_ticks() - pf_mark_g;   /* includes any proxy work nested inside the guest code */
     if (np == pc) {   /* regions overlap: the binary search may land on one that does not enter at pc, so try every region covering pc */
       for (int m = 0; m < aot_nregions && np == pc; m++) if (m != k && pc >= aot_region_lo[m] && pc < aot_region_hi[m]) np = aot_region_fn[m](c, pc);
     }
