@@ -145,8 +145,10 @@ uint64_t aot_x86_alias_out(uint64_t r) {  /* shim result -> 32-bit value */
 __thread uint32_t aot_x86_gesp;   /* guest esp while a shim runs (c->r[4] points at the host arg frame then); aot_call nests below it */
 uint64_t aot_x86_thunk(CPU *c, shim_fn fn, int pop, int fp) {
   uint32_t esp = (uint32_t)c->r[4], prev_gesp = aot_x86_gesp; aot_x86_gesp = esp; uint64_t a[12], sc[16] = { 0 };
-  for (int n = 0; n < 12; n++) a[n] = aot_x86_alias_in(LD(uint32_t, esp + 4 + 4 * n));
-  for (int n = 4; n < 12; n++) sc[1 + n] = a[n];
+  int na = pop > 0 ? (pop >> 2) + 2 : 12; if (na > 12) na = 12;   /* stdcall: the declared argument count (+2 spare) is all a shim can read; only cdecl/unknown imports need the full 12 */
+  for (int n = 0; n < na; n++) a[n] = aot_x86_alias_in(LD(uint32_t, esp + 4 + 4 * n));
+  for (int n = na; n < 12; n++) a[n] = 0;
+  for (int n = 4; n < na; n++) sc[1 + n] = a[n];
   c->r[1] = a[0]; c->r[2] = a[1]; c->r[8] = a[2]; c->r[9] = a[3]; c->r[4] = (uint64_t)(uintptr_t)sc;
   if (fp) { c->x[0].g[0] = LD(double, esp + 4); c->x[1].g[0] = LD(double, esp + 12); }
   uint64_t r = fn(c);
