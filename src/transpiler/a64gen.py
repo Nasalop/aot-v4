@@ -21,7 +21,7 @@ class Fn(Exception): pass   # not translated natively: use the C fallback
 class Blk:
     """Translates the instructions of one basic block into text lines. `fallback(i, need)` -> uf function name."""
     def __init__(s, fallback, haslabel, sh, uid):
-        s.o = []; s.fallback = fallback; s.haslabel = haslabel; s.sh = sh; s.uid = uid; s.nl = 0
+        s.o = []; s.fallback = fallback; s.haslabel = haslabel; s.sh = sh; s.uid = uid; s.nl = 0; s.ftv = False
     def e(s, *l): s.o.extend(l)
     def lab(s): s.nl += 1; return '.Lt%s_%d' % (s.uid, s.nl)
     # ---------- operands ----------
@@ -29,14 +29,19 @@ class Blk:
         if op.type == 1 and op.reg in X and op.size == 4: return X[op.reg]
         raise Fn()
     def addr(s, op, lea=False, al=4):   # -> (base_reg_str, imm_or_None) leaving the address in a register; may emit code.  Returns operand text for [..]
-        m = op.mem
-        if m.segment: raise Fn()
+        m = op.mem; seg = False
+        if m.segment:
+            if m.segment not in (X86_REG_FS, X86_REG_GS) or lea: raise Fn()
+            seg = True   # fs:/gs: = 32-bit offset + the TEB base kept in c->gs
         if m.base and m.base not in X or m.index and m.index not in X: raise Fn()
         b = XR(X[m.base]) if m.base else None; ix = X[m.index] if m.index else None; d = m.disp & 0xffffffff
         if d >= 0x80000000: d -= 1 << 32
-        if not lea and ix is None and b is not None and (-256 <= d <= 255 or (0 <= d <= 4095 * al and d % al == 0)):
+        if not seg and not lea and ix is None and b is not None and (-256 <= d <= 255 or (0 <= d <= 4095 * al and d % al == 0)):
             return '[%s, #%d]' % (b, d)
-        if b is None and ix is None: s.e(*mov32('w10', d)); return '[x10]'
+        if b is None and ix is None:
+            s.e(*mov32('w10', d))
+            if seg: s.e('ldr x11, [x27, #736]', 'add x10, x10, x11')
+            return '[x10]'
         if m.scale not in (1, 2, 4, 8): raise Fn()
         sh = {1: 0, 2: 1, 4: 2, 8: 3}[m.scale]
         if b is None: s.e('lsl w10, %s, #%d' % (W(ix), sh))
@@ -46,6 +51,7 @@ class Blk:
             if 0 < d < 4096: s.e('add w10, w10, #%d' % d)
             elif -4096 < d < 0: s.e('sub w10, w10, #%d' % -d)
             else: s.e(*mov32('w11', d), 'add w10, w10, w11')
+        if seg: s.e('ldr x11, [x27, #736]', 'add x10, x10, x11')
         return '[x10]'
     def val(s, op, t):   # source value as a w register name; t = scratch
         if op.type == 1: return W(s.reg(op))
@@ -157,9 +163,183 @@ class Blk:
             if d.type == 3 and sr.type == 1: o = s.xmm(sr); a = s.addr(d); s.e('ldr w0, [x27, #%d]' % o, 'str w0, %s' % a); return
             if d.type == 1 and sr.type == 1: s.e('ldr w0, [x27, #%d]' % s.xmm(sr), 'str w0, [x27, #%d]' % s.xmm(d)); return
         raise Fn()
+    # ---------- x87 (st(i) slots live in c->fst[(ftop+i)&7] as doubles; ftop is cached in w15 for the rest of the block once loaded) ----------
+    FST = 768; FCW = 832; FSW = 834; FTOP = 836
+    def ftl(s):
+        if not s.ftv: s.e('ldrb w15, [x27, #%d]' % s.FTOP); s.ftv = True
+    def fslot(s, k, r):   # x<r> <- address of ST(k); returns the operand text
+        s.ftl()
+        if k == 0: s.e('add x%d, x27, x15, lsl #3' % r)
+        else: s.e('add w%d, w15, #%d' % (r, k), 'and w%d, w%d, #7' % (r, r), 'add x%d, x27, x%d, lsl #3' % (r, r))
+        return '[x%d, #%d]' % (r, s.FST)
+    def fpush(s): s.ftl(); s.e('add w15, w15, #7', 'and w15, w15, #7', 'strb w15, [x27, #%d]' % s.FTOP)
+    def fpop(s): s.ftl(); s.e('add w15, w15, #1', 'and w15, w15, #7', 'strb w15, [x27, #%d]' % s.FTOP)
+    def sti(s, op):
+        if op.type != 1 or not (X86_REG_ST0 <= op.reg <= X86_REG_ST7): raise Fn()
+        return op.reg - X86_REG_ST0
+    def fmem(s, op, mn, dreg):   # memory operand converted to a double in dreg (d0/d1)
+        isint = mn.startswith('fi')
+        if op.type != 3: raise Fn()
+        if isint:
+            if op.size == 2: a = s.addr(op, al=2); s.e('ldrsh w3, %s' % a, 'scvtf %s, w3' % dreg)
+            elif op.size == 4: a = s.addr(op); s.e('ldr w3, %s' % a, 'scvtf %s, w3' % dreg)
+            elif op.size == 8: a = s.addr(op, al=8); s.e('ldr x3, %s' % a, 'scvtf %s, x3' % dreg)
+            else: raise Fn()
+        elif op.size == 4: a = s.addr(op); s.e('ldr s3, %s' % a, 'fcvt %s, s3' % dreg)
+        elif op.size == 8: a = s.addr(op, al=8); s.e('ldr %s, %s' % (dreg, a))
+        else: raise Fn()
+    def x87(s, i, nd):
+        mn = i.mnemonic; ops = i.operands; n = len(ops)
+        base = mn[:-1] if mn.endswith('p') and mn[1:-1] in ('add', 'sub', 'subr', 'mul', 'div', 'divr') else mn
+        pop = base != mn
+        for nm in ('fadd', 'fsub', 'fsubr', 'fmul', 'fdiv', 'fdivr', 'fiadd', 'fisub', 'fisubr', 'fimul', 'fidiv', 'fidivr'):
+            if base != nm: continue
+            k = (nm.replace('fi', 'f', 1) if nm.startswith('fi') else nm)[1:]
+            if n == 1 and ops[0].type == 3:
+                s.fmem(ops[0], mn, 'd1'); a0 = s.fslot(0, 0); s.e('ldr d0, %s' % a0); dst = a0; pp = False
+            else:
+                if n == 1: di, si = (s.sti(ops[0]), 0) if pop else (0, s.sti(ops[0]))
+                elif n == 2: di, si = s.sti(ops[0]), s.sti(ops[1])
+                else: raise Fn()
+                ad = s.fslot(di, 0); asr = s.fslot(si, 1); s.e('ldr d0, %s' % ad, 'ldr d1, %s' % asr); dst = ad; pp = pop
+            if k in ('subr', 'divr'): s.e('%s d0, d1, d0' % {'subr': 'fsub', 'divr': 'fdiv'}[k])
+            else: s.e('%s d0, d0, d1' % {'add': 'fadd', 'sub': 'fsub', 'mul': 'fmul', 'div': 'fdiv'}[k])
+            s.e('str d0, %s' % dst)
+            if pp: s.fpop()
+            return
+        if mn in ('fld', 'fild'):
+            if ops[0].type == 3: s.fmem(ops[0], mn, 'd0')
+            else: a = s.fslot(s.sti(ops[0]), 0); s.e('ldr d0, %s' % a)
+            s.fpush(); a = s.fslot(0, 0); s.e('str d0, %s' % a); return
+        if mn in ('fst', 'fstp'):
+            o = ops[0]; a = s.fslot(0, 0); pp = mn == 'fstp'
+            if o.type == 3:
+                if o.size == 4: s.e('ldr d0, %s' % a, 'fcvt s0, d0'); s.e('str s0, %s' % s.addr(o))
+                elif o.size == 8: s.e('ldr d0, %s' % a); s.e('str d0, %s' % s.addr(o, al=8))
+                else: raise Fn()
+            else: b = s.fslot(s.sti(o), 1); s.e('ldr d0, %s' % a, 'str d0, %s' % b)
+            if pp: s.fpop()
+            return
+        if mn == 'fxch':
+            k = s.sti(ops[-1]) if n else 1; a = s.fslot(0, 0); b = s.fslot(k, 1); s.e('ldr d0, %s' % a, 'ldr d1, %s' % b, 'str d1, %s' % a, 'str d0, %s' % b); return
+        if mn in ('fchs', 'fabs', 'fsqrt'):
+            a = s.fslot(0, 0); s.e('ldr d0, %s' % a, '%s d0, d0' % {'fchs': 'fneg', 'fabs': 'fabs', 'fsqrt': 'fsqrt'}[mn], 'str d0, %s' % a); return
+        if mn in ('fldz', 'fld1'):
+            s.fpush(); a = s.fslot(0, 0)
+            if mn == 'fldz': s.e('str xzr, %s' % a)
+            else: s.e('fmov d0, #1.0', 'str d0, %s' % a)
+            return
+        if mn in ('fcom', 'fcomp', 'fucom', 'fucomp', 'fcompp', 'fucompp'):
+            a = s.fslot(0, 0); s.e('ldr d0, %s' % a)
+            if n and ops[0].type == 3: s.fmem(ops[0], mn, 'd1')
+            else: b = s.fslot(s.sti(ops[0]) if n else 1, 1); s.e('ldr d1, %s' % b)
+            s.e('fcmp d0, d1', 'mov w2, #0', 'mov w3, #256', 'csel w2, w3, w2, mi', 'mov w3, #16384', 'csel w2, w3, w2, eq', 'mov w3, #17664', 'csel w2, w3, w2, vs',
+                'ldrh w4, [x27, #%d]' % s.FSW, 'bic w4, w4, w3' if False else 'mov w3, #17664', 'bic w4, w4, w3', 'orr w4, w4, w2', 'strh w4, [x27, #%d]' % s.FSW)
+            if mn.endswith('pp'): s.fpop(); s.fpop()
+            elif mn.endswith('p'): s.fpop()
+            return
+        if mn == 'fnstsw' and n == 1:
+            o = ops[0]; s.ftl()
+            s.e('ldrh w0, [x27, #%d]' % s.FSW, 'mov w1, #14336', 'bic w0, w0, w1', 'orr w0, w0, w15, lsl #11')
+            if o.type == 1 and o.reg == X86_REG_AX: s.e('bfi x19, x0, #0, #16'); return
+            if o.type == 3 and o.size == 2: s.e('strh w0, %s' % s.addr(o, al=2)); return
+            raise Fn()
+        if mn == 'fnstcw' and n == 1 and ops[0].type == 3 and ops[0].size == 2: s.e('ldrh w0, [x27, #%d]' % s.FCW); s.e('strh w0, %s' % s.addr(ops[0], al=2)); return
+        if mn == 'fldcw' and n == 1 and ops[0].type == 3 and ops[0].size == 2: s.e('ldrh w0, %s' % s.addr(ops[0], al=2)); s.e('strh w0, [x27, #%d]' % s.FCW); return
+        raise Fn()
+    # ---------- SSE arithmetic / logic / conversion ----------
+    def vsrc(s, op, reg, al):
+        if op.type == 1: s.e('ldr %s, [x27, #%d]' % (reg, s.xmm(op)))
+        elif op.type == 3: s.e('ldr %s, %s' % (reg, s.addr(op, al=al)))
+        else: raise Fn()
+    def sse(s, i, nd):
+        mn = i.mnemonic; ops = i.operands; n = len(ops)
+        if n == 3 and mn == 'shufps': pass
+        elif n != 2: raise Fn()
+        d, sr = ops[0], ops[1]
+        if mn in ('movd',):
+            if d.type == 1 and d.size == 16 or d.type == 1 and X86_REG_XMM0 <= d.reg <= X86_REG_XMM7:
+                od = s.xmm(d)
+                if sr.type == 1 and sr.reg in X: s.e('fmov s0, %s' % W(X[sr.reg]))
+                elif sr.type == 3: s.e('ldr s0, %s' % s.addr(sr))
+                else: raise Fn()
+                s.e('str q0, [x27, #%d]' % od); return
+            if sr.type == 1 and X86_REG_XMM0 <= sr.reg <= X86_REG_XMM7:
+                o = s.xmm(sr)
+                if d.type == 1 and d.reg in X: s.e('ldr %s, [x27, #%d]' % (W(X[d.reg]), o)); return
+                if d.type == 3: s.e('ldr w0, [x27, #%d]' % o); s.e('str w0, %s' % s.addr(d)); return
+            raise Fn()
+        if mn in ('movq', 'movsd', 'movlps', 'movhps', 'movlpd', 'movhpd', 'movhlps', 'movlhps'):
+            if d.type == 1 and X86_REG_XMM0 <= d.reg <= X86_REG_XMM7:
+                od = s.xmm(d)
+                if mn in ('movq', 'movsd') and sr.type == 3: s.e('ldr d0, %s' % s.addr(sr, al=8), 'str q0, [x27, #%d]' % od); return
+                if mn in ('movq', 'movsd') and sr.type == 1: s.e('ldr d0, [x27, #%d]' % s.xmm(sr)); s.e('str q0, [x27, #%d]' % od if mn == 'movq' else 'str d0, [x27, #%d]' % od); return
+                if mn in ('movlps', 'movlpd') and sr.type == 3: s.e('ldr d0, %s' % s.addr(sr, al=8), 'str d0, [x27, #%d]' % od); return
+                if mn in ('movhps', 'movhpd') and sr.type == 3: s.e('ldr d0, %s' % s.addr(sr, al=8), 'str d0, [x27, #%d]' % (od + 8)); return
+                if mn == 'movhlps' and sr.type == 1: s.e('ldr d0, [x27, #%d]' % (s.xmm(sr) + 8), 'str d0, [x27, #%d]' % od); return
+                if mn == 'movlhps' and sr.type == 1: s.e('ldr d0, [x27, #%d]' % s.xmm(sr), 'str d0, [x27, #%d]' % (od + 8)); return
+                raise Fn()
+            if d.type == 3 and sr.type == 1 and mn in ('movq', 'movsd', 'movlps', 'movlpd', 'movhps', 'movhpd'):
+                o = s.xmm(sr) + (8 if mn in ('movhps', 'movhpd') else 0); s.e('ldr d0, [x27, #%d]' % o); s.e('str d0, %s' % s.addr(d, al=8)); return
+            raise Fn()
+        if d.type != 1 or not (X86_REG_XMM0 <= d.reg <= X86_REG_XMM7): raise Fn()
+        od = s.xmm(d)
+        import re as _re
+        m = _re.match(r'(add|sub|mul|div|sqrt|min|max)(ss|sd|ps|pd)$', mn)
+        if m:
+            op, ty = m.groups()
+            if ty in ('ss', 'sd'):
+                r = 's' if ty == 'ss' else 'd'; al = 4 if ty == 'ss' else 8
+                s.vsrc(sr, r + '1', al)
+                if op == 'sqrt': s.e('fsqrt %s0, %s1' % (r, r))
+                else:
+                    s.e('ldr %s0, [x27, #%d]' % (r, od))
+                    if op in ('min', 'max'): s.e('fcmp %s0, %s1' % (r, r), 'fcsel %s0, %s0, %s1, %s' % (r, r, r, 'mi' if op == 'min' else 'gt'))
+                    else: s.e('%s %s0, %s0, %s1' % ({'add': 'fadd', 'sub': 'fsub', 'mul': 'fmul', 'div': 'fdiv'}[op], r, r, r))
+                s.e('str %s0, [x27, #%d]' % (r, od)); return
+            if op in ('min', 'max'): raise Fn()
+            t = '4s' if ty == 'ps' else '2d'; s.vsrc(sr, 'q1', 16)
+            if op == 'sqrt': s.e('fsqrt v0.%s, v1.%s' % (t, t))
+            else: s.e('ldr q0, [x27, #%d]' % od, '%s v0.%s, v0.%s, v1.%s' % ({'add': 'fadd', 'sub': 'fsub', 'mul': 'fmul', 'div': 'fdiv'}[op], t, t, t))
+            s.e('str q0, [x27, #%d]' % od); return
+        LG = {'xorps': 'eor', 'xorpd': 'eor', 'pxor': 'eor', 'andps': 'and', 'andpd': 'and', 'pand': 'and', 'orps': 'orr', 'orpd': 'orr', 'por': 'orr', 'andnps': 'andn', 'andnpd': 'andn', 'pandn': 'andn'}
+        if mn in LG:
+            if LG[mn] == 'eor' and sr.type == 1 and sr.reg == d.reg: s.e('stp xzr, xzr, [x27, #%d]' % od); return
+            s.vsrc(sr, 'q1', 16); s.e('ldr q0, [x27, #%d]' % od)
+            if LG[mn] == 'andn': s.e('bic v0.16b, v1.16b, v0.16b')
+            else: s.e('%s v0.16b, v0.16b, v1.16b' % LG[mn])
+            s.e('str q0, [x27, #%d]' % od); return
+        if mn == 'cvtss2sd': s.vsrc(sr, 's1', 4); s.e('fcvt d1, s1', 'str d1, [x27, #%d]' % od); return
+        if mn == 'cvtsd2ss': s.vsrc(sr, 'd1', 8); s.e('fcvt s1, d1', 'str s1, [x27, #%d]' % od); return
+        if mn in ('cvtsi2sd', 'cvtsi2ss'):
+            if sr.type == 1 and sr.reg in X: w = W(X[sr.reg])
+            elif sr.type == 3 and sr.size == 4: s.e('ldr w0, %s' % s.addr(sr)); w = 'w0'
+            else: raise Fn()
+            r = 'd' if mn.endswith('sd') else 's'; s.e('scvtf %s0, %s' % (r, w), 'str %s0, [x27, #%d]' % (r, od)); return
+        if mn == 'cvtps2pd': s.vsrc(sr, 'd1', 8); s.e('fcvtl v0.2d, v1.2s', 'str q0, [x27, #%d]' % od); return
+        if mn == 'cvtpd2ps': s.vsrc(sr, 'q1', 16); s.e('fcvtn v0.2s, v1.2d', 'str q0, [x27, #%d]' % od); return
+        if mn == 'cvtdq2ps': s.vsrc(sr, 'q1', 16); s.e('scvtf v0.4s, v1.4s', 'str q0, [x27, #%d]' % od); return
+        if mn in ('unpcklps', 'unpckhps'):
+            s.vsrc(sr, 'q1', 16); s.e('ldr q0, [x27, #%d]' % od, '%s v0.4s, v0.4s, v1.4s' % ('zip1' if mn == 'unpcklps' else 'zip2'), 'str q0, [x27, #%d]' % od); return
+        if mn == 'shufps' and n == 3 and ops[2].type == 2:
+            im = ops[2].imm & 255; s.vsrc(sr, 'q1', 16); s.e('ldr q0, [x27, #%d]' % od)
+            s.e('mov v2.s[0], v0.s[%d]' % (im & 3), 'mov v2.s[1], v0.s[%d]' % ((im >> 2) & 3), 'mov v2.s[2], v1.s[%d]' % ((im >> 4) & 3), 'mov v2.s[3], v1.s[%d]' % ((im >> 6) & 3), 'str q2, [x27, #%d]' % od); return
+        if mn in ('comiss', 'ucomiss', 'comisd', 'ucomisd'):
+            r = 's' if mn.endswith('ss') else 'd'; s.vsrc(sr, r + '1', 4 if r == 's' else 8); s.e('ldr %s0, [x27, #%d]' % (r, od), 'fcmp %s0, %s1' % (r, r))
+            need = nd & set(FB)
+            if 'cf' in need: s.e('cset w1, lo', 'cset w2, vs', 'orr w1, w1, w2', 'bfi x28, x1, #0, #1')
+            if 'zf' in need: s.e('cset w1, eq', 'cset w2, vs', 'orr w1, w1, w2', 'bfi x28, x1, #6, #1')
+            if 'pf' in need: s.e('cset w1, vs', 'bfi x28, x1, #2, #1')
+            if 'sf' in need: s.e('bfi x28, xzr, #7, #1')
+            if 'of' in need: s.e('bfi x28, xzr, #11, #1')
+            return
+        raise Fn()
+    SSE_SET = frozenset('addss subss mulss divss sqrtss minss maxss addsd subsd mulsd divsd sqrtsd minsd maxsd addps subps mulps divps sqrtps addpd subpd mulpd divpd sqrtpd xorps xorpd pxor andps andpd pand orps orpd por andnps andnpd pandn cvtss2sd cvtsd2ss cvtsi2sd cvtsi2ss cvtps2pd cvtpd2ps cvtdq2ps unpcklps unpckhps shufps comiss ucomiss comisd ucomisd movd movq movsd movlps movhps movlpd movhpd movhlps movlhps'.split())
     def ins2(s, i, nd, fuse=None):
         """sized moves, extensions, shifts, 8-bit compares and the rest of the common integer forms"""
         mn = i.mnemonic; ops = i.operands; n = len(ops); need = nd & set(FB)
+        if mn[0] == 'f' and mn not in ('fist', 'fistp') : return s.x87(i, nd)
+        if mn in s.SSE_SET: return s.sse(i, nd)
         if mn in ('movaps', 'movups', 'movdqa', 'movdqu', 'movapd', 'movupd', 'movss') and n == 2: return s.sse_move(i, ops)
         if mn == 'mov' and n == 2 and ops[0].size in (1, 2) and ops[0].size == ops[1].size:
             d, sr = ops
@@ -189,6 +369,61 @@ class Blk:
                 return
             if ops[1].type == 1 and ops[1].reg == X86_REG_CL: s.e('%s %s, %s, w20' % (op, W(dr), W(dr))); return
             raise Fn()
+        if mn in ('shl', 'sal', 'shr', 'sar') and n == 2 and ops[0].type in (1, 3) and ops[0].size == 4 and (ops[1].type == 2 or (ops[1].type == 1 and ops[1].reg == X86_REG_CL and need)):
+            var = ops[1].type == 1
+            c = 0 if var else ops[1].imm & 31
+            if not var and c == 0: return
+            d = ops[0]
+            if d.type == 1: dr = s.reg(d); a = W(dr)
+            else: ad = s.addr(d); s.e('ldr w0, %s' % ad); a = 'w0'
+            k = 'shl' if mn in ('shl', 'sal') else mn
+            sop = {'shl': 'lsl', 'shr': 'lsr', 'sar': 'asr'}[k]
+            if var:
+                done = s.lab(); s.e('and w6, w20, #31', 'cbz w6, %s' % done)   # count 0 leaves everything (flags too) unchanged
+                s.e('%s w3, %s, w6' % (sop, a))
+            else: s.e('%s w3, %s, #%d' % (sop, a, c))
+            if 'cf' in need or (k == 'shl' and 'of' in need):
+                if var:
+                    if k == 'shl': s.e('mov w7, #32', 'sub w7, w7, w6')
+                    else: s.e('sub w7, w6, #1')
+                    s.e('%s w4, %s, w7' % ('lsr' if k != 'sar' else 'asr', a), 'and w4, w4, #1')
+                else: s.e('ubfx w4, %s, #%d, #1' % (a, 32 - c if k == 'shl' else c - 1))   # CF = last bit shifted out
+                if 'cf' in need: s.e('bfi x28, x4, #0, #1')
+            if 'of' in need:
+                if k == 'shl': s.e('lsr w5, w3, #31', 'eor w5, w5, w4', 'bfi x28, x5, #11, #1')
+                elif k == 'shr': s.e('lsr w5, %s, #31' % a, 'bfi x28, x5, #11, #1')
+                else: s.e('bfi x28, xzr, #11, #1')
+            if 'zf' in need: s.e('cmp w3, #0', 'cset w5, eq', 'bfi x28, x5, #6, #1')
+            if 'sf' in need: s.e('lsr w5, w3, #31', 'bfi x28, x5, #7, #1')
+            if 'pf' in need: s.e('eor w1, w3, w3, lsr #4', 'eor w1, w1, w1, lsr #2', 'eor w1, w1, w1, lsr #1', 'mvn w1, w1', 'bfi x28, x1, #2, #1')
+            if d.type == 1: s.e('mov %s, w3' % a)
+            else: s.e('str w3, %s' % ad)
+            if var: s.e('%s:' % done)
+            return
+        # 8/16-bit add/sub/and/or/xor (flags via the operands shifted to the top of a 32-bit register)
+        if mn in ('add', 'sub', 'and', 'or', 'xor') and n == 2 and ops[0].size in (1, 2) and (ops[1].size == ops[0].size or ops[1].type == 2) and not (ops[0].type == 3 and ops[1].type == 3):
+            d, sr = ops; sz = d.size; sh = 32 - 8 * sz
+            a = s.ldv(d, 'w2')
+            if sr.type == 2: s.e(*mov32('w3', sr.imm & ((1 << (8 * sz)) - 1))); b = 'w3'
+            else: b = s.ldv(sr, 'w3')
+            if mn in ('and', 'or', 'xor'):
+                s.e('%s w7, %s, %s' % ({'and': 'and', 'or': 'orr', 'xor': 'eor'}[mn], a, b))
+                if need & {'zf', 'sf', 'pf'}: s.e('lsl w4, w7, #%d' % sh, 'tst w4, w4'); s.setf(need, 'logic', 'w7')
+                elif need: s.setf(need, 'logic', 'w7')
+            elif not need: s.e('%s w7, %s, %s' % (mn, a, b))
+            else:
+                s.e('lsl w4, %s, #%d' % (a, sh), 'lsl w5, %s, #%d' % (b, sh), '%s w6, w4, w5' % ('adds' if mn == 'add' else 'subs'), 'lsr w7, w6, #%d' % sh)
+                s.setf(need, mn, 'w7')
+            s.stv(d, 'w7'); return
+        # adc/sbb with the result flags dead: the incoming carry is just a bit of the packed flags
+        if mn in ('adc', 'sbb') and n == 2 and not need and ops[0].size in (1, 4) and (ops[1].size == ops[0].size or ops[1].type == 2) and not (ops[0].type == 3 and ops[1].type == 3):
+            d, sr = ops; sz = d.size
+            if sz == 4 and d.type == 1: a = W(s.reg(d))
+            else: a = s.ldv(d, 'w2')
+            if sr.type == 2: s.e(*mov32('w3', sr.imm & ((1 << (8 * sz)) - 1))); b = 'w3'
+            else: b = s.ldv(sr, 'w3')
+            s.e('and w1, w28, #1', '%s w7, %s, %s' % ('add' if mn == 'adc' else 'sub', a, b), '%s w7, w7, w1' % ('add' if mn == 'adc' else 'sub'))
+            s.stv(d, 'w7'); return
         if mn == 'not' and n == 1 and ops[0].type == 1 and ops[0].size == 4: r = W(s.reg(ops[0])); s.e('mvn %s, %s' % (r, r)); return
         if mn == 'neg' and n == 1 and ops[0].type == 1 and ops[0].size == 4:
             r = W(s.reg(ops[0]))
@@ -252,6 +487,8 @@ def disp_site(o, sh, mulc, tag):
     """Per-site dispatch of the guest pc in w9: first probe inline (its own indirect branch), collisions/misses go to the shared slow path."""
     o.extend(mov32('w10', mulc) + ['mul w10, w9, w10', 'lsr w10, w10, #%d' % sh, 'add x10, x29, x10, lsl #4', 'ldr w11, [x10]', 'cmp w11, w9', 'b.ne .Ls_%s' % tag, 'ldr x12, [x10, #8]', 'br x12', '.Ls_%s:' % tag, 'b aot_a64_slow'])
 
+HIST = {}
+HIST2 = {}
 class Prog:
     """Builds the whole-program assembly text for a list of regions (each a list of basic blocks of capstone insns)."""
     def __init__(s, g, regions, live_out, flagrw, F5, cfun, special=None):
@@ -263,8 +500,36 @@ class Prog:
     def goto(s, o, a):   # direct transfer to guest address a
         if a in s.lset: o.append('b %s' % s.lbl(a))
         else: o.extend(mov32('w9', a) + ['b aot_a64_exit'])
+    GPR = {}
+    for _k, _ns in enumerate((('eax', 'ax', 'al', 'ah'), ('ecx', 'cx', 'cl', 'ch'), ('edx', 'dx', 'dl', 'dh'), ('ebx', 'bx', 'bl', 'bh'), ('esp', 'sp'), ('ebp', 'bp'), ('esi', 'si', 'sil'), ('edi', 'di', 'dil'))):
+        for _n in _ns: GPR[_n] = _k
+    def gpr_sets(s, i):
+        """(read, written) sets of guest GPR numbers for x87/SSE/MMX instructions (their C function touches no other integer state); None = use the full exchange"""
+        mn = i.mnemonic.split()[-1]
+        if not (mn[0] == 'f' or mn in ('emms',) or any(i.reg_name(o.reg).startswith(('xmm', 'mm', 'st')) for o in i.operands if o.type == 1)): return None
+        try: rd, wr = i.regs_access()
+        except Exception: return None
+        R = set(); W_ = set()
+        for lst, dst in ((rd, R), (wr, W_)):
+            for r in lst:
+                nm = i.reg_name(r)
+                if nm in s.GPR: dst.add(s.GPR[nm])
+                elif nm in ('eflags', 'fpsw', 'fpcw', 'mxcsr', 'rip', 'eip', 'cs', 'ds', 'es', 'ss', 'fs', 'gs') or nm.startswith(('xmm', 'mm', 'st', 'fp')): pass
+                else: return None
+        return R | W_, W_
     def fallback(s, o, i, nd, ctl=False):
         w, r, var = s.flagrw(i); s.fb += 1
+        gs = None if ctl else s.gpr_sets(i)
+        if gs is not None:
+            sp, ld = sorted(gs[0]), sorted(gs[1])
+            o.extend(['str x%d, [x27, #%d]' % (19 + k, 8 * k) for k in sp])
+            if r or w or var: o.append('bl aot_a64_fl_store')
+            o.extend(['mov x0, x27'] + mov32('w1', i.address) + ['bl %s' % s.cfun(i, nd), 'mov w9, w0'])
+            o.extend(['ldr w%d, [x27, #%d]' % (19 + k, 8 * k) for k in ld])
+            if w or var: o.append('bl aot_a64_fl_load')
+            return
+        HIST[i.mnemonic.split()[-1]] = HIST.get(i.mnemonic.split()[-1], 0) + 1
+        if i.mnemonic in ('mov', 'shl', 'add', 'sbb', 'shr', 'and', 'movsd'): k2 = i.mnemonic + ' ' + ','.join('%d/%d%s' % (o.type, o.size, ('s' if o.type == 3 and o.mem.segment else '')) for o in i.operands) + ' fl=' + ','.join(sorted(nd)); HIST2[k2] = HIST2.get(k2, 0) + 1
         o.extend(['stp x19, x20, [x27]', 'stp x21, x22, [x27, #16]', 'stp x23, x24, [x27, #32]', 'stp x25, x26, [x27, #48]'])
         if r or w or var or ctl: o.append('bl aot_a64_fl_store')
         o.extend(['mov x0, x27'] + mov32('w1', i.address) + ['bl %s' % s.cfun(i, nd), 'mov w9, w0'])
@@ -313,14 +578,15 @@ class Prog:
             if elided and i is last: break
             if fz and i is fz[0]:
                 try: B.o = []; B.ins(i, set(), fuse=True); o.extend(B.o); s.native += 1; continue
-                except Fn: fz = None
+                except Fn: fz = None; B.ftv = False
             try:
                 if i.address in s.special: raise Fn()
                 B.o = []; B.ins(i, nd); o.extend(B.o); s.native += 1
             except Fn:
+                B.ftv = False
                 ctl = i.mnemonic.split()[-1] in s.CTL or i.mnemonic.startswith('j')
                 if ctl: s.fb_ctl(o, i, nd); return o
-                s.fallback(o, i, nd, False)
+                s.fallback(o, i, nd, False); B.ftv = False
         if not ends:
             s.goto(o, last.address + last.size); return o
         nd = needs[-1]; nx = last.address + last.size; op0 = last.operands[0] if last.operands else None
@@ -404,7 +670,7 @@ def core_asm(prog, nregions):
     for a in place:
         if a is None: o += ['.word 0, 0', '.quad 0']
         else: o += ['.word 0x%x, 0' % a, '.quad L_%x' % a]
-    o += ['.text']
+    o += ['.globl aot_a64_tab_n', '.hidden aot_a64_tab_n', 'aot_a64_tab_n:', '.quad %d' % n, '.text']
     return o
 
 def to_c(lines):
