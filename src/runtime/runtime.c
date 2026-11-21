@@ -511,6 +511,22 @@ uint64_t aot_tail(CPU *c, uint64_t pc) {
 }
 
 
+/* ARM64 assembly backend: a dispatch miss on an import thunk address is served right here and execution continues at the import's return address, instead of
+   leaving the translated code and re-entering through run() for every import call. Returns 0 when pc is not a servable import (caller then exits as before). */
+uint64_t aot_a64_imp_c(CPU *c, uint64_t pc) {
+  if (pc < THUNK_BASE || pc >= THUNK_BASE + (uint64_t)MAXTHUNK * THUNK_SZ) return 0;
+  int idx = (int)((pc - THUNK_BASE) / THUNK_SZ);
+  if (!aot_is_pe32 || idx <= RET_IDX || idx >= nthunks || !thunks[idx].fn) return 0;
+  if (__builtin_expect(imp_trace < 0, 0)) imp_trace = getenv("AOT_TRACE_IMPORTS") != NULL;
+  if (imp_trace) return 0;
+  Thunk *t = &thunks[idx]; WdThread *w = wd_self(); w->imp[w->in++ % 12] = idx;
+  uint64_t t0 = aot_perf_ticks();
+  uint64_t np = aot_x86_thunk(c, t->fn, t->pop, t->fp);
+  imp_post(idx, t, c);
+  if (aot_guest_depth == 1) aot_perf_guest -= aot_perf_ticks() - t0;
+  return np;
+}
+
 /* Host-call mode: the non-tail call a guest `call` turns into. Runs the callee (a translated region, or an import served right here) and returns the guest pc
    execution continues at - normally the call site's return address, which the call site then takes without any lookup. Anything unusual comes back as that pc too. */
 uint64_t aot_hcall(CPU *c, uint64_t pc) {
