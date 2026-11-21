@@ -41,11 +41,12 @@ static void px_frame_cap(void) {
 #include "d3d10_proxy_gen.inc"
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
 /* ---- where the game thread's time goes: time inside translated code vs time in the D3D proxy ---- */
+extern volatile uint64_t aot_perf_shim, aot_perf_shim_n;
 static uint64_t pf_proxy_ticks, pf_calls, pf_if_calls[64], pf_if_ticks[64];
 static void pf_report(void) {
-  static uint64_t last_ns, last_g, last_p, last_c, last_f; static int started;
+  static uint64_t last_ns, last_g, last_p, last_c, last_f, last_s, last_sn; static int started;
   uint64_t now = px_now_ns();
-  if (!started) { started = 1; last_ns = now; last_g = aot_perf_guest; last_p = pf_proxy_ticks; last_c = pf_calls; last_f = aot_frames; return; }
+  if (!started) { started = 1; last_ns = now; last_g = aot_perf_guest; last_p = pf_proxy_ticks; last_c = pf_calls; last_f = aot_frames; last_s = aot_perf_shim; last_sn = aot_perf_shim_n; return; }
   if (now - last_ns < 1000000000ull) return;
   double to_ms = 1000.0 / (double)aot_perf_hz(), win = (double)(now - last_ns) / 1e6;
   uint64_t dg = aot_perf_guest - last_g, dp = pf_proxy_ticks - last_p, dc = pf_calls - last_c, df = aot_frames - last_f;
@@ -54,6 +55,8 @@ static void pf_report(void) {
                   " | D3D proxy %.2f ms/frame, %llu calls (%.0f ns/call)\n",
           win, (unsigned long long)df, 1000.0 * (double)df / win, gms / n, win > 0 ? gms / win * 100.0 : 0.0,
           pms / n, (unsigned long long)dc, dc ? pms * 1e6 / (double)dc : 0.0);
+  { uint64_t ds = aot_perf_shim - last_s, dn = aot_perf_shim_n - last_sn; last_s = aot_perf_shim; last_sn = aot_perf_shim_n;
+    fprintf(stderr, "[perf]   asm-served imports (all shims incl. D3D): %.2f ms/frame, %llu calls\n", (double)ds * to_ms / n, (unsigned long long)dn); }
   int top[3] = { -1, -1, -1 };
   for (int i = 0; i < 64; i++) {
     uint64_t t = pf_if_ticks[i]; if (!t) continue;
