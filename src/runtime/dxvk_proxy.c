@@ -44,7 +44,7 @@ static void px_cpu_place(void) {
     else dprintf(2, "[cpu] game thread placement left to the scheduler (pin %s, prime mask 0x%llx of %ld cpus)\n", on ? "on" : "off", (unsigned long long)mask, n);
   }
   uint64_t now = px_now_ns();
-  if (now >= next_rep && nrep < 40) { next_rep = now + 5000000000ull; nrep++; int c = sched_getcpu(); char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
+  if (now >= next_rep && nrep < 40) { next_rep = now + 5000000000ull; nrep++; unsigned cpu_u = 0; int c = syscall(SYS_getcpu, &cpu_u, NULL, NULL) == 0 ? (int)cpu_u : -1; char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
     long cur = c >= 0 ? px_rd_long(p) : -1; dprintf(2, "[cpu] game thread on cpu%d at %ld MHz\n", c, cur > 0 ? cur / 1000 : -1); }
 }
 static void px_frame_cap(void) {
