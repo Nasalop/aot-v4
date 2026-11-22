@@ -162,7 +162,11 @@ SYS(GetCursorPos) { if (A(0)) { ST(int32_t, A(0), mx); ST(int32_t, A(0) + 4, my)
    releases never count as motion, and until the game warps (menus, front end) the absolute mapping
    stays exactly as before. */
 static int mx_last, my_last, mx_seen, mx_warp;
-SYS(SetCursorPos) { mx = (int32_t)A(0); my = (int32_t)A(1); mx_warp = 1; return 1; }
+extern void aot_state_note(const char *tag, long val); extern volatile uint32_t aot_st_warps;
+SYS(SetCursorPos) { mx = (int32_t)A(0); my = (int32_t)A(1); mx_warp = 1; __atomic_add_fetch(&aot_st_warps, 1, __ATOMIC_RELAXED); return 1; }
+/* Windows keeps a display counter: the cursor shows while it is >= 0. The game hides it for play and shows it in menus, which makes this the cheapest "in a menu" signal. */
+SYS(ShowCursor) { static int cnt; cnt += A(0) & 1 ? 1 : -1; aot_state_note("cursor_visible", cnt >= 0); return (uint32_t)cnt; }
+SYS(SetCursor) { aot_state_note("cursor_handle", A(0) != 0); return 0; }
 SYS(ScreenToClient) { return 1; }
 SYS(one) { return 1; }
 SYS(zero) { return 0; }
@@ -278,7 +282,7 @@ const ShimEnt aot_shim_table_input[] = {
   EA("SendMessageA", SendMessage), EA("SendMessageW", SendMessage), EA("PostMessageA", PostMessage), EA("PostMessageW", PostMessage), E(PostQuitMessage), EA("PostThreadMessageA", PostThreadMessage), EA("PostThreadMessageW", PostThreadMessage),
   E(GetAsyncKeyState), E(GetKeyState), E(GetKeyboardState), E(GetCursorPos), E(SetCursorPos), EA("ScreenToClient", ScreenToClient), EA("ClientToScreen", ScreenToClient),
   EA("MapVirtualKeyA", MapVirtualKey), EA("MapVirtualKeyW", MapVirtualKey), EA("RegisterWindowMessageA", RegisterWindowMessage), EA("RegisterWindowMessageW", RegisterWindowMessage), E(GetMessageTime),
-  EA("SetCapture", hwnd), EA("ReleaseCapture", one), EA("SetCursor", zero), EA("GetFocus", hwnd), EA("IsWindowVisible", one), EA("GetParent", zero), EA("InvalidateRect", one), EA("ValidateRect", one),
+  EA("SetCapture", hwnd), EA("ReleaseCapture", one), E(SetCursor), E(ShowCursor), EA("GetFocus", hwnd), EA("IsWindowVisible", one), EA("GetParent", zero), EA("InvalidateRect", one), EA("ValidateRect", one),
   E(BeginPaint), EA("EndPaint", one), EA("SetTimer", one), EA("KillTimer", one), EA("EnableWindow", one), EA("IsZoomed", zero), EA("GetDesktopWindow", hwnd), EA("GetCapture", zero), EA("TrackMouseEvent", one),
   E(XInputGetState), E(XInputSetState), E(XInputGetCapabilities), E(XInputGetBatteryInformation), E(XInputEnable), E(XInputGetKeystroke),
   { 0, 0 }
