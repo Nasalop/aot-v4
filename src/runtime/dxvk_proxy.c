@@ -25,7 +25,30 @@ static inline uint64_t px_now_ns(void) { struct timespec t; clock_gettime(CLOCK_
 /* Frame cap. Present is forced to SyncInterval 0 (see px_call_inner), so a menu or loading screen the game would have vsynced ran at 1000-2000 fps: the CPU
    core and the GPU were flat out drawing frames nobody can see, which is a large part of the heat. The cap sleeps off the rest of each frame interval; anything
    that already runs below the cap (gameplay) is untouched. Default 60 fps; fps_cap.txt in the game folder (a number, 0 = off) or AOT_FPS_CAP overrides it. */
+/* The thread that presents is the game thread (T3 in the watchdog): it is pegged near 100% all session, so which core it sits on is worth a lot. It is kept on the
+   fastest cores (every core whose cpuinfo_max_freq equals the chip's highest: the prime pair on a Snapdragon 8 Elite), free to move between them; nothing else is touched.
+   Off with AOT_MAIN_PRIME=0 or a `0` in cpu_main.txt. Every few seconds the core and its clock are logged so the log shows whether it really runs fast. */
+#include <sys/syscall.h>
+#include <unistd.h>
+static long px_rd_long(const char *p) { FILE *f = fopen(p, "r"); if (!f) return -1; long v = -1; if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); return v; }
+static void px_cpu_place(void) {
+  static int init; static uint64_t next_rep; static int nrep; long mx = 0;
+  if (!init) { init = 1; int on = 1; const char *e = getenv("AOT_MAIN_PRIME");
+    if (e && *e) on = atoi(e) != 0; else { FILE *f = fopen("cpu_main.txt", "r"); if (f) { int v; if (fscanf(f, "%d", &v) == 1) on = v != 0; fclose(f); } }
+    long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 64) n = 64; long fr[64]; uint64_t mask = 0; char p[96];
+    for (int i = 0; i < n; i++) { snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i); fr[i] = px_rd_long(p); if (fr[i] > mx) mx = fr[i]; }
+    for (int i = 0; i < n; i++) if (mx > 0 && fr[i] == mx) mask |= 1ull << i;
+    if (on && mask && mask != (n >= 64 ? ~0ull : (1ull << n) - 1)) {
+      long r = syscall(SYS_sched_setaffinity, 0, sizeof mask, &mask);
+      dprintf(2, "[cpu] game thread (the one that presents) %s prime cores mask=0x%llx (max %ld kHz)\n", r == 0 ? "pinned to" : "could NOT be pinned to", (unsigned long long)mask, mx); }
+    else dprintf(2, "[cpu] game thread placement left to the scheduler (pin %s, prime mask 0x%llx of %ld cpus)\n", on ? "on" : "off", (unsigned long long)mask, n);
+  }
+  uint64_t now = px_now_ns();
+  if (now >= next_rep && nrep < 40) { next_rep = now + 5000000000ull; nrep++; int c = sched_getcpu(); char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
+    long cur = c >= 0 ? px_rd_long(p) : -1; dprintf(2, "[cpu] game thread on cpu%d at %ld MHz\n", c, cur > 0 ? cur / 1000 : -1); }
+}
 static void px_frame_cap(void) {
+  px_cpu_place();
   static int fps = -1; static uint64_t next;
   if (fps < 0) { fps = 60; const char *e = getenv("AOT_FPS_CAP"); if (e && *e) fps = atoi(e);
     else { FILE *f = fopen("fps_cap.txt", "r"); if (f) { int v; if (fscanf(f, "%d", &v) == 1) fps = v; fclose(f); } }
