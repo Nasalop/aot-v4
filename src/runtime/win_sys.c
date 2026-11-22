@@ -234,6 +234,9 @@ void aot_heap_lock(void) { cs_enter(0x199df84u); }
 void aot_heap_unlock(void) { cs_leave(0x199df84u); }
 SYS(EnterCriticalSection) { if (A(0) == 0x199df84u) aot_heap_check("CS enter"); cs_enter(A(0)); return 0; }
 SYS(LeaveCriticalSection) { if (A(0) == 0x199df84u) aot_heap_check("CS leave"); cs_leave(A(0)); return 0; }
+/* Guest thread ids are a synthetic counter (cur_tid), not kernel tids, so "the owner is gone" is answered from the shim's own thread table: a thread object whose
+   thread has exited. A thread with no object (the process's first thread) counts as alive, so a lock a live thread really holds is never taken from it. */
+static int tid_exited(uint64_t t) { int r = 0; pthread_mutex_lock(&G); for (int i = 0; i < NOBJ; i++) if (objs[i].open && objs[i].kind == K_THREAD && objs[i].tid == (uint32_t)t && objs[i].done) { r = 1; break; } pthread_mutex_unlock(&G); return r; }
 SYS(TryEnterCriticalSection) { uint64_t cs = A(0), tid = cur_tid(), rec = cs_recursion_offset();
   if (cs_owner_load(cs) == tid) { ST(int32_t, cs + rec, LD(int32_t, cs + rec) + 1); return 1; }
   if (cs_owner_claim(cs, tid)) { ST(int32_t, cs + rec, 1); return 1; }
@@ -244,7 +247,7 @@ SYS(TryEnterCriticalSection) { uint64_t cs = A(0), tid = cur_tid(), rec = cs_rec
   static __thread uint64_t t_cs, t_own; static __thread struct timespec t_t0;
   uint64_t own = cs_owner_load(cs); struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn);
   if (t_cs != cs || t_own != own) { t_cs = cs; t_own = own; t_t0 = tn; return 0; }
-  if ((tn.tv_sec - t_t0.tv_sec) * 1000 + (tn.tv_nsec - t_t0.tv_nsec) / 1000000 > 3000) {
+  if ((tn.tv_sec - t_t0.tv_sec) * 1000 + (tn.tv_nsec - t_t0.tv_nsec) / 1000000 > 3000 && tid_exited(own)) {
     static int logged; if (logged++ < 8) fprintf(stderr, "[aot] critical section %#llx held by thread %u for >3 s while thread %u polls it with TryEnter: taking it over (stuck lock)\n", (unsigned long long)cs, (unsigned)own, (unsigned)tid);
     uint32_t cur = (uint32_t)own; uint32_t *w = (uint32_t *)(uintptr_t)(cs + cs_owner_offset());
     if (aot_is_pe32 ? __atomic_compare_exchange_n(w, &cur, (uint32_t)tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED) : 0) { ST(int32_t, cs + rec, 1); t_cs = 0; return 1; }
