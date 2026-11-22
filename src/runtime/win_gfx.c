@@ -1211,7 +1211,7 @@ const ShimEnt aot_shim_table_gfx[] = {
   { "GetClientRect", u_getclientrect }, { "GetWindowRect", u_getclientrect }, { "AdjustWindowRect", u_one }, { "AdjustWindowRectEx", u_one }, { "SetWindowPos", u_one }, { "MoveWindow", u_one },
   { "PeekMessageW", u_zero }, { "PeekMessageA", u_zero }, { "GetMessageW", u_zero }, { "GetMessageA", u_zero }, { "TranslateMessage", u_zero }, { "DispatchMessageW", u_zero }, { "DispatchMessageA", u_zero },
   { "PostQuitMessage", u_zero }, { "DefWindowProcW", u_zero }, { "DefWindowProcA", u_zero }, { "LoadCursorW", u_one }, { "LoadCursorA", u_one }, { "LoadIconW", u_one }, { "LoadIconA", u_one },
-  { "GetSystemMetrics", u_sysmetrics }, { "SetWindowTextW", u_one }, { "SetWindowTextA", u_one }, { "ShowCursor", u_zero }, { "ClipCursor", u_one }, { "SetCursorPos", u_one }, { "GetCursorPos", u_getcursor },
+  { "GetSystemMetrics", u_sysmetrics }, { "SetWindowTextW", u_one }, { "SetWindowTextA", u_one }, { "ClipCursor", u_one }, { "SetCursorPos", u_one }, { "GetCursorPos", u_getcursor },
   { "GetAsyncKeyState", u_zero }, { "GetKeyState", u_zero }, { "GetForegroundWindow", u_hwnd }, { "GetActiveWindow", u_hwnd }, { "IsWindow", u_one }, { "IsIconic", u_zero }, { "GetDC", u_one }, { "ReleaseDC", u_one },
   { "MessageBoxA", u_msgbox }, { "MessageBoxW", u_msgbox }, { "timeGetTime", u_tickcount }, { "timeBeginPeriod", u_zero }, { "timeEndPeriod", u_zero }, { "SetProcessDPIAware", u_one },
   { 0, 0 }
