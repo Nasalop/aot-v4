@@ -660,6 +660,46 @@ uint64_t aot_call(CPU *c, uint64_t fn, int nargs, ...) {
    and would otherwise inherit the guest's single-core mask from whoever called into it. A mask is only written
    when it actually differs, so this does not migrate threads that are already in the right place.
    AOT_PIN=0 turns all of it off; AOT_PIN=1 (or unset) leaves it on. */
+/* ---- [state] monitor: what the game is doing right now, for the dynamic touch controls ----
+   Lines go through dprintf (not fprintf) so the release log filter's per-format limit of 40 does not cut them off; the monitor keeps its own bound.
+   Sources: hooks call aot_state_note(tag, value) and only CHANGES are logged. The monitor thread adds mouse-look (the game recentres the cursor every frame only while
+   playing), the frame-rate bucket, and every address listed in state_watch.txt (one per line: `0xADDR size`, size 1/2/4, `#` starts a comment), read with
+   process_vm_readv so a wrong address is skipped instead of crashing. Perform one action at a time while it runs and the log shows which values move with it. */
+#include <sys/uio.h>
+volatile uint32_t aot_st_warps;
+static struct timespec st_t0; static volatile int st_lines;
+static double st_sec(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)(t.tv_sec - st_t0.tv_sec) + (double)(t.tv_nsec - st_t0.tv_nsec) / 1e9; }
+void aot_state_note(const char *tag, long val) {
+  static struct { const char *tag; long val; } last[48]; static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_lock(&m);
+  int i = 0; while (i < 48 && last[i].tag && strcmp(last[i].tag, tag)) i++;
+  if (i < 48) {
+    int fresh = !last[i].tag;
+    if ((fresh || last[i].val != val) && st_lines < 1500) { st_lines++; dprintf(2, "[state] t=%.2fs %s=%ld\n", st_sec(), tag, val); }
+    last[i].tag = tag; last[i].val = val;
+  }
+  pthread_mutex_unlock(&m);
+}
+extern volatile uint64_t aot_frames;
+static void *state_monitor(void *arg) {
+  (void)arg; struct { uint64_t a; int sz; char *tag; long last; } w[32]; int nw = 0;
+  FILE *f = fopen("state_watch.txt", "r");
+  if (f) { char ln[160]; while (nw < 32 && fgets(ln, sizeof ln, f)) { char *h = strchr(ln, '#'); if (h) *h = 0; unsigned long long a; int sz = 4;
+      if (sscanf(ln, "%llx %d", &a, &sz) >= 1 && (sz == 1 || sz == 2 || sz == 4)) { char t[40]; snprintf(t, sizeof t, "watch_%llx_%d", a, sz); w[nw].a = a; w[nw].sz = sz; w[nw].tag = strdup(t); w[nw].last = -1; nw++; } }
+    fclose(f); dprintf(2, "[state] watching %d guest address(es) from state_watch.txt\n", nw); }
+  uint32_t lw = 0; uint64_t lf = aot_frames; int tick = 0;
+  for (;;) {
+    struct timespec ts = { 0, nw ? 100000000 : 250000000 }; nanosleep(&ts, NULL); tick++;
+    for (int i = 0; i < nw; i++) { uint32_t v = 0; struct iovec lo = { &v, (size_t)w[i].sz }, re = { (void *)(uintptr_t)w[i].a, (size_t)w[i].sz };
+      if (syscall(SYS_process_vm_readv, (long)getpid(), &lo, 1UL, &re, 1UL, 0UL) == (long)w[i].sz) aot_state_note(w[i].tag, (long)v); }
+    if ((tick & 1) == 0) {   /* twice a second */
+      uint32_t nwp = aot_st_warps; aot_state_note("mouselook", (uint32_t)(nwp - lw) > 2); lw = nwp;
+      uint64_t nf = aot_frames; long fps = (long)(nf - lf) * 2; lf = nf; aot_state_note("fps_bucket", fps < 1 ? 0 : fps < 15 ? 1 : fps < 25 ? 2 : fps < 45 ? 3 : 4);
+    }
+  }
+  return NULL;
+}
+static void state_monitor_start(void) { clock_gettime(CLOCK_MONOTONIC, &st_t0); pthread_t t; if (!pthread_create(&t, NULL, state_monitor, NULL)) pthread_detach(t); }
 static int g_pin_cpu = -2;
 static uint64_t g_other[2];
 /* Which threads are guest threads, recorded where a guest thread starts. Matching on the thread name would be wrong:
@@ -802,6 +842,7 @@ int main(int argc, char **argv) {
   if (argc < 2) { fprintf(stderr, "usage: %s game.exe [args...]\n", argv[0]); return 2; }
   g_exe_path = argv[1];
   { pthread_t wt; if (!pthread_create(&wt, NULL, watchdog, NULL)) pthread_detach(wt); }
+  state_monitor_start();
   FILE *f = fopen(argv[1], "rb"); if (!f) { perror(argv[1]); return 2; }
   fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
   uint8_t *file = malloc(fsz); if (fread(file, 1, fsz, f) != (size_t)fsz) return 2; fclose(f);
