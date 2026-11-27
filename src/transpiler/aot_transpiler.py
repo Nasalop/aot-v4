@@ -1228,4 +1228,278 @@ def _block_succ(a, b, k, owner):
     transfer can leave through SAVES/JMPREG/EXIT/dispatch, which stores all five flags."""
     last = b[-1]; mn = last.mnemonic.split()[-1]; nxt = last.address + last.size
     imm = [o.imm for o in last.operands if o.type == X86_OP_IMM]
-    if mn != 'jmp' and (mn.startswith('j') or mn in ('loop', 'loope', 'loopne', 'loopz', 'loopnz', 'jecxz', 'j
+    if mn != 'jmp' and (mn.startswith('j') or mn in ('loop', 'loope', 'loopne', 'loopz', 'loopnz', 'jecxz', 'jrcxz')):
+        if not imm or owner.get(imm[0]) != k or owner.get(nxt) != k: return None
+        return [imm[0], nxt]
+    if mn == 'jmp':
+        if not imm or owner.get(imm[0]) != k: return None
+        return [imm[0]]
+    if mn in ('ret', 'retf', 'iret', 'iretd', 'call', 'syscall', 'int', 'int3', 'ud2', 'cpuid'): return None
+    return [nxt] if owner.get(nxt) == k else None   # straight-line fall-through into the next block
+
+def flag_live_out(blk, blkreg, owner, cross_block=None):
+    """For every block, the flags that still have to be materialised when it hands control on.
+
+    Liveness fixpoint over block edges: live_out[b] is the union of the successors' live_in, where live_in is
+    computed backwards through the block with the same flag rules the emitter uses. Starting from the empty set
+    and iterating upwards is the standard sound direction for a may-be-live analysis (a flag is only omitted
+    when nothing downstream can read it before writing it). Blocks whose transfer is not a plain branch inside
+    the same region -- return, indirect jump, call, cross-region jump, EXIT -- keep all five, because those go
+    through SAVES(), which stores every flag."""
+    if cross_block is None: cross_block = CROSS_BLOCK_FLAGS
+    if not cross_block: return {a: set(F5) for a in blk}
+    succs = {a: _block_succ(a, b, blkreg[a], owner) for a, b in blk.items()}
+    def _ends_call_ret(b):
+        m = b[-1].mnemonic.split()[-1]
+        return m in ('ret', 'call')
+    # Flags are not part of the x86 calling convention: nothing reads them after a `ret`, or in a callee, that the caller computed. Blocks ending in a call or a ret
+    # therefore only keep cf/zf alive (the two a hand-written asm helper could plausibly return a result in); sf/of/pf - the expensive ones - are dropped.
+    def resolve(a, b):
+        """auto mode: successors of a block that leaves its region.  list = known blocks (direct call/jmp/jcc target and fall-through); [] = flags dead (indirect jmp/call, int3, ud2, hlt);
+        None = unknown, keep everything"""
+        l = b[-1]; m = l.mnemonic.split()[-1]; imm = [o.imm & 0xffffffff for o in l.operands if o.type == X86_OP_IMM]; nxt = l.address + l.size
+        if m in ('int3', 'ud2', 'hlt'): return []
+        if not (m.startswith('j') or m in ('call', 'ret', 'retf', 'iret', 'iretd', 'int', 'sysenter', 'loop', 'loope', 'loopne', 'loopz', 'loopnz')): return [nxt] if nxt in blk else None   # plain fall-through into another region
+        if m == 'call': return imm if imm and imm[0] in blk else ([] if not imm else None)   # flags passed INTO a callee: only what its entry reads
+        if m == 'jmp': return imm if imm and imm[0] in blk else ([] if not imm else None)
+        if m.startswith('j') and imm and imm[0] in blk and nxt in blk: return [imm[0], nxt]
+        return None
+    xs = {}; rets = []; conts = set(); calls = {}   # auto-mode static facts: resolved out-of-region successors, ret blocks, call continuations -> callee (None = indirect)
+    if RETCALL_MODE == 'auto':
+        for a, b in blk.items():
+            l = b[-1]; m = l.mnemonic.split()[-1]
+            if m == 'call':
+                conts.add(l.address + l.size); imm = [o.imm & 0xffffffff for o in l.operands if o.type == X86_OP_IMM]
+                calls[l.address + l.size] = imm[0] if imm and imm[0] in blk else None
+            if m == 'ret': rets.append(a); continue
+            if succs[a] is None:
+                r = resolve(a, b)
+                if r is not None: xs[a] = r
+    succs_ = dict(succs); succs_.update(xs)
+    def intra(a):   # successors inside the same function: a call continues at the next instruction, a ret ends
+        b = blk[a]; l = b[-1]; m = l.mnemonic.split()[-1]
+        if m == 'ret': return []
+        if m == 'call': nx = l.address + l.size; return [nx] if nx in blk else []
+        return [x for x in (succs_[a] or []) if x in blk]
+    def flood(entries):
+        seen = set(); st = [e for e in entries if e in blk]
+        while st:
+            a = st.pop()
+            if a in seen: continue
+            seen.add(a); st.extend(intra(a))
+        return seen
+    def solve(LITE, auto=False, R=frozenset()):
+        live_out = {a: ((LITE if _ends_call_ret(blk[a]) else set(F5)) if s is None else set()) for a, s in succs_.items()}
+        for a in xs: live_out[a] = set()
+        for a in rets: live_out[a] = set()
+        live_in = {a: set() for a in blk}
+        for _ in range(64):
+            changed = False
+            for a, b in blk.items():
+                li = set(live_out[a])
+                for i in reversed(b):
+                    w, r, varcnt = flagrw(i)
+                    if varcnt: li = li | r; continue   # dynamic flag effects: assume the old value survives
+                    li = (li - w) | r
+                if li != live_in[a]: live_in[a] = li; changed = True
+            if not changed: break
+            for a, s in succs_.items():
+                if s is not None: live_out[a] = set().union(*[live_in[x] for x in s])
+            if auto and rets:
+                rl = set().union(*[live_in[c] for c in conts if c in live_in])   # a `ret` lands on some call's continuation: flags a function returns are exactly what those read
+                for a in R: live_out[a] = rl
+        else:
+            return {a: set(F5) for a in blk}, live_in
+        return live_out, live_in
+    if RETCALL_MODE == 'auto':
+        # Only functions whose callers read flags after the call (found iteratively: the set of such continuations can only grow) return flags; every other ret has none live.
+        R = set()
+        for _ in range(6):
+            lo, li = solve(set(), True, R)
+            cr = [c for c in conts if li.get(c)]
+            if any(calls[c] is None for c in cr): R = set(rets); lo, li = solve(set(), True, R); return lo   # a flag-reading continuation of an indirect call: callee unknown
+            new = {a for a in flood([calls[c] for c in cr]) if blk[a][-1].mnemonic.split()[-1] == 'ret'}
+            if new <= R: return lo
+            R |= new
+        return solve(set(), True, set(rets))[0]
+    return solve({'cf', 'zf'} if RETCALL_LITE else set(F5))[0]
+    return solve({'cf', 'zf'} if RETCALL_LITE else set(F5))
+
+def emit_a64(rec, g, regions, owner, live_out, outdir, regions_per_file):
+    """Opt-in ARM64 assembly backend (AOT_BACKEND=a64): see a64gen.py.  The assembly is wrapped in C files (one top-level asm statement each) so the existing
+    shard compile (aot_part*.c) builds it unchanged; instructions it does not translate become one-instruction C functions (uf_<addr>) from the C backend."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import a64gen
+    ufs = {}
+    natblk = {}
+    if NATIVE_CRT_ON and g.m32:
+        for reg in regions:
+            for b in reg:
+                nat = NATIVE_CRT.get(b[0].address)
+                if nat is not None and b''.join(x.bytes for x in b).startswith(nat[0]): natblk[b[0].address] = nat
+    def cfun(i, nd):
+        name = 'uf_%x' % i.address
+        if name in ufs: return name
+        try:
+            if i.address in natblk: sx = natblk[i.address][1]
+            else:
+                sx = g.tr(i, set(F5), lambda a: '{EXIT(0x%xULL);}' % a)
+                if i.address == 0xa40284: sx += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
+                if i.address == 0x8f6b50 and i.mnemonic.split()[-1] == 'push': sx = RESERVE_CLAMP + sx
+        except Exception as e:
+            rec.unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
+            sx = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
+        ufs[name] = 'uint64_t %s(CPU*c,uint64_t pc){DECL_STATE;%s EXIT(0x%xULL);dispatch:EXIT(pc);}\n' % (name, sx, i.address + i.size)
+        return name
+    prog = a64gen.Prog(g, regions, live_out, flagrw, F5, cfun)
+    prog.elided = lambda a: native_elided(rec, a); prog.natblk = natblk; prog.special = {0xa40284: 1, 0x8f6b50: 1}
+    PRE = '#define AOT_M32 1\n#define AOT_FT 1\n'
+    files = []
+    def put(text):
+        fn = os.path.join(outdir, 'aot_part%d.c' % len(files))
+        with open(fn, 'w', encoding='utf-8') as out: out.write(text)
+        files.append(fn)
+    put(a64gen.to_c(a64gen.core_asm(prog, len(regions))))
+    for r0 in range(0, len(regions), regions_per_file):
+        lines = ['.text', '.balign 4']
+        for reg in regions[r0:r0 + regions_per_file]:
+            for bi, b in enumerate(reg):
+                bl = prog.block(b, 0, None)
+                if lines and lines[-1].startswith('b L_') and bl and bl[0:3][-1] == 'L_%x:' % b[0].address and lines[-1] == 'b L_%x' % b[0].address: lines.pop()
+                lines.extend(bl)
+        put(a64gen.to_c(a64gen.peep(lines)))
+    items = sorted(ufs.items()); k = 0
+    for u0 in range(0, len(items), 4000):
+        put(PRE + HDR + ''.join(t for _, t in items[u0:u0 + 4000]))
+    tab = ['#include "aot_runtime.h"']
+    tab += ['uint64_t region_%d(CPU*,uint64_t);' % k for k in range(len(regions))]
+    tab.append('const int aot_is_pe32=1;'); tab.append('const int aot_backend_a64=1;')
+    tab.append('const uint64_t aot_image_base=0x%xULL, aot_entry=0x%xULL, aot_image_hash=0x%xULL; const int aot_nregions=%d;' % (rec.base, rec.entry, rec.image_hash, len(regions)))
+    tab.append('const uint64_t aot_region_lo[]={%s};' % ','.join('0x%xULL' % r[0][0].address for r in regions))
+    tab.append('const uint64_t aot_region_hi[]={%s};' % ','.join('0x%xULL' % (r[-1][-1].address + r[-1][-1].size) for r in regions))
+    tab.append('uint64_t (*const aot_region_fn[])(CPU*,uint64_t)={%s};' % ','.join('region_%d' % k for k in range(len(regions))))
+    with open(os.path.join(outdir, 'aot_tab.c'), 'w', encoding='utf-8') as output: output.write('\n'.join(tab) + '\n')
+    print('[a64] %d instructions translated natively, %d through C fallbacks (%d distinct), %d blocks' % (prog.native, prog.fb, len(ufs), len(prog.leaders)))
+    return len(rec.insns), len(prog.leaders), len(regions), rec.unsup
+
+
+def emit(rec, outdir, per_region=3000, regions_per_file=8):
+    g = Gen(rec); blocks = rec.blocks(); os.makedirs(outdir, exist_ok=True)
+    regions = []; cur = []; cnt = 0
+    for b in blocks:
+        cur.append(b); cnt += len(b)
+        if cnt >= per_region: regions.append(cur); cur = []; cnt = 0
+    if cur: regions.append(cur)
+    owner = {b[0].address: k for k, r in enumerate(regions) for b in r}
+    # ---- which flags really have to be materialised where a block hands control on ----
+    # Emission below walks each block backwards assuming all five flags are live at its end, so the first
+    # flag-writing instruction of every block computes all five even when the branch that follows reads one.
+    # The live-out is computed here instead, as a liveness fixpoint over block edges. Any edge that is not a
+    # plain branch to another block of the same region -- return, indirect jump, call, cross-region jump, EXIT,
+    # or an address that is not a block entry -- passes through SAVES(), which stores all five flags, so those
+    # blocks keep the fully conservative set and behave exactly as before.
+    blk = {b[0].address: b for reg in regions for b in reg}
+    blkreg = {b[0].address: k for k, reg in enumerate(regions) for b in reg}
+    live_out = flag_live_out(blk, blkreg, owner)
+    g.owner = owner
+    if os.environ.get('AOT_BACKEND', 'c') == 'a64' and g.m32: return emit_a64(rec, g, regions, owner, live_out, outdir, regions_per_file)
+    protos = ''.join('uint64_t region_%d(CPU*,uint64_t);\n' % q for q in range(len(regions)))   # direct region-to-region tail calls need the prototypes in every part file
+    unsup = rec.unsup; nok = 0
+    native_hooks = []
+    PRE = '#define AOT_M32 1\n#define AOT_FT 1\n' if g.m32 else ''
+    files = []; buf = [PRE + HDR + protos]   # PE32: regions load/store only eax..edi (see DECL_STATE in aot_runtime.h)
+    for k, reg in enumerate(regions):
+        out = ['uint64_t region_%d(CPU*c,uint64_t pc){DECL_STATE;uint64_t pc0=pc;\n' % k,
+               'if(pc==0x%xULL)goto L_%x;' % (reg[0][0].address, reg[0][0].address),   # enter at the region start without touching the switch: the common case
+               'dispatch:']
+        fastd = None
+        if len(reg) >= 24 and os.environ.get('AOT_TABLE_DISPATCH', '1') != '0':
+            # Table dispatch: the entry addresses and label addresses live in rodata and are binary-searched. A big switch makes the compiler hoist every case
+            # constant into a register for the whole region (spills everywhere, and ~20 constants rebuilt after every helper call).
+            ents = sorted(set(b[0].address for b in reg)); w64 = not g.m32
+            bits = max(4, (2 * len(ents) - 1).bit_length()); sz = 1 << bits; mask = (1 << (64 if w64 else 32)) - 1
+            mul = 0x9E3779B97F4A7C15 if w64 else 0x9E3779B1; sh = (64 if w64 else 32) - bits
+            keys = [0] * sz; lbl = [ents[0]] * sz
+            for a_ in ents:   # open addressing, linear probing: the generated lookup repeats exactly this probe order
+                h = ((a_ * mul) & mask) >> sh
+                while keys[h]: h = (h + 1) & (sz - 1)
+                keys[h] = a_; lbl[h] = a_
+            kt = 'uint64_t' if w64 else 'uint32_t'
+            mulc = ('0x%xULL' % mul) if w64 else ('0x%xu' % mul)
+            if PERSITE:   # tables at function scope so every return/indirect jump can carry its own first probe and its own indirect branch
+                out.insert(1, 'static const %s K[%d]={%s};static const void*const T[%d]={%s};' % (kt, sz, ','.join('0x%x' % k for k in keys), sz, ','.join('&&L_%x' % x for x in lbl)))
+                out.append('{%s pk=(%s)pc;unsigned h=(unsigned)((pk*%s)>>%d)&%d;'
+                           'for(;;){%s kk=K[h];if(kk==pk&&pk==pc)goto *T[h];if(!kk)break;h=(h+1)&%d;}AOT_TAILDISP(pc,pc0);}' % (kt, kt, mulc, sh, sz - 1, kt, sz - 1))
+                fastd = '{%s pk_=(%s)pc;unsigned h_=(unsigned)((pk_*%s)>>%d)&%d;if(K[h_]==pk_&&pk_==pc)goto *T[h_];goto dispatch;}' % (kt, kt, mulc, sh, sz - 1)
+            else:
+                out.append('{static const %s K[%d]={%s};static const void*const T[%d]={%s};%s pk=(%s)pc;unsigned h=(unsigned)((pk*%s)>>%d)&%d;'
+                           'for(;;){%s kk=K[h];if(kk==pk&&pk==pc)goto *T[h];if(!kk)break;h=(h+1)&%d;}AOT_TAILDISP(pc,pc0);}' % (
+                    kt, sz, ','.join('0x%x' % k for k in keys), sz, ','.join('&&L_%x' % x for x in lbl), kt, kt,
+                    mulc, sh, sz - 1, kt, sz - 1))
+        else:
+            out.append('switch(pc){')
+            out += ['case 0x%xULL:goto L_%x;' % (b[0].address, b[0].address) for b in reg]
+            out.append('default:AOT_TAILDISP(pc,pc0);}')
+        nstart = len(out)
+        def tgt(a, k=k):
+            if owner.get(a) == k: return 'goto L_%x;' % a
+            if a in owner: return 'JMPREG(%d,0x%xULL);' % (owner[a], a)   # known entry of another region: tail-call it, skip run()
+            return 'EXIT(0x%xULL);' % a
+        for b in reg:
+            live = set(live_out[b[0].address]); needs = []   # computed above: only the flags a successor can still read
+            for i in reversed(b):
+                w, r, varcnt = flagrw(i)   # one definition of flag read/write, shared with the liveness fixpoint
+                if varcnt: needs.append(set(F5)); live |= r; continue
+                needs.append(live & w); live = (live - w) | r
+            needs.reverse()
+            out.append('L_%x:;' % b[0].address)
+            fz = None
+            if g.FUSE and g.m32 and len(b) >= 2 and not (set(live_out[b[0].address]) & set(flagrw(b[-2])[0])):
+                try: fz = g.fuse_cmp_jcc(b[-2], b[-1], tgt)
+                except Exception: fz = None
+            for i, nd in zip(b, needs):
+                if fz is not None and i is b[-2]: out.append(''); nok += 1; continue
+                if fz is not None and i is b[-1]: out.append(fz); nok += 1; continue
+                try:
+                    s = g.tr(i, nd, tgt); nok += 1
+                    nat = NATIVE_CRT.get(i.address) if (NATIVE_CRT_ON and g.m32) else None
+                    if nat is not None and i is b[0] and b''.join(x.bytes for x in b).startswith(nat[0]): s = nat[1]; native_hooks.append(i.address)
+                    # AC1 ray/grid walk: `movzx eax,word [edi+2]` is a node id used as an index into a stack visited-bitmap of ([esp+0x64]>>2)*4+4 bytes. Node ids read from
+                    # an unbuilt/garbage graph reach 65535 and the following `xor [esi+eax],dl` then writes past the stack into the heap. Keep the id inside the bitmap.
+                    if i.address == 0xa40284: s += 'if((uint32_t)r0>LD(uint32_t,(uint32_t)r4+0x64)+4u)r0=0;'
+                    if i.address == 0x8f6b50 and i.mnemonic.split()[-1] == 'push': s = RESERVE_CLAMP + s
+                except Exception as e:   # Unsup, or a translator bug on one instruction: record it, keep going
+                    unsup[i.mnemonic.split()[-1] + ('' if isinstance(e, Unsup) else ' [translator bug: %s]' % type(e).__name__)] += 1
+                    s = 'aot_unimpl(0x%xULL,"%s %s");' % (i.address, i.mnemonic, i.op_str.replace('"', "'"))
+                out.append(s)
+            last = b[-1]; lm = last.mnemonic.split()[-1]
+            elided = lm == 'call' and last.operands and last.operands[0].type == X86_OP_IMM and native_elided(rec, last.operands[0].imm)   # dropped call: execution simply continues after it
+            if elided or lm not in ('jmp', 'ljmp', 'ret', 'retf', 'iret', 'iretd', 'iretq', 'call', 'lcall', 'ud2', 'int3', 'int1', 'hlt'): out.append(tgt(last.address + last.size))
+        if fastd:   # per-site dispatch: each return gets its own indirect branch instead of all of them sharing one (a single branch with hundreds of targets predicts badly)
+            out[nstart:] = [x.replace('goto dispatch;', fastd) for x in out[nstart:]]
+        out.append('}\n')
+        buf.append('\n'.join(out))
+        if (k + 1) % regions_per_file == 0 or k == len(regions) - 1:
+            fn = os.path.join(outdir, 'aot_part%d.c' % len(files))
+            with open(fn, 'w', encoding='utf-8') as output:
+                output.write('\n'.join(buf))
+            files.append(fn)
+            buf = [PRE + HDR + protos]
+    tab = ['#include "aot_runtime.h"']
+    tab += ['uint64_t region_%d(CPU*,uint64_t);' % k for k in range(len(regions))]
+    tab.append('const int aot_is_pe32=%d;' % (1 if rec.m32 else 0))
+    tab.append('const uint64_t aot_image_base=0x%xULL, aot_entry=0x%xULL, aot_image_hash=0x%xULL; const int aot_nregions=%d;' % (rec.base, rec.entry, rec.image_hash, len(regions)))
+    tab.append('const uint64_t aot_region_lo[]={%s};' % ','.join('0x%xULL' % r[0][0].address for r in regions))
+    tab.append('const uint64_t aot_region_hi[]={%s};' % ','.join('0x%xULL' % (r[-1][-1].address + r[-1][-1].size) for r in regions))
+    tab.append('uint64_t (*const aot_region_fn[])(CPU*,uint64_t)={%s};' % ','.join('region_%d' % k for k in range(len(regions))))
+    with open(os.path.join(outdir, 'aot_tab.c'), 'w', encoding='utf-8') as output:
+        output.write('\n'.join(tab) + '\n')
+    if native_hooks: print('[native-crt] replaced %d C-runtime functions: %s' % (len(native_hooks), ' '.join('0x%x' % a for a in native_hooks)))
+    return len(rec.insns), len(blocks), len(regions), unsup
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3: sys.exit(__doc__)
+    rec = Rec(sys.argv[1]).discover()
+    ni, nb, nr, un = emit(rec, sys.argv[2])
+    print('[+] %d instructions, %d blocks, %d regions' % (ni, nb, nr))
+    if un: print('[!] unsupported instructions (become runtime traps): ' + ', '.join('%s x%d' % kv for kv in un.most_common()))
