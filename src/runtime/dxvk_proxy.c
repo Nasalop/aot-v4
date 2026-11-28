@@ -67,6 +67,61 @@ static void px_frame_cap(void) {
 #define NPI ((int)(sizeof PIS / sizeof PIS[0]))
 /* ---- where the game thread's time goes: time inside translated code vs time in the D3D proxy ---- */
 extern volatile uint64_t aot_perf_shim, aot_perf_shim_n;
+/* ---- per-second game-thread profile: where wall time goes (running / waiting for a CPU / blocked) and, when the kernel allows it, hardware counters.
+   Hardware counters need perf_event_open for our own thread; stock Android often refuses it, in which case one line says so and the scheduler numbers still print. */
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <errno.h>
+#ifndef RUSAGE_THREAD
+#define RUSAGE_THREAD 1
+#endif
+static int hw_fd[6] = { -1, -1, -1, -1, -1, -1 }, hw_idx[6], hw_nopen, hw_tid, hw_init_done;
+static const char *const hw_nm[6] = { "cycles", "instr", "br-miss", "L1i-miss", "iTLB-miss", "L1d-miss" };
+static int hw_open_ev(uint32_t type, uint64_t cfg, int leader) {
+  struct perf_event_attr a; memset(&a, 0, sizeof a); a.type = type; a.size = sizeof a; a.config = cfg; a.exclude_kernel = 1; a.exclude_hv = 1; a.disabled = leader < 0;
+  a.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+  return (int)syscall(SYS_perf_event_open, &a, 0, -1, leader, 0);
+}
+static void hw_init(void) {
+  hw_init_done = 1; hw_tid = (int)syscall(SYS_gettid);
+  const uint64_t C = PERF_COUNT_HW_CACHE_OP_READ << 8 | (uint64_t)PERF_COUNT_HW_CACHE_RESULT_MISS << 16;
+  static const struct { uint32_t t; uint64_t c; } ev[6] = { { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES }, { PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS }, { PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES },
+    { PERF_TYPE_HW_CACHE, 0 }, { PERF_TYPE_HW_CACHE, 0 }, { PERF_TYPE_HW_CACHE, 0 } };
+  const uint64_t cc[6] = { 0, 0, 0, PERF_COUNT_HW_CACHE_L1I | C, PERF_COUNT_HW_CACHE_ITLB | C, PERF_COUNT_HW_CACHE_L1D | C };
+  for (int k = 0; k < 6; k++) {
+    int fd = hw_open_ev(ev[k].t, k >= 3 ? cc[k] : ev[k].c, k ? hw_fd[0] : -1);
+    if (k == 0 && fd < 0) { int e = errno; FILE *f = fopen("/proc/sys/kernel/perf_event_paranoid", "r"); int pr = -9; if (f) { if (fscanf(f, "%d", &pr) != 1) pr = -9; fclose(f); }
+      fprintf(stderr, "[perf] hardware counters unavailable for this thread (perf_event_open errno %d, perf_event_paranoid %d); scheduler numbers only\n", e, pr); return; }
+    if (fd >= 0) { hw_fd[k] = fd; hw_idx[k] = hw_nopen++; } else if (k < 3) fprintf(stderr, "[perf] counter %s not supported (errno %d)\n", hw_nm[k], errno);
+  }
+  ioctl(hw_fd[0], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP); ioctl(hw_fd[0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+}
+static void hw_report(void) {
+  static uint64_t p_wall, p_run, p_wait, p_slices, p_en, p_ru, p_hw[6]; static struct rusage p_ru_s; static int base;
+  if (!hw_init_done) hw_init();
+  if ((int)syscall(SYS_gettid) != hw_tid) return;   /* only the thread that made the first proxy call (the game thread) */
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t wall = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  uint64_t run = 0, wait = 0, slices = 0; FILE *f = fopen("/proc/thread-self/schedstat", "r"); if (f) { if (fscanf(f, "%llu %llu %llu", (unsigned long long *)&run, (unsigned long long *)&wait, (unsigned long long *)&slices) != 3) run = wait = slices = 0; fclose(f); }
+  struct rusage ru; getrusage(RUSAGE_THREAD, &ru);
+  uint64_t hv[6] = { 0 }, en = 0, rn = 0; if (hw_fd[0] >= 0) { uint64_t buf[3 + 6]; if (read(hw_fd[0], buf, sizeof buf) > 24) { en = buf[1]; rn = buf[2]; for (int k = 0; k < 6; k++) if (hw_fd[k] >= 0) hv[k] = buf[3 + hw_idx[k]]; } }
+  if (!base) { base = 1; p_wall = wall; p_run = run; p_wait = wait; p_slices = slices; p_ru_s = ru; p_en = en; p_ru = rn; memcpy(p_hw, hv, sizeof hv); return; }
+  double w = (double)(wall - p_wall) / 1e6, r = (double)(run - p_run) / 1e6, q = (double)(wait - p_wait) / 1e6, b = w - r - q; if (b < 0) b = 0;
+  double us = (double)(ru.ru_utime.tv_sec - p_ru_s.ru_utime.tv_sec) * 1e3 + (double)(ru.ru_utime.tv_usec - p_ru_s.ru_utime.tv_usec) / 1e3, sy = (double)(ru.ru_stime.tv_sec - p_ru_s.ru_stime.tv_sec) * 1e3 + (double)(ru.ru_stime.tv_usec - p_ru_s.ru_stime.tv_usec) / 1e3;
+  unsigned cpu_u = 0; syscall(SYS_getcpu, &cpu_u, 0, 0); int cpu = (int)cpu_u; long khz = 0; char path[96]; snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu); f = fopen(path, "r"); if (f) { if (fscanf(f, "%ld", &khz) != 1) khz = 0; fclose(f); }
+  fprintf(stderr, "[perf]   game thread tid %d (cpu%d %ld MHz now): wall %.0f ms = on-cpu %.0f (user %.0f, sys %.0f) + waiting-for-a-cpu %.0f + blocked/sleeping %.0f | ctx-switches voluntary %ld involuntary %ld, %llu slices, minor faults %ld\n",
+          hw_tid, cpu, khz / 1000, w, r, us, sy, q, b, ru.ru_nvcsw - p_ru_s.ru_nvcsw, ru.ru_nivcsw - p_ru_s.ru_nivcsw, (unsigned long long)(slices - p_slices), ru.ru_minflt - p_ru_s.ru_minflt);
+  if (hw_fd[0] >= 0) {
+    uint64_t de = en - p_en, dr = rn - p_ru; double sc = dr ? (double)de / (double)dr : 0; uint64_t d[6]; for (int k = 0; k < 6; k++) d[k] = (uint64_t)((double)(hv[k] - p_hw[k]) * sc);
+    if (!dr) fprintf(stderr, "[perf]   hw counters: group was not scheduled on the PMU this second\n");
+    else { double ki = (double)d[1] / 1000.0;
+      fprintf(stderr, "[perf]   hw: IPC %.2f, %.2f GHz | per 1000 instr: branch-miss %.2f", d[0] ? (double)d[1] / (double)d[0] : 0.0, r > 0 ? (double)d[0] / (r * 1e6) : 0.0, ki > 0 ? (double)d[2] / ki : 0.0);
+      for (int k = 3; k < 6; k++) if (hw_fd[k] >= 0) fprintf(stderr, ", %s %.2f", hw_nm[k], ki > 0 ? (double)d[k] / ki : 0.0);
+      fprintf(stderr, " (counted %.0f%% of the time)\n", 100.0 * (double)dr / (double)(de ? de : 1)); }
+  }
+  p_wall = wall; p_run = run; p_wait = wait; p_slices = slices; p_ru_s = ru; p_en = en; p_ru = rn; memcpy(p_hw, hv, sizeof hv);
+}
 static uint64_t pf_proxy_ticks, pf_calls, pf_if_calls[64], pf_if_ticks[64];
 static void pf_report(void) {
   static uint64_t last_ns, last_g, last_p, last_c, last_f, last_s, last_sn; static int started;
@@ -95,6 +150,7 @@ static void pf_report(void) {
       fprintf(stderr, " %s %.2f ms %llu calls;", PIS[i].name, (double)pf_if_ticks[i] * to_ms / n, (unsigned long long)pf_if_calls[i]); }
     fprintf(stderr, "\n");
   }
+  hw_report();
   memset(pf_if_calls, 0, sizeof pf_if_calls); memset(pf_if_ticks, 0, sizeof pf_if_ticks);
   last_ns = now; last_g = aot_perf_guest; last_p = pf_proxy_ticks; last_c = pf_calls; last_f = aot_frames;
 }
