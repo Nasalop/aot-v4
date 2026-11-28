@@ -195,7 +195,7 @@ static int gblk_find(uint64_t pc) { if (!ngblk || pc < gblk_lo || pc >= gblk_hi)
 static void prof_h(int sig, siginfo_t *si, void *uc_) { (void)sig; (void)si; WdThread *w = wd_me; if (!w) return;
   mcontext_t *m = &((ucontext_t *)uc_)->uc_mcontext; unsigned i = __atomic_fetch_add(&prof_w, 1, __ATOMIC_RELAXED); ProfRec *r = &prof_ring[i & 2047]; prof_slot[i & 2047] = (uint8_t)(w - wd_t);
   r->pc = m->pc; for (int k = 0; k < PROF_NRET; k++) r->ret[k] = 0;
-  if (gblk_find(m->pc) >= 0) return;   /* inside generated asm: x29 is the dispatch table, nothing to unwind */
+  if (gblk_find(m->pc) >= 0) return;   /* inside generated asm: x29 is the shadow return ring, nothing to unwind */
   r->ret[0] = m->regs[30]; uint64_t sp = m->sp, fp = m->regs[29];
   for (int k = 1; k < PROF_NRET && fp > sp && fp < sp + (1u << 20) && !(fp & 7); k++) { r->ret[k] = ((uint64_t *)fp)[1]; uint64_t nf = ((uint64_t *)fp)[0]; if (nf <= fp) break; fp = nf; } }
 typedef struct { uintptr_t fn; int k; } PReg; static PReg *preg; static int npreg; static uintptr_t preg_end;
