@@ -1,5 +1,5 @@
 """ARM64 assembly backend (opt-in).  x86 eax..edi live in x19..x26 for the whole program, x27 = CPU*, x28 = packed EFLAGS bits
-(CF 0, PF 2, ZF 6, SF 7, OF 11), x29 = dispatch table.  Every asm region shares one host frame, so a jump between regions is a plain `b`.
+(CF 0, PF 2, ZF 6, SF 7, OF 11), x29 = shadow return ring pointer (call/ret pairs go through native bl/ret x1; the dispatch table is reached with adrp, 4KB-aligned).  Every asm region shares one host frame, so a jump between regions is a plain `b`.
 Anything not translated natively is one call to a tiny C function (uf_<addr>) made by the C backend: state goes through the CPU struct."""
 from capstone.x86 import *
 X = {X86_REG_EAX:0, X86_REG_ECX:1, X86_REG_EDX:2, X86_REG_EBX:3, X86_REG_ESP:4, X86_REG_EBP:5, X86_REG_ESI:6, X86_REG_EDI:7}
@@ -644,9 +644,20 @@ def logic_imm(v):
     return False
 
 # ======================= block terminators + program builder =======================
-def disp_site(o, sh, mulc, tag):
-    """Per-site dispatch of the guest pc in w9: first probe inline (its own indirect branch), collisions/misses go to the shared slow path."""
-    o.extend(mov32('w10', mulc) + ['mul w10, w9, w10', 'lsr w10, w10, #%d' % sh, 'add x10, x29, x10, lsl #4', 'ldr w11, [x10]', 'cmp w11, w9', 'b.ne .Ls_%s' % tag, 'ldr x12, [x10, #8]', 'br x12', '.Ls_%s:' % tag, 'b aot_a64_slow'])
+def disp_site(o, sh, mulc, tag, call=None):
+    """Per-site dispatch of the guest pc in w9: first probe inline (its own indirect branch), collisions/misses go to the shared slow path.
+    call = None: plain jump.  call = [lines]: indirect call whose shadow-stack entry was already pushed (its host return address is .Lc_<tag>)."""
+    o.extend(mov32('w10', mulc) + ['mul w10, w9, w10', 'lsr w10, w10, #%d' % sh, 'adrp x11, aot_a64_tab', 'add x10, x11, x10, lsl #4', 'ldr w11, [x10]', 'cmp w11, w9', 'b.ne .Ls_%s' % tag, 'ldr x12, [x10, #8]'])
+    if call is None: o.extend(['br x12', '.Ls_%s:' % tag, 'b aot_a64_slow'])
+    else: o.extend(['blr x12', '.Lc_%s:' % tag] + call + ['.Ls_%s:' % tag, 'bl aot_a64_slowc', 'b .Lc_%s' % tag])   # call = the lines that continue at the return address
+
+def push_shadow(o, nx, tag):
+    """guest call: push the return address on the guest stack and a (guest ret, host ret) pair on the shadow ring (x29, 8KB, 16-byte entries, wraps by clearing bit 13)"""
+    o.extend(mov32('w0', nx) + ['adr x1, .Lc_%s' % tag, 'stp x0, x1, [x29], #16', 'bic x29, x29, #0x2000', 'str w0, [x23, #-4]!'])
+
+def pop_shadow(o, tag):
+    """w9 = guest return address (already popped from the guest stack): return through the shadow ring so the CPU's return-address predictor sees a matched bl/ret pair"""
+    o.extend(['sub x10, x29, #16', 'bfi x29, x10, #0, #13', 'ldp x0, x1, [x29]', 'cmp w0, w9', 'b.ne .Lrm_%s' % tag, 'ret x1', '.Lrm_%s:' % tag, 'b aot_a64_retmiss'])
 
 CCN = {'e':'e','z':'e','ne':'ne','nz':'ne','b':'b','c':'b','nae':'b','ae':'ae','nb':'ae','nc':'ae','be':'be','na':'be','a':'a','nbe':'a','s':'s','ns':'ns','o':'o','no':'no','p':'p','pe':'p','np':'np','po':'np','l':'l','nge':'l','ge':'ge','nl':'ge','le':'le','ng':'le','g':'g','nle':'g'}
 HIST = {}
@@ -823,18 +834,21 @@ class Prog:
             return False
         if lm == 'call' and op0 is not None and op0.type == 2:
             tgt = op0.imm & 0xffffffff
-            o.extend(mov32('w0', nx) + ['sub w23, w23, #4', 'str w0, [x23]']); s.goto(o, tgt); return o
+            if tgt in s.lset:
+                tg = 'd%x' % last.address; push_shadow(o, nx, tg); o.extend(['bl %s' % s.lbl(tgt), '.Lc_%s:' % tg]); s.goto(o, nx); return o
+            o.extend(mov32('w0', nx) + ['str w0, [x23, #-4]!']); s.goto(o, tgt); return o
         if lm in ('call', 'jmp') and op0 is not None and op0.type in (1, 3) and op0.size == 4 and op0.type == 3 and not op0.mem.segment or lm in ('call', 'jmp') and op0 is not None and op0.type == 1 and op0.size == 4:
             B.o = []
             try:
                 if op0.type == 1: B.o.append('mov w9, %s' % W(B.reg(op0)))
                 else: a = B.addr(op0); B.o.append('ldr w9, %s' % a)
                 o.extend(B.o)
-                if lm == 'call': o.extend(mov32('w0', nx) + ['sub w23, w23, #4', 'str w0, [x23]'])
+                if lm == 'call':
+                    tg = 'i%x' % last.address; push_shadow(o, nx, tg); c = []; s.goto(c, nx); disp_site(o, s.sh, s.mulc, tg, c); return o
                 disp_site(o, s.sh, s.mulc, 'i%x' % last.address); return o
             except Fn: pass
         if lm == 'ret' and not last.operands:
-            o.extend(['ldr w9, [x23]', 'add w23, w23, #4']); disp_site(o, s.sh, s.mulc, 'r%x' % last.address); return o
+            o.append('ldr w9, [x23], #4'); pop_shadow(o, 'r%x' % last.address); return o
         if lm == 'ret' and op0 is not None and op0.type == 2:
             o.extend(['ldr w9, [x23]'] + (['add w23, w23, #%d' % (4 + op0.imm)] if 4 + op0.imm < 4096 else mov32('w0', 4 + op0.imm) + ['add w23, w23, w0'])); disp_site(o, s.sh, s.mulc, 'r%x' % last.address); return o
         s.fb_ctl(o, last, nd); return o
@@ -864,10 +878,14 @@ def core_asm(prog, nregions):
         place[h] = a
     o = ['.text', '.balign 16', '.globl aot_a64_enter', '.hidden aot_a64_enter', 'aot_a64_enter:',
          'stp x29, x30, [sp, #-96]!', 'stp x19, x20, [sp, #16]', 'stp x21, x22, [sp, #32]', 'stp x23, x24, [sp, #48]', 'stp x25, x26, [sp, #64]', 'stp x27, x28, [sp, #80]',
-         'mov x27, x0', 'adrp x29, aot_a64_tab', 'add x29, x29, :lo12:aot_a64_tab', 'mov w9, w1',
+         'mov x27, x0', 'mov w9, w1',
+         # shadow return ring: 8KB at a 16KB-aligned base below the frame, old sp kept just above it; entry 0 is a sentinel (guest 0 -> aot_a64_slow)
+         'mov x10, sp', 'sub x10, x10, #0x2000', 'sub x10, x10, #64', 'and x10, x10, #0xffffffffffffc000', 'mov x11, sp', 'str x11, [x10, #0x2000]', 'adr x12, aot_a64_slow', 'stp xzr, x12, [x10]',
+         'add x29, x10, #16', 'sub sp, x10, #64',
          'ldr w19, [x27]', 'ldr w20, [x27, #8]', 'ldr w21, [x27, #16]', 'ldr w22, [x27, #24]', 'ldr w23, [x27, #32]', 'ldr w24, [x27, #40]', 'ldr w25, [x27, #48]', 'ldr w26, [x27, #56]', 'bl aot_a64_fl_load', 'b aot_a64_slow',
          '.globl aot_a64_exit', '.hidden aot_a64_exit', 'aot_a64_exit:',
          'stp x19, x20, [x27]', 'stp x21, x22, [x27, #16]', 'stp x23, x24, [x27, #32]', 'stp x25, x26, [x27, #48]', 'bl aot_a64_fl_store', 'mov w0, w9',
+         'and x10, x29, #0xffffffffffffc000', 'ldr x10, [x10, #0x2000]', 'mov sp, x10',
          'ldp x27, x28, [sp, #80]', 'ldp x25, x26, [sp, #64]', 'ldp x23, x24, [sp, #48]', 'ldp x21, x22, [sp, #32]', 'ldp x19, x20, [sp, #16]', 'ldp x29, x30, [sp], #96', 'ret',
          '.globl aot_a64_fl_store', '.hidden aot_a64_fl_store', 'aot_a64_fl_store:',
          'and w0, w28, #1', 'strb w0, [x27, #%d]' % OFF, 'ubfx w0, w28, #6, #1', 'strb w0, [x27, #%d]' % (OFF + 1), 'ubfx w0, w28, #7, #1', 'strb w0, [x27, #%d]' % (OFF + 2),
@@ -876,15 +894,24 @@ def core_asm(prog, nregions):
          'ldrb w28, [x27, #%d]' % OFF, 'ldrb w0, [x27, #%d]' % (OFF + 1), 'ldrb w1, [x27, #%d]' % (OFF + 2), 'ldrb w2, [x27, #%d]' % (OFF + 3), 'ldrb w3, [x27, #%d]' % (OFF + 4),
          'bfi w28, w0, #6, #1', 'bfi w28, w1, #7, #1', 'bfi w28, w2, #11, #1', 'bfi w28, w3, #2, #1', 'ret',
          '.globl aot_a64_slow', '.hidden aot_a64_slow', 'aot_a64_slow:']
-    o += mov32('w10', prog.mulc) + ['mul w10, w9, w10', 'lsr w10, w10, #%d' % sh,
-         '.Lsl_loop:', 'add x11, x29, x10, lsl #4', 'ldr w12, [x11]', 'cbz w12, .Lsl_miss', 'cmp w12, w9', 'b.eq .Lsl_hit', 'add w10, w10, #1', 'and w10, w10, #%d' % mask, 'b .Lsl_loop',
+    o += mov32('w10', prog.mulc) + ['mul w10, w9, w10', 'lsr w10, w10, #%d' % sh, 'adrp x13, aot_a64_tab',
+         '.Lsl_loop:', 'add x11, x13, x10, lsl #4', 'ldr w12, [x11]', 'cbz w12, .Lsl_miss', 'cmp w12, w9', 'b.eq .Lsl_hit', 'add w10, w10, #1', 'and w10, w10, #%d' % mask, 'b .Lsl_loop',
          '.Lsl_hit:', 'ldr x12, [x11, #8]', 'br x12',
          '.Lsl_miss:', 'str x9, [sp, #-16]!', 'stp x19, x20, [x27]', 'stp x21, x22, [x27, #16]', 'stp x23, x24, [x27, #32]', 'stp x25, x26, [x27, #48]',
          'mov x0, x27', 'mov w1, w9', 'bl aot_a64_imp_c',
          'ldr w19, [x27]', 'ldr w20, [x27, #8]', 'ldr w21, [x27, #16]', 'ldr w22, [x27, #24]', 'ldr w23, [x27, #32]', 'ldr w24, [x27, #40]', 'ldr w25, [x27, #48]', 'ldr w26, [x27, #56]',
-         'ldr x9, [sp], #16', 'cbz w0, aot_a64_exit', 'mov w9, w0', 'b aot_a64_slow']
+         'ldr x9, [sp], #16', 'cbz w0, aot_a64_exit', 'mov w9, w0',
+         # an imported/untranslated callee was run by the host and "returned" to w9: drop its call's shadow entry (the top one, if it is for exactly this return address)
+         'sub x10, x29, #16', 'mov x11, x29', 'bfi x11, x10, #0, #13', 'ldr w12, [x11]', 'cmp w12, w9', 'csel x29, x11, x29, eq', 'b aot_a64_slow',
+         # indirect call that missed the inline probe: x30 (after the bl at the call site) becomes the host return address of the shadow entry just pushed
+         '.globl aot_a64_slowc', '.hidden aot_a64_slowc', 'aot_a64_slowc:', 'sub x11, x29, #8', 'mov x10, x29', 'bfi x10, x11, #0, #13', 'str x30, [x10]', 'b aot_a64_slow',
+         # ret whose shadow entry did not match (non-local return, longjmp, stale entries): look a few entries down, never past the ring base; else plain dispatch
+         '.globl aot_a64_retmiss', '.hidden aot_a64_retmiss', 'aot_a64_retmiss:', 'tst x29, #0x1fff', 'b.ne .Lrm_go', 'add x29, x29, #16', 'b aot_a64_slow',
+         '.Lrm_go:', 'mov x12, x29', 'mov w10, #32',
+         '.Lrm_l:', 'sub x11, x29, #16', 'bfi x29, x11, #0, #13', 'ldp x0, x1, [x29]', 'cbz w0, .Lrm_f', 'cmp w0, w9', 'b.eq .Lrm_h', 'tst x29, #0x1fff', 'b.eq .Lrm_f', 'subs w10, w10, #1', 'b.ne .Lrm_l',
+         '.Lrm_f:', 'mov x29, x12', 'b aot_a64_slow', '.Lrm_h:', 'ret x1']
     for k in range(nregions): o += ['.globl region_%d' % k, '.hidden region_%d' % k, '.type region_%d, %%function' % k, 'region_%d:' % k, 'b aot_a64_enter']
-    o += ['.section .data.rel.ro,"aw",@progbits', '.balign 16', '.globl aot_a64_tab', '.hidden aot_a64_tab', 'aot_a64_tab:']
+    o += ['.section .data.rel.ro,"aw",@progbits', '.balign 4096', '.globl aot_a64_tab', '.hidden aot_a64_tab', 'aot_a64_tab:']
     for a in place:
         if a is None: o += ['.word 0, 0', '.quad 0']
         else: o += ['.word 0x%x, 0' % a, '.quad L_%x' % a]
