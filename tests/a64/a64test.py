@@ -128,10 +128,10 @@ def build_arm(case, insns):
         lines = prog.block(blk, 0, None)
         lines = [l for l in lines if not l.startswith(('.globl', '.hidden'))]
     if any(l.startswith('bl uf_') or l.startswith('bl aot_a64_fl') for l in lines): return None
-    return lines
+    return ['movz x11, #0x300, lsl #32' if l == 'adrp x11, aot_a64_tab' else l for l in lines]   # dispatch table is mapped at 0x30000000000 (empty)
 
 def stubs():
-    return ['aot_a64_exit: hlt #0', 'aot_a64_slow: hlt #1']
+    return ['aot_a64_exit: hlt #0', 'aot_a64_slow: hlt #1', '.set aot_a64_retmiss, aot_a64_slow', '.set aot_a64_slowc, aot_a64_slow']
 
 def run_case(case, ntrials, seed0, verbose=False):
     code = asm_x86(case.text); insns = parse(code)
@@ -167,7 +167,7 @@ def run_case(case, ntrials, seed0, verbose=False):
         ua = Uc(UC_ARCH_ARM64, UC_MODE_ARM); ua.ctl_set_cpu_model(UC_CPU_ARM64_MAX); ea = Emu(ua, seed)   # 'max' = LSE, CRC, ... as on the target
         ua.mem_map(CODE_A, 0x10000); ua.mem_write(CODE_A, blob); ua.mem_map(CPU_A, 0x1000); ea.pages.add(-1)
         for k in range(8): ua.reg_write(UC_ARM64_REG_X19 + k, regs[k])
-        ua.mem_map(0x30000000000, 0x20000); ua.mem_write(0x30000000000, b'\xff' * 0x20000); ua.reg_write(UC_ARM64_REG_X29, 0x30000000000)   # empty dispatch table: every indirect branch ends in aot_a64_slow with the guest pc in w9
+        ua.mem_map(0x30000000000, 0x20000); ua.mem_write(0x30000000000, b'\xff' * 0x20000); ua.mem_map(0x30100000000, 0x4000); ua.mem_write(0x30100000000, struct.pack('<QQ', 0, CODE_A + len(blob) - 4)); ua.reg_write(UC_ARM64_REG_X29, 0x30100000010)   # empty dispatch table: every indirect branch ends in aot_a64_slow with the guest pc in w9
         ua.reg_write(UC_ARM64_REG_X27, CPU_A); ua.reg_write(UC_ARM64_REG_X28, pack_flags(fl))
         cpu = bytearray(0x400)
         for k in range(8): cpu[XOFF + 16 * k:XOFF + 16 * k + 16] = xm[k]
@@ -376,4 +376,4 @@ def main():
     print('ok %d  FAIL %d  skipped(fallback, not checkable) %d' % (tot['ok'], tot['FAIL'], tot['SKIP-FALLBACK']))
     if skips: print('fallback cases:', ' | '.join(sorted(set(s.split()[0] if not s.startswith('BLK') else s for s in skips)))[:1500])
     sys.exit(1 if fails else 0)
-main()
+if __name__ == '__main__': main()
